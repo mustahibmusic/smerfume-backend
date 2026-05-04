@@ -1,7 +1,7 @@
 from django.db import models
+from django.db.models import Case, IntegerField, Value, When
+
 from apps.core.models import BaseModel
-from django.db.models import Case, When, Value, IntegerField
-from typing import TYPE_CHECKING
 
 
 class Brand(BaseModel):
@@ -13,7 +13,7 @@ class Brand(BaseModel):
     ]
 
     name = models.CharField(max_length=100, unique=True)
-    brand_category = models.CharField(max_length=100, null=False, choices=BRAND_CATEGORY_CHOICES, db_index=True, default="designer")
+    brand_category = models.CharField(max_length=100, choices=BRAND_CATEGORY_CHOICES, db_index=True, default="designer")
     slug = models.SlugField(unique=True, db_index=True)
 
     def __str__(self):

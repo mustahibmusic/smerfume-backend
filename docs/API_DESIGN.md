@@ -390,6 +390,7 @@ All catalog endpoints are public (`AllowAny`). No authentication required.
               "image": null,
               "size_ml": 70,
               "is_decant": false,
+              "mrp": "32000.00",
               "selling_price": "29500.00"
             }
           ]
@@ -400,7 +401,7 @@ All catalog endpoints are public (`AllowAny`). No authentication required.
 }
 ```
 
-**Note:** `mrp` is stored in the DB but **not returned in API responses**. Only `selling_price` is returned.
+Both `mrp` and `selling_price` are returned so the frontend can display the original price and savings.
 
 ---
 

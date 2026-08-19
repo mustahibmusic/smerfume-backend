@@ -25,7 +25,7 @@ class PerfumeNoteSerializer(serializers.ModelSerializer):
 class ProductVariantSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductVariant
-        fields = ("public_id", "image", "size_ml", "is_decant", "selling_price")
+        fields = ("public_id", "image", "size_ml", "is_decant", "mrp", "selling_price")
 
 
 class EditionNotesGroupedSerializer(serializers.Serializer):

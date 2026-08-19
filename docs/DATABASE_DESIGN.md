@@ -233,7 +233,7 @@ A purchasable SKU (specific size or decant).
 | `mrp` | DecimalField(10,2) | | Maximum retail price |
 | `selling_price` | DecimalField(10,2) | | Price used at checkout |
 
-**Note:** `mrp` is stored in the DB but is **not exposed in any current API serializer**. It is present in the model for admin use only.
+**Note:** `mrp` is exposed in the API alongside `selling_price` so the frontend can display original price and savings.
 
 ---
 

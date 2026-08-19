@@ -701,14 +701,14 @@ class ProductSerializerFieldTests(CatalogTestBase):
         response = self.client.get(LIST_URL)
         chance_men = self._list_edition(response, "chance", "chance-pour-homme")
         variant = chance_men["variants"][0]
-        for field in ("public_id", "size_ml", "is_decant", "selling_price"):
+        for field in ("public_id", "size_ml", "is_decant", "mrp", "selling_price"):
             self.assertIn(field, variant)
 
-    def test_list_edition_variant_does_not_expose_mrp(self):
+    def test_list_edition_variant_exposes_mrp(self):
         response = self.client.get(LIST_URL)
         chance_men = self._list_edition(response, "chance", "chance-pour-homme")
         for variant in chance_men["variants"]:
-            self.assertNotIn("mrp", variant)
+            self.assertIn("mrp", variant)
 
     def test_list_edition_all_active_variants_present(self):
         # 3 active variants: 100 ml, 50 ml, 10 ml decant
@@ -750,8 +750,8 @@ class ProductSerializerFieldTests(CatalogTestBase):
         for field in ("min_price", "max_price", "variants_count"):
             self.assertNotIn(field, edition)
 
-    def test_variant_does_not_expose_mrp(self):
-        # mrp is an internal cost field; only selling_price is public.
+    def test_variant_exposes_mrp(self):
+        # mrp is exposed alongside selling_price so the frontend can show savings.
         for url in (LIST_URL, detail_url("chance")):
             response = self.client.get(url)
             if "results" in response.data:
@@ -762,12 +762,12 @@ class ProductSerializerFieldTests(CatalogTestBase):
                 editions = response.data["editions"]
             for edition in editions:
                 for variant in edition["variants"]:
-                    self.assertNotIn("mrp", variant, msg=f"mrp leaked in {url}")
+                    self.assertIn("mrp", variant, msg=f"mrp missing in {url}")
 
     def test_detail_variant_exposes_required_fields(self):
         response = self.client.get(detail_url("chance"))
         variant = self._edition(response, "chance-pour-homme")["variants"][0]
-        for field in ("public_id", "size_ml", "is_decant", "selling_price"):
+        for field in ("public_id", "size_ml", "is_decant", "mrp", "selling_price"):
             self.assertIn(field, variant)
 
     # ── Edition with no variants ──────────────────────────────────────────────

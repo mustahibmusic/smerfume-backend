@@ -12,12 +12,9 @@ env/
 ENV/
 
 # ── Environment / secrets ───────────────────────────────────────────────────────
-# .env.example is intentionally NOT listed here — it is safe to commit as a template.
+# No .env* files are committed — keys and values are both kept private.
 .env
-.env.local
-.env.*.local
-.env.production
-.env.staging
+.env.*
 
 # ── Django ──────────────────────────────────────────────────────────────────────
 *.log
@@ -26,11 +23,12 @@ db.sqlite3
 media/
 staticfiles/
 
-# ── IDEs ────────────────────────────────────────────────────────────────────────
+# ── IDEs / AI tooling ───────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
+.claude/
 
 # ── OS ──────────────────────────────────────────────────────────────────────────
 .DS_Store

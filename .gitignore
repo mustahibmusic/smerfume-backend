@@ -1,4 +1,37 @@
-venv/
-.env
+# ── Python ─────────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environment ─────────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── Environment / secrets ───────────────────────────────────────────────────────
+# .env.example is intentionally NOT listed here — it is safe to commit as a template.
+.env
+.env.local
+.env.*.local
+.env.production
+.env.staging
+
+# ── Django ──────────────────────────────────────────────────────────────────────
+*.log
+local_settings.py
+db.sqlite3
+media/
+staticfiles/
+
+# ── IDEs ────────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ──────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

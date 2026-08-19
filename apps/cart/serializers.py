@@ -1,3 +1,4 @@
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from apps.catalog.models import ProductVariant
@@ -36,9 +37,11 @@ class CartSerializer(serializers.ModelSerializer):
         model = Cart
         fields = ("public_id", "items", "total", "item_count")
 
+    @extend_schema_field(serializers.DecimalField(max_digits=10, decimal_places=2))
     def get_total(self, obj):
         return obj.get_total()
 
+    @extend_schema_field(serializers.IntegerField())
     def get_item_count(self, obj):
         return obj.items.count()
 

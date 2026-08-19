@@ -1,4 +1,5 @@
 from django.db.models import Prefetch
+from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
 from rest_framework import filters, viewsets
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny
@@ -17,25 +18,44 @@ _VALID_GENDERS = {c[0] for c in ProductEdition.GENDER_CHOICES}
 _VALID_CONCENTRATIONS = {c[0] for c in ProductEdition.CONCENTRATION_CHOICES}
 
 
+@extend_schema_view(
+    list=extend_schema(
+        tags=["Catalog"],
+        summary="List products",
+        description=(
+            "Return all active products with their editions and variants.\n\n"
+            "**Filters:**\n"
+            "- `search` — name, brand name, or edition name (min 2 chars)\n"
+            "- `brand` — brand slug\n"
+            "- `category` — category slug\n"
+            "- `gender` — `men` | `women` | `unisex`\n"
+            "- `concentration` — `edc` | `edt` | `edp` | `extrait`\n"
+            "- `note` — comma-separated note names, AND logic, max 5\n"
+            "- `is_best_seller` — `true` | `false`\n"
+            "- `is_new_arrival` — `true` | `false`\n"
+            "- `ordering` — `name` | `-name` | `brand__name` | `-brand__name`"
+        ),
+        parameters=[
+            OpenApiParameter("search", str, description="Search by name, brand, or edition (min 2 chars)"),
+            OpenApiParameter("brand", str, description="Filter by brand slug"),
+            OpenApiParameter("category", str, description="Filter by category slug"),
+            OpenApiParameter("gender", str, description="men | women | unisex"),
+            OpenApiParameter("concentration", str, description="edc | edt | edp | extrait"),
+            OpenApiParameter("note", str, description="Comma-separated note names (AND logic, max 5)"),
+            OpenApiParameter("is_best_seller", str, description="true | false"),
+            OpenApiParameter("is_new_arrival", str, description="true | false"),
+            OpenApiParameter("ordering", str, description="name | -name | brand__name | -brand__name"),
+        ],
+        auth=[],
+    ),
+    retrieve=extend_schema(
+        tags=["Catalog"],
+        summary="Get product detail",
+        description="Return full detail for a single product including all editions, notes, and variants.",
+        auth=[],
+    ),
+)
 class ProductViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    Public product catalog.
-
-    List   — GET /api/catalog/products/
-    Detail — GET /api/catalog/products/{slug}/
-
-    Query params:
-      ?search=<str>          name, brand name, edition name (min 2 chars)
-      ?brand=<slug>
-      ?category=<slug>
-      ?gender=men|women|unisex
-      ?concentration=edc|edt|edp|extrait
-      ?note=<name>[,<name>]  comma-separated, AND logic, max 5
-      ?is_best_seller=true|false
-      ?is_new_arrival=true|false
-      ?ordering=name|-name|brand__name|-brand__name
-    """
-
     permission_classes = [AllowAny]
     lookup_field = "slug"
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
@@ -157,6 +177,19 @@ class ProductViewSet(viewsets.ReadOnlyModelViewSet):
         return ProductListSerializer
 
 
+@extend_schema_view(
+    list=extend_schema(
+        tags=["Catalog"],
+        summary="List brands",
+        description="Return all active brands. Supports `?search=` by name.",
+        auth=[],
+    ),
+    retrieve=extend_schema(
+        tags=["Catalog"],
+        summary="Get brand detail",
+        auth=[],
+    ),
+)
 class BrandViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [AllowAny]
     queryset = Brand.objects.filter(is_active=True).order_by("name")
@@ -166,6 +199,19 @@ class BrandViewSet(viewsets.ReadOnlyModelViewSet):
     search_fields = ["name"]
 
 
+@extend_schema_view(
+    list=extend_schema(
+        tags=["Catalog"],
+        summary="List categories",
+        description="Return all active product categories.",
+        auth=[],
+    ),
+    retrieve=extend_schema(
+        tags=["Catalog"],
+        summary="Get category detail",
+        auth=[],
+    ),
+)
 class CategoryViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [AllowAny]
     queryset = Category.objects.filter(is_active=True).order_by("name")
@@ -173,6 +219,19 @@ class CategoryViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_field = "slug"
 
 
+@extend_schema_view(
+    list=extend_schema(
+        tags=["Catalog"],
+        summary="List perfume notes",
+        description="Return all active perfume notes. Supports `?search=` by name or category.",
+        auth=[],
+    ),
+    retrieve=extend_schema(
+        tags=["Catalog"],
+        summary="Get perfume note detail",
+        auth=[],
+    ),
+)
 class PerfumeNoteViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [AllowAny]
     queryset = PerfumeNote.objects.filter(is_active=True).order_by("name")

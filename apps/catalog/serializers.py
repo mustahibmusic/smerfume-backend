@@ -1,3 +1,4 @@
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from .models import Brand, Category, EditionNote, PerfumeNote, Product, ProductEdition, ProductVariant
@@ -89,6 +90,12 @@ class ProductEditionDetailSerializer(serializers.ModelSerializer):
             "variants",
         )
 
+    @extend_schema_field(
+        serializers.DictField(
+            child=serializers.ListField(child=serializers.CharField()),
+            help_text='Notes grouped by position: {"top": [...], "heart": [...], "base": [...]}',
+        )
+    )
     def get_notes(self, obj):
         return EditionNotesGroupedSerializer().to_representation(obj)
 

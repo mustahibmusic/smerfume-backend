@@ -18,10 +18,19 @@ from django.conf import settings
 from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
+from drf_spectacular.views import SpectacularAPIView, SpectacularRedocView, SpectacularSwaggerView
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
-    path('api/', include('config.api_urls')),
+    path("admin/", admin.site.urls),
+    path("api/", include("config.api_urls")),
+
+    # ── API Documentation ──────────────────────────────────────────────────
+    # Raw OpenAPI 3.0 schema (JSON/YAML download)
+    path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
+    # Swagger UI  →  http://127.0.0.1:8000/api/docs/
+    path("api/docs/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
+    # ReDoc       →  http://127.0.0.1:8000/api/redoc/
+    path("api/redoc/", SpectacularRedocView.as_view(url_name="schema"), name="redoc"),
 ]
 
 if settings.DEBUG:

@@ -8,9 +8,11 @@ CORS_ALLOW_ALL_ORIGINS = True
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=60),
-    "REFRESH_TOKEN_LIFETIME": timedelta(days=1),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
     "AUTH_HEADER_TYPES": ("Bearer",),
     "UPDATE_LAST_LOGIN": True,
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
 }
 
 # Relax throttle in local dev
@@ -20,5 +22,6 @@ REST_FRAMEWORK = {
         "anon": "1000/day",
         "user": "10000/day",
         "otp_request": "100/hour",
+        "otp_verify": "1000/minute",
     },
 }

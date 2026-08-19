@@ -29,6 +29,8 @@ INSTALLED_APPS = [
 
     # Third-party
     "rest_framework",
+    "rest_framework_simplejwt.token_blacklist",
+    "drf_spectacular",
     "corsheaders",
     "storages",
 
@@ -73,9 +75,49 @@ REST_FRAMEWORK = {
         "anon": "100/day",
         "user": "1000/day",
         "otp_request": "5/hour",
+        "otp_verify": "10/minute",
     },
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 24,
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+}
+
+# ── API Documentation (drf-spectacular) ───────────────────────────────────────
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Smerfume API",
+    "DESCRIPTION": (
+        "REST API for the Smerfume e-commerce fragrance platform.\n\n"
+        "## Authentication\n"
+        "All protected endpoints require a JWT Bearer token.\n"
+        "1. Call `POST /api/auth/otp/request/` with your mobile number.\n"
+        "2. Submit the OTP to `POST /api/auth/otp/verify/` to receive tokens.\n"
+        "3. Click **Authorize** above and enter: `Bearer <access_token>`"
+    ),
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    "COMPONENT_SPLIT_REQUEST": True,
+    "TAGS": [
+        {"name": "Auth", "description": "OTP-based passwordless authentication and token management"},
+        {"name": "Catalog", "description": "Products, editions, variants, brands, categories and perfume notes"},
+        {"name": "Cart", "description": "Shopping cart management"},
+        {"name": "Orders", "description": "Checkout and order history"},
+    ],
+    "SECURITY": [{"BearerAuth": []}],
+    "COMPONENTS": {
+        "securitySchemes": {
+            "BearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "JWT",
+                "description": "Paste the access token returned by /api/auth/otp/verify/",
+            }
+        }
+    },
+    "SWAGGER_UI_SETTINGS": {
+        "persistAuthorization": True,   # token survives page refresh during testing
+        "displayRequestDuration": True,
+        "filter": True,
+    },
 }
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
@@ -162,6 +204,28 @@ if os.getenv("USE_S3") == "True":
         },
     }
     MEDIA_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/"
+
+
+# ── SMS Backend ────────────────────────────────────────────────────────────
+# SEND_REAL_OTP (bool env var, default False):
+#   Master cost-control switch. When False, ConsoleSMSBackend is used
+#   regardless of SMS_BACKEND — prevents accidental SMS sends in dev/staging.
+#   Set SEND_REAL_OTP=True in production .env only.
+#
+# SMS_BACKEND (str env var):
+#   Fully qualified class path of the SMS provider to use when SEND_REAL_OTP=True.
+#   To switch providers, change this env var — no code changes needed.
+#   Current provider: MSG91 (apps.accounts.providers.msg91.MSG91SMSBackend)
+#   To switch to another: create provider class, set SMS_BACKEND to its path.
+SEND_REAL_OTP = os.getenv("SEND_REAL_OTP", "False") == "True"
+SMS_BACKEND = os.getenv(
+    "SMS_BACKEND",
+    "apps.accounts.providers.msg91.MSG91SMSBackend",
+)
+# MSG91 credentials — only required when SMS_BACKEND=MSG91SMSBackend
+MSG91_AUTH_KEY = os.getenv("MSG91_AUTH_KEY", "")
+MSG91_TEMPLATE_ID = os.getenv("MSG91_TEMPLATE_ID", "")
+MSG91_SENDER_ID = os.getenv("MSG91_SENDER_ID", "SMRFME")
 
 
 UNFOLD = {

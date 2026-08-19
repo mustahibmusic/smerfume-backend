@@ -30,6 +30,7 @@ INSTALLED_APPS = [
     # Third-party
     "rest_framework",
     "corsheaders",
+    "storages",
 
     # Local Apps
     "apps.core",
@@ -128,6 +129,39 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+
+# ── File Storage ───────────────────────────────────────────────────────────────
+# Set USE_S3=True in your environment to switch to Amazon S3.
+# Required env vars when USE_S3 is True:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_STORAGE_BUCKET_NAME,
+#   AWS_S3_REGION_NAME (default: ap-south-1)
+if os.getenv("USE_S3") == "True":
+    AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+    AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+    AWS_STORAGE_BUCKET_NAME = os.getenv("AWS_STORAGE_BUCKET_NAME")
+    AWS_S3_REGION_NAME = os.getenv("AWS_S3_REGION_NAME", "ap-south-1")
+    AWS_S3_CUSTOM_DOMAIN = f"{AWS_STORAGE_BUCKET_NAME}.s3.{AWS_S3_REGION_NAME}.amazonaws.com"
+    AWS_DEFAULT_ACL = None          # inherit bucket policy (Block Public Access)
+    AWS_S3_FILE_OVERWRITE = False   # keep original filename on re-upload
+
+    STORAGES = {
+        "default": {
+            "BACKEND": "storages.backends.s3boto3.S3Boto3Storage",
+            "OPTIONS": {
+                "access_key": AWS_ACCESS_KEY_ID,
+                "secret_key": AWS_SECRET_ACCESS_KEY,
+                "bucket_name": AWS_STORAGE_BUCKET_NAME,
+                "region_name": AWS_S3_REGION_NAME,
+                "custom_domain": AWS_S3_CUSTOM_DOMAIN,
+                "file_overwrite": AWS_S3_FILE_OVERWRITE,
+                "default_acl": AWS_DEFAULT_ACL,
+            },
+        },
+        "staticfiles": {
+            "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+        },
+    }
+    MEDIA_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/"
 
 
 UNFOLD = {

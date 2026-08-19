@@ -75,6 +75,7 @@ class ProductEditionInline(admin.StackedInline):
     fields = (
         "name",
         "slug",
+        "image",
         "gender",
         "concentration",
         "is_best_seller",
@@ -112,6 +113,7 @@ class ProductVariantAdmin(ModelAdmin):
         "display_name_formatted",
         "price_label",
         "decant_badge",
+        "image_preview",
     )
     list_filter = ("is_decant", "edition__product__brand")
     list_select_related = ("edition__product__brand",)
@@ -121,6 +123,7 @@ class ProductVariantAdmin(ModelAdmin):
         "edition__name",
         "edition__product__brand__name",
     )
+    readonly_fields = ("image_preview",)
 
     @display(description="Variant Product", header=True)
     def display_name_formatted(self, obj):
@@ -134,6 +137,12 @@ class ProductVariantAdmin(ModelAdmin):
     def decant_badge(self, obj):
         return obj.is_decant
 
+    @display(description="Image")
+    def image_preview(self, obj):
+        if obj.image:
+            return mark_safe(f'<img src="{obj.image.url}" style="height:60px;border-radius:4px;">')
+        return "—"
+
 
 # -------------------------
 # Product Edition (Main Notes View)
@@ -145,6 +154,7 @@ class ProductEditionAdmin(ModelAdmin):
         "notes_summary",
         "gender",
         "concentration",
+        "image_preview",
     )
 
     search_fields = (
@@ -153,6 +163,7 @@ class ProductEditionAdmin(ModelAdmin):
         "name",
     )
 
+    readonly_fields = ("image_preview",)
     inlines = [EditionNoteInline]
 
     def get_queryset(self, request):
@@ -161,6 +172,12 @@ class ProductEditionAdmin(ModelAdmin):
             .get_queryset(request)
             .prefetch_related("edition_notes__note")
         )
+
+    @display(description="Image")
+    def image_preview(self, obj):
+        if obj.image:
+            return mark_safe(f'<img src="{obj.image.url}" style="height:60px;border-radius:4px;">')
+        return "—"
 
     def notes_summary(self, obj):
         notes = (

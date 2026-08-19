@@ -1,7 +1,9 @@
+from django.db.models import Prefetch
 from rest_framework import filters, viewsets
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny
 
-from .models import Brand, Category, PerfumeNote, Product
+from .models import Brand, Category, EditionNote, PerfumeNote, Product, ProductEdition, ProductVariant
 from .serializers import (
     BrandSerializer,
     CategorySerializer,
@@ -10,23 +12,28 @@ from .serializers import (
     ProductListSerializer,
 )
 
+# Precomputed valid choice sets — avoids recomputing per request
+_VALID_GENDERS = {c[0] for c in ProductEdition.GENDER_CHOICES}
+_VALID_CONCENTRATIONS = {c[0] for c in ProductEdition.CONCENTRATION_CHOICES}
+
 
 class ProductViewSet(viewsets.ReadOnlyModelViewSet):
     """
     Public product catalog.
 
-    List  — GET /api/catalog/products/
+    List   — GET /api/catalog/products/
     Detail — GET /api/catalog/products/{slug}/
 
     Query params:
-      ?search=        — name, brand name, edition name
+      ?search=<str>          name, brand name, edition name (min 2 chars)
       ?brand=<slug>
       ?category=<slug>
       ?gender=men|women|unisex
       ?concentration=edc|edt|edp|extrait
-      ?note=<note-name>  (comma-separated, AND logic)
-      ?is_best_seller=true
-      ?is_new_arrival=true
+      ?note=<name>[,<name>]  comma-separated, AND logic, max 5
+      ?is_best_seller=true|false
+      ?is_new_arrival=true|false
+      ?ordering=name|-name|brand__name|-brand__name
     """
 
     permission_classes = [AllowAny]
@@ -37,46 +44,112 @@ class ProductViewSet(viewsets.ReadOnlyModelViewSet):
     ordering = ["name"]
 
     def get_queryset(self):
+        # self.request is a DRF Request, but the underlying Django HttpRequest
+        # exposes GET instead of query_params. Using GET keeps the code type-safe
+        # for static analyzers without changing runtime behavior.
+        params = self.request.GET
+
         qs = (
             Product.objects.filter(is_active=True)
             .select_related("brand", "category")
             .prefetch_related(
-                "editions",
-                "editions__variants",
-                "editions__edition_notes__note",
+                # Explicit Prefetch objects so inactive editions/variants are
+                # excluded from serialized output.
+                Prefetch(
+                    "editions",
+                    queryset=ProductEdition.objects.filter(is_active=True),
+                ),
+                Prefetch(
+                    "editions__variants",
+                    queryset=ProductVariant.objects.filter(is_active=True),
+                ),
+                # select_related("note") here avoids a per-EditionNote DB hit
+                # in EditionNotesGroupedSerializer, which now reads from cache.
+                Prefetch(
+                    "editions__edition_notes",
+                    queryset=EditionNote.objects.select_related("note"),
+                ),
             )
         )
 
-        params = self.request.query_params
+        # ── Product-level filters ──────────────────────────────────────────────
 
-        brand_slug = params.get("brand")
+        brand_slug = params.get("brand", "").strip()
         if brand_slug:
             qs = qs.filter(brand__slug=brand_slug)
 
-        category_slug = params.get("category")
+        category_slug = params.get("category", "").strip()
         if category_slug:
             qs = qs.filter(category__slug=category_slug)
 
-        gender = params.get("gender")
+        # ── Edition-level filters ──────────────────────────────────────────────
+        # All edition constraints are collected and applied as a single subquery
+        # on ProductEdition. This prevents cross-edition contamination: without
+        # the subquery, ?gender=men&concentration=edp would match a product
+        # whose Edition A is (men/edt) and Edition B is (women/edp) — two
+        # different editions satisfying two different constraints.
+        edition_filters = {}
+
+        gender = params.get("gender", "").strip()
         if gender:
-            qs = qs.filter(editions__gender=gender)
+            if gender not in _VALID_GENDERS:
+                raise ValidationError(
+                    {"gender": f"Invalid value. Must be one of: {', '.join(sorted(_VALID_GENDERS))}."}
+                )
+            edition_filters["gender"] = gender
 
-        concentration = params.get("concentration")
+        concentration = params.get("concentration", "").strip()
         if concentration:
-            qs = qs.filter(editions__concentration=concentration)
+            if concentration not in _VALID_CONCENTRATIONS:
+                raise ValidationError(
+                    {"concentration": f"Invalid value. Must be one of: {', '.join(sorted(_VALID_CONCENTRATIONS))}."}
+                )
+            edition_filters["concentration"] = concentration
 
-        note = params.get("note")
+        is_best_seller = params.get("is_best_seller", "").strip().lower()
+        if is_best_seller:
+            if is_best_seller not in ("true", "false"):
+                raise ValidationError({"is_best_seller": "Must be 'true' or 'false'."})
+            if is_best_seller == "true":
+                edition_filters["is_best_seller"] = True
+
+        is_new_arrival = params.get("is_new_arrival", "").strip().lower()
+        if is_new_arrival:
+            if is_new_arrival not in ("true", "false"):
+                raise ValidationError({"is_new_arrival": "Must be 'true' or 'false'."})
+            if is_new_arrival == "true":
+                edition_filters["is_new_arrival"] = True
+
+        note_names = []
+        note = params.get("note", "").strip()
         if note:
-            for note_name in note.split(","):
-                qs = qs.filter(editions__edition_notes__note__name__iexact=note_name.strip())
+            note_names = [n.strip() for n in note.split(",") if n.strip()]
+            if len(note_names) > 5:
+                raise ValidationError({"note": "Maximum 5 notes can be specified."})
 
-        if params.get("is_best_seller", "").lower() == "true":
-            qs = qs.filter(editions__is_best_seller=True)
+        if edition_filters or note_names:
+            editions_qs = ProductEdition.objects.filter(is_active=True, **edition_filters)
+            # Each chained filter for notes creates a separate JOIN on
+            # edition_notes, correctly enforcing AND logic on the same edition.
+            for note_name in note_names:
+                editions_qs = editions_qs.filter(
+                    edition_notes__note__name__iexact=note_name
+                )
+            qs = qs.filter(pk__in=editions_qs.values("product_id"))
 
-        if params.get("is_new_arrival", "").lower() == "true":
-            qs = qs.filter(editions__is_new_arrival=True)
-
+        # distinct() guards against duplicates from SearchFilter's editions__name
+        # JOIN and from any remaining multi-valued traversals.
         return qs.distinct()
+
+    def filter_queryset(self, queryset):
+        # Reject single-character search terms: they are too broad and trigger
+        # expensive icontains JOINs across three tables.
+        search = self.request.query_params.get(
+            filters.SearchFilter.search_param, ""
+        ).strip()
+        if search and len(search) < 2:
+            return queryset.none()
+        return super().filter_queryset(queryset)
 
     def get_serializer_class(self):
         if self.action == "retrieve":

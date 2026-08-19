@@ -113,6 +113,8 @@ class ProductEdition(BaseModel):
         blank=True
     )
 
+    image = models.ImageField(upload_to="catalog/editions/", null=True, blank=True)
+
     is_best_seller = models.BooleanField(default=False)
     is_new_arrival = models.BooleanField(default=False)
 
@@ -152,6 +154,8 @@ class ProductVariant(BaseModel):
         on_delete=models.CASCADE,
         related_name="variants"
     )
+
+    image = models.ImageField(upload_to="catalog/variants/", null=True, blank=True)
 
     size_ml = models.PositiveIntegerField()
     is_decant = models.BooleanField(default=False)

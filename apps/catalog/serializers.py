@@ -24,16 +24,24 @@ class PerfumeNoteSerializer(serializers.ModelSerializer):
 class ProductVariantSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductVariant
-        fields = ("public_id", "size_ml", "is_decant", "mrp", "selling_price")
+        fields = ("public_id", "image", "size_ml", "is_decant", "mrp", "selling_price")
 
 
 class EditionNotesGroupedSerializer(serializers.Serializer):
-    """Returns notes bucketed into top / heart / base."""
+    """Returns notes bucketed into top / heart / base, sorted top → heart → base."""
+
+    _POSITION_ORDER = {"top": 0, "heart": 1, "base": 2}
 
     def to_representation(self, edition):
-        qs = edition.ordered_notes().select_related("note")
+        # edition.edition_notes.all() reads from the prefetch cache populated by
+        # Prefetch("editions__edition_notes", queryset=EditionNote.objects.select_related("note"))
+        # — no extra DB query. Sorting is done in Python.
+        edition_notes = sorted(
+            edition.edition_notes.all(),
+            key=lambda en: (self._POSITION_ORDER.get(en.position, 99), en.note.name),
+        )
         grouped = {"top": [], "heart": [], "base": []}
-        for en in qs:
+        for en in edition_notes:
             grouped[en.position].append(en.note.name)
         return grouped
 
@@ -53,6 +61,7 @@ class ProductEditionListSerializer(serializers.ModelSerializer):
             "public_id",
             "name",
             "slug",
+            "image",
             "gender",
             "concentration",
             "is_best_seller",
@@ -63,15 +72,17 @@ class ProductEditionListSerializer(serializers.ModelSerializer):
         )
 
     def get_min_price(self, obj):
-        prices = [v.selling_price for v in obj.variants.all() if obj.is_active]
+        # obj.variants.all() reads from prefetch cache (active variants only).
+        prices = [v.selling_price for v in obj.variants.all()]
         return min(prices) if prices else None
 
     def get_max_price(self, obj):
-        prices = [v.selling_price for v in obj.variants.all() if obj.is_active]
+        prices = [v.selling_price for v in obj.variants.all()]
         return max(prices) if prices else None
 
     def get_variants_count(self, obj):
-        return obj.variants.count()
+        # len() on prefetch cache — avoids a COUNT(*) DB hit per edition.
+        return len(obj.variants.all())
 
 
 class ProductEditionDetailSerializer(serializers.ModelSerializer):
@@ -86,6 +97,7 @@ class ProductEditionDetailSerializer(serializers.ModelSerializer):
             "public_id",
             "name",
             "slug",
+            "image",
             "gender",
             "concentration",
             "is_best_seller",

@@ -163,6 +163,7 @@ class ProductEditionAdmin(ModelAdmin):
         "name",
     )
 
+    prepopulated_fields = {"slug": ("name",)}
     readonly_fields = ("image_preview",)
     inlines = [EditionNoteInline]
 

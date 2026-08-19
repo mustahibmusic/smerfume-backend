@@ -24,7 +24,7 @@ class PerfumeNoteSerializer(serializers.ModelSerializer):
 class ProductVariantSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductVariant
-        fields = ("public_id", "image", "size_ml", "is_decant", "mrp", "selling_price")
+        fields = ("public_id", "image", "size_ml", "is_decant", "selling_price")
 
 
 class EditionNotesGroupedSerializer(serializers.Serializer):
@@ -49,11 +49,9 @@ class EditionNotesGroupedSerializer(serializers.Serializer):
 # ── Product Edition ────────────────────────────────────────────────────────────
 
 class ProductEditionListSerializer(serializers.ModelSerializer):
-    """Lightweight edition info used inside the product list endpoint."""
+    """Edition info used inside the product list endpoint."""
 
-    min_price = serializers.SerializerMethodField()
-    max_price = serializers.SerializerMethodField()
-    variants_count = serializers.SerializerMethodField()
+    variants = ProductVariantSerializer(many=True, read_only=True)
 
     class Meta:
         model = ProductEdition
@@ -66,23 +64,8 @@ class ProductEditionListSerializer(serializers.ModelSerializer):
             "concentration",
             "is_best_seller",
             "is_new_arrival",
-            "min_price",
-            "max_price",
-            "variants_count",
+            "variants",
         )
-
-    def get_min_price(self, obj):
-        # obj.variants.all() reads from prefetch cache (active variants only).
-        prices = [v.selling_price for v in obj.variants.all()]
-        return min(prices) if prices else None
-
-    def get_max_price(self, obj):
-        prices = [v.selling_price for v in obj.variants.all()]
-        return max(prices) if prices else None
-
-    def get_variants_count(self, obj):
-        # len() on prefetch cache — avoids a COUNT(*) DB hit per edition.
-        return len(obj.variants.all())
 
 
 class ProductEditionDetailSerializer(serializers.ModelSerializer):

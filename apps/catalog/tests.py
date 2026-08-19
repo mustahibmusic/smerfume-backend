@@ -560,23 +560,18 @@ class ProductActiveFilterTests(CatalogTestBase):
         variant_sizes = [v["size_ml"] for v in chance_men["variants"]]
         self.assertNotIn(200, variant_sizes)
 
-    def test_min_price_only_counts_active_variants(self):
-        # Active variants: ₹4500, ₹2700, ₹500 → min = ₹500
-        # Inactive 200 ml @ ₹8000 must NOT affect min/max.
+    def test_inactive_variant_absent_from_list_response(self):
+        # Inactive 200 ml variant must not appear in the list endpoint either.
         response = self.client.get(LIST_URL)
         chance_men = self._list_edition(response, "chance", "chance-pour-homme")
-        self.assertEqual(Decimal(str(chance_men["min_price"])), Decimal("500.00"))
+        sizes = [v["size_ml"] for v in chance_men["variants"]]
+        self.assertNotIn(200, sizes)
 
-    def test_max_price_only_counts_active_variants(self):
+    def test_only_active_variants_counted_in_list(self):
+        # 3 active (100 ml, 50 ml, 10 ml decant); inactive 200 ml excluded.
         response = self.client.get(LIST_URL)
         chance_men = self._list_edition(response, "chance", "chance-pour-homme")
-        self.assertEqual(Decimal(str(chance_men["max_price"])), Decimal("4500.00"))
-
-    def test_variants_count_excludes_inactive(self):
-        # 3 active variants (100 ml, 50 ml, 10 ml decant); 200 ml is inactive.
-        response = self.client.get(LIST_URL)
-        chance_men = self._list_edition(response, "chance", "chance-pour-homme")
-        self.assertEqual(chance_men["variants_count"], 3)
+        self.assertEqual(len(chance_men["variants"]), 3)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -696,26 +691,37 @@ class ProductSerializerFieldTests(CatalogTestBase):
 
     # ── List serializer ───────────────────────────────────────────────────────
 
-    def test_list_edition_exposes_min_max_price_and_count(self):
+    def test_list_edition_includes_variants_array(self):
         response = self.client.get(LIST_URL)
         chance_men = self._list_edition(response, "chance", "chance-pour-homme")
-        for field in ("min_price", "max_price", "variants_count"):
-            self.assertIn(field, chance_men)
+        self.assertIn("variants", chance_men)
+        self.assertIsInstance(chance_men["variants"], list)
 
-    def test_list_edition_min_price_value(self):
+    def test_list_edition_variant_objects_have_correct_fields(self):
         response = self.client.get(LIST_URL)
         chance_men = self._list_edition(response, "chance", "chance-pour-homme")
-        self.assertEqual(Decimal(str(chance_men["min_price"])), Decimal("500.00"))
+        variant = chance_men["variants"][0]
+        for field in ("public_id", "size_ml", "is_decant", "selling_price"):
+            self.assertIn(field, variant)
 
-    def test_list_edition_max_price_value(self):
+    def test_list_edition_variant_does_not_expose_mrp(self):
         response = self.client.get(LIST_URL)
         chance_men = self._list_edition(response, "chance", "chance-pour-homme")
-        self.assertEqual(Decimal(str(chance_men["max_price"])), Decimal("4500.00"))
+        for variant in chance_men["variants"]:
+            self.assertNotIn("mrp", variant)
 
-    def test_list_edition_variants_count_value(self):
+    def test_list_edition_all_active_variants_present(self):
+        # 3 active variants: 100 ml, 50 ml, 10 ml decant
         response = self.client.get(LIST_URL)
         chance_men = self._list_edition(response, "chance", "chance-pour-homme")
-        self.assertEqual(chance_men["variants_count"], 3)
+        sizes = {v["size_ml"] for v in chance_men["variants"]}
+        self.assertEqual(sizes, {100, 50, 10})
+
+    def test_list_edition_selling_prices_correct(self):
+        response = self.client.get(LIST_URL)
+        chance_men = self._list_edition(response, "chance", "chance-pour-homme")
+        prices = {Decimal(str(v["selling_price"])) for v in chance_men["variants"]}
+        self.assertEqual(prices, {Decimal("4500.00"), Decimal("2700.00"), Decimal("500.00")})
 
     def test_list_edition_does_not_include_notes(self):
         # Notes are only in the detail serializer.
@@ -723,10 +729,12 @@ class ProductSerializerFieldTests(CatalogTestBase):
         chance = next(p for p in response.data["results"] if p["slug"] == "chance")
         self.assertNotIn("notes", chance["editions"][0])
 
-    def test_list_edition_does_not_include_variants(self):
+    def test_list_edition_does_not_expose_scalar_price_fields(self):
+        # min_price / max_price / variants_count replaced by the variants array.
         response = self.client.get(LIST_URL)
-        chance = next(p for p in response.data["results"] if p["slug"] == "chance")
-        self.assertNotIn("variants", chance["editions"][0])
+        chance_men = self._list_edition(response, "chance", "chance-pour-homme")
+        for field in ("min_price", "max_price", "variants_count"):
+            self.assertNotIn(field, chance_men)
 
     # ── Detail serializer ─────────────────────────────────────────────────────
 
@@ -736,29 +744,35 @@ class ProductSerializerFieldTests(CatalogTestBase):
         self.assertIn("notes",    edition)
         self.assertIn("variants", edition)
 
-    def test_detail_edition_does_not_include_min_max_price(self):
-        # min_price / max_price / variants_count are list-only fields.
+    def test_detail_edition_does_not_include_scalar_price_fields(self):
         response = self.client.get(detail_url("chance"))
         edition = self._edition(response, "chance-pour-homme")
-        self.assertNotIn("min_price",      edition)
-        self.assertNotIn("max_price",      edition)
-        self.assertNotIn("variants_count", edition)
+        for field in ("min_price", "max_price", "variants_count"):
+            self.assertNotIn(field, edition)
+
+    def test_variant_does_not_expose_mrp(self):
+        # mrp is an internal cost field; only selling_price is public.
+        for url in (LIST_URL, detail_url("chance")):
+            response = self.client.get(url)
+            if "results" in response.data:
+                editions = next(
+                    p for p in response.data["results"] if p["slug"] == "chance"
+                )["editions"]
+            else:
+                editions = response.data["editions"]
+            for edition in editions:
+                for variant in edition["variants"]:
+                    self.assertNotIn("mrp", variant, msg=f"mrp leaked in {url}")
 
     def test_detail_variant_exposes_required_fields(self):
         response = self.client.get(detail_url("chance"))
         variant = self._edition(response, "chance-pour-homme")["variants"][0]
-        for field in ("public_id", "size_ml", "is_decant", "mrp", "selling_price"):
+        for field in ("public_id", "size_ml", "is_decant", "selling_price"):
             self.assertIn(field, variant)
-
-    def test_detail_variant_mrp_exposed(self):
-        # mrp exposure is intentional (Indian consumer law mandates MRP display).
-        response = self.client.get(detail_url("chance"))
-        variant = self._edition(response, "chance-pour-homme")["variants"][0]
-        self.assertIn("mrp", variant)
 
     # ── Edition with no variants ──────────────────────────────────────────────
 
-    def test_edition_with_no_variants_min_max_price_are_null(self):
+    def test_edition_with_no_variants_returns_empty_array(self):
         empty_edition = ProductEdition.objects.create(
             product=self.product_sauvage, name="No Variants",
             slug="sauvage-no-variants", gender="unisex", concentration="edt",
@@ -766,6 +780,4 @@ class ProductSerializerFieldTests(CatalogTestBase):
         response = self.client.get(LIST_URL)
         sauvage = next(p for p in response.data["results"] if p["slug"] == "sauvage")
         empty_ed = next(e for e in sauvage["editions"] if e["slug"] == "sauvage-no-variants")
-        self.assertIsNone(empty_ed["min_price"])
-        self.assertIsNone(empty_ed["max_price"])
-        self.assertEqual(empty_ed["variants_count"], 0)
+        self.assertEqual(empty_ed["variants"], [])

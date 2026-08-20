@@ -27,6 +27,8 @@ from .serializers import (
     UserMeSerializer,
     VerifyOTPSerializer,
 )
+from apps.cart.services import merge_guest_cart
+
 from .services.otp import create_otp_record, resend_otp, verify_otp_record
 
 logger = logging.getLogger(__name__)
@@ -115,7 +117,9 @@ class VerifyOTPView(APIView):
             "from the request step. On success, returns a JWT access token and "
             "refresh token.\n\n"
             "- Failed attempts increment a counter; the session locks after **3 failures**.\n"
-            "- The `is_new_user` flag lets the client redirect to profile completion."
+            "- The `is_new_user` flag lets the client redirect to profile completion.\n"
+            "- If `X-Cart-Token` is present, any guest cart is automatically merged "
+            "into the user's cart before the tokens are issued."
         ),
         request=VerifyOTPSerializer,
         responses={
@@ -159,6 +163,12 @@ class VerifyOTPView(APIView):
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         user = record.user
+
+        # Merge guest cart if the client held one before logging in
+        cart_token = request.headers.get("X-Cart-Token")
+        if cart_token:
+            merge_guest_cart(cart_token, user)
+
         refresh = RefreshToken.for_user(user)
 
         return Response(

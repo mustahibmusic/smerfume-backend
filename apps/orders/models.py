@@ -40,10 +40,16 @@ class Order(BaseModel):
     discount_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     total = models.DecimalField(max_digits=10, decimal_places=2)
     customer_notes = models.TextField(blank=True)
+    guest_email = models.EmailField(null=True, blank=True)
 
     class Meta:
         db_table = "orders_order"
         ordering = ["-created_at"]
+
+    @property
+    def is_guest_order(self) -> bool:
+        """True when this order was placed via guest checkout."""
+        return self.guest_email is not None
 
     def __str__(self):
         return self.order_number

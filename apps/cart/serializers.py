@@ -32,10 +32,11 @@ class CartSerializer(serializers.ModelSerializer):
     items = CartItemSerializer(many=True, read_only=True)
     total = serializers.SerializerMethodField()
     item_count = serializers.SerializerMethodField()
+    cart_token = serializers.CharField(source="session_key", read_only=True, allow_null=True)
 
     class Meta:
         model = Cart
-        fields = ("public_id", "items", "total", "item_count")
+        fields = ("public_id", "cart_token", "items", "total", "item_count")
 
     @extend_schema_field(serializers.DecimalField(max_digits=10, decimal_places=2))
     def get_total(self, obj):

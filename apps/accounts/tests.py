@@ -8,6 +8,7 @@ Test groups:
     ResendOTPViewTests   — API tests for POST /otp/resend/
     LogoutViewTests      — API tests for POST /logout/
     MeViewTests          — API tests for GET/PATCH /me/
+    CartMergeOnLoginTests — guest cart merged into user cart on OTP verify
 
 All tests mock _get_sms_backend so no real SMS is ever dispatched.
 """
@@ -428,3 +429,81 @@ class MeViewTests(TestCase):
         self._auth()
         resp = self.client.patch(self.url, {"email": "taken@example.com"})
         self.assertEqual(resp.status_code, 400)
+
+
+# ── Cart merge on OTP verify ─────────────────────────────────────────────────
+
+class CartMergeOnLoginTests(TestCase):
+    """
+    Verify that a guest cart is merged into the user's cart when
+    X-Cart-Token is present at POST /api/auth/otp/verify/.
+    """
+
+    VERIFY_URL = "/api/auth/otp/verify/"
+    REQUEST_URL = "/api/auth/otp/request/"
+
+    def setUp(self):
+        from apps.catalog.models import Brand, Category, Product, ProductEdition, ProductVariant
+        from apps.cart.models import Cart, CartItem
+
+        self.client = APIClient()
+        self.user = _make_user(mobile="+919600000001")
+
+        brand = Brand.objects.get_or_create(name="MergeBrand", slug="mergebrand")[0]
+        cat = Category.objects.get_or_create(name="MergeCat", slug="mergecat")[0]
+        product = Product.objects.get_or_create(
+            name="MergeProd", slug="mergeprod",
+            defaults={"brand": brand, "category": cat},
+        )[0]
+        edition = ProductEdition.objects.get_or_create(
+            product=product, slug="mergeprod-edp",
+            defaults={"name": "EDP", "concentration": "edp", "gender": "unisex"},
+        )[0]
+        self.variant = ProductVariant.objects.create(
+            edition=edition, size_ml=10, selling_price="200.00", mrp="250.00"
+        )
+
+        self.guest_cart = Cart.objects.create(session_key="mergetoken")
+        CartItem.objects.create(cart=self.guest_cart, variant=self.variant, quantity=3)
+
+    def _do_otp_verify(self, user, otp_code, cart_token=None):
+        """Create an OTP record and call the verify endpoint."""
+        from django.contrib.auth.hashers import make_password
+        from apps.accounts.models import OTPVerification
+
+        record = OTPVerification.objects.create(
+            user=user,
+            otp_hash=make_password(otp_code),
+            purpose="login",
+            is_new_user=False,
+        )
+        kwargs = {"data": {"otp_session_token": str(record.otp_session_token), "otp": otp_code}}
+        if cart_token:
+            kwargs["HTTP_X_CART_TOKEN"] = cart_token
+        return self.client.post(self.VERIFY_URL, **kwargs)
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_guest_cart_merged_on_verify(self, _mock):
+        """Guest cart items are in user cart after OTP verify with X-Cart-Token."""
+        from apps.cart.models import Cart
+
+        resp = self._do_otp_verify(self.user, "111111", cart_token="mergetoken")
+        self.assertEqual(resp.status_code, 200)
+
+        user_cart = Cart.objects.get(user=self.user)
+        self.assertEqual(user_cart.items.count(), 1)
+        self.assertEqual(user_cart.items.first().quantity, 3)
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_guest_cart_deleted_after_merge(self, _mock):
+        from apps.cart.models import Cart
+
+        self._do_otp_verify(self.user, "222222", cart_token="mergetoken")
+        self.assertFalse(Cart.objects.filter(session_key="mergetoken").exists())
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_verify_without_cart_token_succeeds_normally(self, _mock):
+        """OTP verify without X-Cart-Token still returns tokens (no merge attempted)."""
+        resp = self._do_otp_verify(self.user, "333333")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("access", resp.data)

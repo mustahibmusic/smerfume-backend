@@ -42,6 +42,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
 class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
     shipping_address = ShippingAddressSerializer(read_only=True)
+    is_guest_order = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Order
@@ -53,6 +54,7 @@ class OrderSerializer(serializers.ModelSerializer):
             "discount_amount",
             "total",
             "customer_notes",
+            "is_guest_order",
             "items",
             "shipping_address",
             "created_at",
@@ -62,3 +64,4 @@ class OrderSerializer(serializers.ModelSerializer):
 class CheckoutSerializer(serializers.Serializer):
     shipping_address = ShippingAddressSerializer()
     customer_notes = serializers.CharField(allow_blank=True, required=False, default="")
+    guest_email = serializers.EmailField(required=False, allow_null=True, default=None)

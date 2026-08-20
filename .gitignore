@@ -28,7 +28,8 @@ staticfiles/
 .idea/
 *.swp
 *.swo
-.claude/
+.claude/*
+!.claude/CLAUDE.md
 
 # ── OS ──────────────────────────────────────────────────────────────────────────
 .DS_Store

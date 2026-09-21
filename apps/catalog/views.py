@@ -1,10 +1,20 @@
+from apps.inventory.models import InventoryStock
 from django.db.models import Prefetch
 from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
 from rest_framework import filters, viewsets
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny
 
-from .models import Brand, Category, EditionNote, PerfumeNote, Product, ProductEdition, ProductVariant
+from .models import (
+    Brand,
+    Category,
+    EditionNote,
+    PerfumeNote,
+    Product,
+    ProductEdition,
+    ProductVariant,
+    ProductVariantImage,
+)
 from .serializers import (
     BrandSerializer,
     CategorySerializer,
@@ -88,6 +98,20 @@ class ProductViewSet(viewsets.ReadOnlyModelViewSet):
                 Prefetch(
                     "editions__edition_notes",
                     queryset=EditionNote.objects.select_related("note"),
+                ),
+                # Gallery images for ProductVariantSerializer.images/primary_image
+                Prefetch(
+                    "editions__variants__images",
+                    queryset=ProductVariantImage.objects.all(),
+                ),
+                # Retail stock only, for ProductVariantSerializer.is_available —
+                # matches what apps.inventory.services.reservation actually
+                # reserves against.
+                Prefetch(
+                    "editions__variants__inventory_stocks",
+                    queryset=InventoryStock.objects.filter(
+                        stock_type=InventoryStock.STOCK_TYPE_RETAIL
+                    ),
                 ),
             )
         )

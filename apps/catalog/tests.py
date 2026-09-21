@@ -34,12 +34,20 @@ Coverage
   ProductSerializerFieldTests   serializer field contract & computed values
 """
 
+import tempfile
 from decimal import Decimal
 
-from django.test import TestCase
+from django.contrib import admin as django_admin
+from django.core.exceptions import ValidationError
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import IntegrityError, transaction
+from django.test import RequestFactory, TestCase, override_settings
 from rest_framework import status
 from rest_framework.test import APIClient
 
+from apps.inventory.models import InventoryStock, Warehouse
+
+from .admin import ProductVariantImageInline
 from .models import (
     Brand,
     Category,
@@ -48,6 +56,7 @@ from .models import (
     Product,
     ProductEdition,
     ProductVariant,
+    ProductVariantImage,
 )
 
 LIST_URL = "/api/catalog/products/"
@@ -122,29 +131,35 @@ class CatalogTestBase(TestCase):
         ProductVariant.objects.create(
             edition=cls.edition_chance_men, size_ml=100,
             mrp=Decimal("5000.00"), selling_price=Decimal("4500.00"),
+            sku="TEST-CHANCE-MEN-100ML",
         )
         ProductVariant.objects.create(
             edition=cls.edition_chance_men, size_ml=50,
             mrp=Decimal("3000.00"), selling_price=Decimal("2700.00"),
+            sku="TEST-CHANCE-MEN-50ML",
         )
         ProductVariant.objects.create(
             edition=cls.edition_chance_men, size_ml=10, is_decant=True,
             mrp=Decimal("1000.00"), selling_price=Decimal("500.00"),
+            sku="TEST-CHANCE-MEN-10ML-DECANT",
         )
         ProductVariant.objects.create(
             edition=cls.edition_chance_men, size_ml=200,
             mrp=Decimal("9000.00"), selling_price=Decimal("8000.00"),
             is_active=False,
+            sku="TEST-CHANCE-MEN-200ML-INACTIVE",
         )
         # Variants — chance pour femme
         ProductVariant.objects.create(
             edition=cls.edition_chance_women, size_ml=75,
             mrp=Decimal("4000.00"), selling_price=Decimal("3500.00"),
+            sku="TEST-CHANCE-WOMEN-75ML",
         )
         # Variants — sauvage
         ProductVariant.objects.create(
             edition=cls.edition_sauvage, size_ml=100,
             mrp=Decimal("6000.00"), selling_price=Decimal("5500.00"),
+            sku="TEST-SAUVAGE-100ML",
         )
 
         # Edition notes — chance pour homme: Rose (top), Oud (base), Sandalwood (base)
@@ -781,3 +796,327 @@ class ProductSerializerFieldTests(CatalogTestBase):
         sauvage = next(p for p in response.data["results"] if p["slug"] == "sauvage")
         empty_ed = next(e for e in sauvage["editions"] if e["slug"] == "sauvage-no-variants")
         self.assertEqual(empty_ed["variants"], [])
+
+
+def _fake_image(name="test.jpg"):
+    """A file with .jpg extension but no real image bytes. Valid for these
+    tests because ProductVariantImage is only ever written through the
+    admin/ORM, never through a DRF write endpoint — Pillow's "is this a
+    real image" validation only runs behind forms.ImageField (ModelForm),
+    which none of these tests exercise."""
+    return SimpleUploadedFile(name, b"not-real-image-bytes", content_type="image/jpeg")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. ProductVariantImage — model invariants
+# ─────────────────────────────────────────────────────────────────────────────
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class ProductVariantImageModelTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        brand = Brand.objects.create(name="TestBrand", slug="testbrand")
+        category = Category.objects.create(name="TestCat", slug="testcat")
+        product = Product.objects.create(name="TestProduct", slug="testproduct", brand=brand, category=category)
+        edition = ProductEdition.objects.create(product=product, gender="unisex", concentration="edp")
+        cls.variant = ProductVariant.objects.create(
+            edition=edition, size_ml=100, mrp=Decimal("1000.00"),
+            selling_price=Decimal("900.00"), sku="TEST-IMG-VARIANT",
+        )
+
+    def test_max_10_images_per_variant_enforced(self):
+        for i in range(ProductVariantImage.MAX_IMAGES_PER_VARIANT):
+            ProductVariantImage.objects.create(
+                variant=self.variant, image=_fake_image(f"g{i}.jpg"), role=ProductVariantImage.ROLE_GALLERY,
+            )
+        eleventh = ProductVariantImage(
+            variant=self.variant, image=_fake_image("g11.jpg"), role=ProductVariantImage.ROLE_GALLERY,
+        )
+        with self.assertRaises(ValidationError):
+            eleventh.full_clean()
+
+    def test_editing_an_existing_image_does_not_count_against_its_own_slot(self):
+        images = [
+            ProductVariantImage.objects.create(
+                variant=self.variant, image=_fake_image(f"g{i}.jpg"), role=ProductVariantImage.ROLE_GALLERY,
+            )
+            for i in range(ProductVariantImage.MAX_IMAGES_PER_VARIANT)
+        ]
+        # At exactly 10, re-saving one of the existing 10 (e.g. changing its
+        # alt_text) must not be rejected as "would exceed the cap".
+        images[0].alt_text = "Updated alt text"
+        images[0].full_clean()  # must not raise
+
+    def test_one_primary_per_variant_enforced(self):
+        ProductVariantImage.objects.create(
+            variant=self.variant, image=_fake_image("p1.jpg"), role=ProductVariantImage.ROLE_PRIMARY,
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                ProductVariantImage.objects.create(
+                    variant=self.variant, image=_fake_image("p2.jpg"), role=ProductVariantImage.ROLE_PRIMARY,
+                )
+
+    def test_one_secondary_per_variant_enforced(self):
+        ProductVariantImage.objects.create(
+            variant=self.variant, image=_fake_image("s1.jpg"), role=ProductVariantImage.ROLE_SECONDARY,
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                ProductVariantImage.objects.create(
+                    variant=self.variant, image=_fake_image("s2.jpg"), role=ProductVariantImage.ROLE_SECONDARY,
+                )
+
+    def test_gallery_role_allows_multiple(self):
+        for i in range(3):
+            ProductVariantImage.objects.create(
+                variant=self.variant, image=_fake_image(f"g{i}.jpg"), role=ProductVariantImage.ROLE_GALLERY,
+            )
+        self.assertEqual(
+            ProductVariantImage.objects.filter(variant=self.variant, role=ProductVariantImage.ROLE_GALLERY).count(),
+            3,
+        )
+
+    def test_images_ordered_by_sort_order(self):
+        # Keyed off alt_text rather than the stored filename — storage
+        # auto-suffixes on a filename collision with a leftover file from a
+        # prior test run, which would make a filename-based assertion flaky.
+        ProductVariantImage.objects.create(variant=self.variant, image=_fake_image("c.jpg"), sort_order=2, alt_text="third")
+        ProductVariantImage.objects.create(variant=self.variant, image=_fake_image("a.jpg"), sort_order=0, alt_text="first")
+        ProductVariantImage.objects.create(variant=self.variant, image=_fake_image("b.jpg"), sort_order=1, alt_text="second")
+        alt_texts = [img.alt_text for img in self.variant.images.all()]
+        self.assertEqual(alt_texts, ["first", "second", "third"])
+
+    def test_deleting_primary_does_not_promote_another_image(self):
+        primary = ProductVariantImage.objects.create(
+            variant=self.variant, image=_fake_image("p.jpg"), role=ProductVariantImage.ROLE_PRIMARY,
+        )
+        ProductVariantImage.objects.create(
+            variant=self.variant, image=_fake_image("g.jpg"), role=ProductVariantImage.ROLE_GALLERY,
+        )
+        primary.delete()
+        self.assertFalse(
+            ProductVariantImage.objects.filter(variant=self.variant, role=ProductVariantImage.ROLE_PRIMARY).exists()
+        )
+        # The gallery image must still be gallery, not silently promoted.
+        remaining = ProductVariantImage.objects.get(variant=self.variant)
+        self.assertEqual(remaining.role, ProductVariantImage.ROLE_GALLERY)
+
+    def test_alt_text_persisted(self):
+        img = ProductVariantImage.objects.create(
+            variant=self.variant, image=_fake_image("a.jpg"), alt_text="Rasasi Hawas 100ml bottle front view",
+        )
+        img.refresh_from_db()
+        self.assertEqual(img.alt_text, "Rasasi Hawas 100ml bottle front view")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12. ProductVariantImage — admin wiring
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ProductVariantImageAdminTests(TestCase):
+    def test_inline_max_num_matches_model_limit(self):
+        self.assertEqual(ProductVariantImageInline.max_num, ProductVariantImage.MAX_IMAGES_PER_VARIANT)
+
+    def test_inline_enforces_max_num_server_side(self):
+        # validate_max=True is what makes max_num a real server-side cap
+        # instead of just a UI hint that a crafted POST could bypass.
+        self.assertTrue(ProductVariantImageInline.validate_max)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13. ProductVariantImage — API representation
+# ─────────────────────────────────────────────────────────────────────────────
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class ProductVariantImageAPITests(CatalogTestBase):
+    def setUp(self):
+        super().setUp()
+        self.variant = self.edition_sauvage.variants.get()
+        self.primary = ProductVariantImage.objects.create(
+            variant=self.variant, image=_fake_image("primary.jpg"),
+            role=ProductVariantImage.ROLE_PRIMARY, alt_text="Sauvage EDP 100ml front", sort_order=0,
+        )
+        self.secondary = ProductVariantImage.objects.create(
+            variant=self.variant, image=_fake_image("secondary.jpg"),
+            role=ProductVariantImage.ROLE_SECONDARY, sort_order=1,
+        )
+        self.gallery = ProductVariantImage.objects.create(
+            variant=self.variant, image=_fake_image("gallery.jpg"),
+            role=ProductVariantImage.ROLE_GALLERY, sort_order=2,
+        )
+
+    def _variant_payload(self):
+        response = self.client.get(detail_url("sauvage"))
+        return self._edition(response, "sauvage-edp")["variants"][0]
+
+    def test_images_array_includes_all_roles(self):
+        variant = self._variant_payload()
+        self.assertEqual(len(variant["images"]), 3)
+
+    def test_primary_image_field_matches_primary_role(self):
+        variant = self._variant_payload()
+        self.assertIsNotNone(variant["primary_image"])
+        self.assertEqual(variant["primary_image"]["role"], "primary")
+        self.assertEqual(variant["primary_image"]["alt_text"], "Sauvage EDP 100ml front")
+
+    def test_primary_image_is_none_when_no_primary_set(self):
+        self.primary.delete()
+        variant = self._variant_payload()
+        self.assertIsNone(variant["primary_image"])
+        # The remaining images are still returned, just not as primary_image.
+        self.assertEqual(len(variant["images"]), 2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14. Catalogue SEO — ProductEdition metadata
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CatalogSEOTests(CatalogTestBase):
+    def test_seo_title_falls_back_to_display_name_when_unset(self):
+        response = self.client.get(detail_url("chance"))
+        edition = self._edition(response, "chance-pour-homme")
+        self.assertEqual(edition["seo"]["title"], self.edition_chance_men.display_name())
+
+    def test_seo_title_uses_explicit_override(self):
+        self.edition_chance_men.seo_title = "Buy Chance Pour Homme Online | Smerfume"
+        self.edition_chance_men.save(update_fields=["seo_title"])
+        response = self.client.get(detail_url("chance"))
+        edition = self._edition(response, "chance-pour-homme")
+        self.assertEqual(edition["seo"]["title"], "Buy Chance Pour Homme Online | Smerfume")
+
+    def test_meta_description_is_null_when_unset(self):
+        response = self.client.get(detail_url("chance"))
+        edition = self._edition(response, "chance-pour-homme")
+        self.assertIsNone(edition["seo"]["meta_description"])
+
+    def test_meta_description_uses_explicit_value(self):
+        self.edition_chance_men.meta_description = "A woody floral for men."
+        self.edition_chance_men.save(update_fields=["meta_description"])
+        response = self.client.get(detail_url("chance"))
+        edition = self._edition(response, "chance-pour-homme")
+        self.assertEqual(edition["seo"]["meta_description"], "A woody floral for men.")
+
+    def test_og_title_falls_back_to_seo_title_then_display_name(self):
+        response = self.client.get(detail_url("chance"))
+        edition = self._edition(response, "chance-pour-homme")
+        self.assertEqual(edition["seo"]["og_title"], self.edition_chance_men.display_name())
+
+        self.edition_chance_men.seo_title = "SEO Title"
+        self.edition_chance_men.save(update_fields=["seo_title"])
+        response = self.client.get(detail_url("chance"))
+        edition = self._edition(response, "chance-pour-homme")
+        self.assertEqual(edition["seo"]["og_title"], "SEO Title")
+
+        self.edition_chance_men.og_title = "OG Title"
+        self.edition_chance_men.save(update_fields=["og_title"])
+        response = self.client.get(detail_url("chance"))
+        edition = self._edition(response, "chance-pour-homme")
+        self.assertEqual(edition["seo"]["og_title"], "OG Title")
+
+    def test_is_indexable_defaults_true(self):
+        response = self.client.get(detail_url("chance"))
+        edition = self._edition(response, "chance-pour-homme")
+        self.assertTrue(edition["seo"]["is_indexable"])
+
+    def test_is_indexable_false_is_respected(self):
+        self.edition_chance_men.is_indexable = False
+        self.edition_chance_men.save(update_fields=["is_indexable"])
+        response = self.client.get(detail_url("chance"))
+        edition = self._edition(response, "chance-pour-homme")
+        self.assertFalse(edition["seo"]["is_indexable"])
+
+    def test_list_serializer_does_not_include_seo_block(self):
+        # SEO metadata is only meaningful for the single canonical page being
+        # rendered — keeping it off the list/search payload keeps that
+        # response lean, per the search-vs-SEO separation.
+        response = self.client.get(LIST_URL)
+        chance_men = self._list_edition(response, "chance", "chance-pour-homme")
+        self.assertNotIn("seo", chance_men)
+
+    def test_duplicate_edition_slug_within_same_product_rejected(self):
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                ProductEdition.objects.create(
+                    product=self.product_chance, name="Duplicate",
+                    slug="chance-pour-homme",  # already used by edition_chance_men
+                    gender="unisex", concentration="edp",
+                )
+
+    def test_same_slug_allowed_across_different_products(self):
+        # Scoped uniqueness: "original" under Chance does not collide with
+        # "original" under Sauvage.
+        ProductEdition.objects.create(
+            product=self.product_chance, name="Original",
+            slug="original", gender="unisex", concentration="edp",
+        )
+        edition = ProductEdition.objects.create(
+            product=self.product_sauvage, name="Original",
+            slug="original", gender="unisex", concentration="edp",
+        )
+        self.assertIsNotNone(edition.pk)
+
+    def test_null_slugs_do_not_collide(self):
+        # Single-edition products intentionally leave slug null — multiple
+        # of those under the same product must not violate the constraint.
+        ProductEdition.objects.create(product=self.product_sauvage, gender="unisex", concentration="edt")
+        second = ProductEdition.objects.create(product=self.product_sauvage, gender="unisex", concentration="extrait")
+        self.assertIsNotNone(second.pk)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15. Catalogue availability & SKU exposure
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CatalogAvailabilityTests(CatalogTestBase):
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        # A default warehouse is already seeded by inventory's
+        # 0003_seed_default_warehouse data migration and persists across
+        # TestCase tests — reuse it rather than creating a second
+        # is_default=True row (unique_default_warehouse would reject that).
+        cls.warehouse = Warehouse.objects.filter(is_default=True).first() or Warehouse.objects.create(
+            name="Test Warehouse", is_default=True,
+        )
+        cls.sauvage_variant = cls.edition_sauvage.variants.get()
+
+    def test_variant_with_retail_stock_is_available(self):
+        InventoryStock.objects.create(
+            variant=self.sauvage_variant, warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal("5"),
+        )
+        response = self.client.get(detail_url("sauvage"))
+        variant = self._edition(response, "sauvage-edp")["variants"][0]
+        self.assertTrue(variant["is_available"])
+
+    def test_variant_without_stock_is_not_available(self):
+        response = self.client.get(detail_url("sauvage"))
+        variant = self._edition(response, "sauvage-edp")["variants"][0]
+        self.assertFalse(variant["is_available"])
+
+    def test_fully_reserved_stock_is_not_available(self):
+        InventoryStock.objects.create(
+            variant=self.sauvage_variant, warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL,
+            quantity=Decimal("5"), quantity_reserved=Decimal("5"),
+        )
+        response = self.client.get(detail_url("sauvage"))
+        variant = self._edition(response, "sauvage-edp")["variants"][0]
+        self.assertFalse(variant["is_available"])
+
+    def test_tester_stock_does_not_count_as_available(self):
+        # Only retail-type stock is purchasable/reservable — matches
+        # apps.inventory.services.reservation.
+        InventoryStock.objects.create(
+            variant=self.sauvage_variant, warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_TESTER, quantity=Decimal("5"),
+        )
+        response = self.client.get(detail_url("sauvage"))
+        variant = self._edition(response, "sauvage-edp")["variants"][0]
+        self.assertFalse(variant["is_available"])
+
+    def test_variant_sku_exposed_in_api(self):
+        response = self.client.get(detail_url("sauvage"))
+        variant = self._edition(response, "sauvage-edp")["variants"][0]
+        self.assertEqual(variant["sku"], "TEST-SAUVAGE-100ML")

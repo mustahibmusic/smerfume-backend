@@ -14,6 +14,7 @@ from .models import (
     Product,
     ProductEdition,
     ProductVariant,
+    ProductVariantImage,
     EditionNote,
 )
 
@@ -105,6 +106,24 @@ class ProductAdmin(ModelAdmin):
 
 
 # -------------------------
+# Product Variant Image Inline
+# -------------------------
+class ProductVariantImageInline(TabularInline):
+    model = ProductVariantImage
+    extra = 1
+    max_num = ProductVariantImage.MAX_IMAGES_PER_VARIANT
+    validate_max = True  # enforced server-side, not just as a UI hint
+    fields = ("image_preview", "image", "role", "alt_text", "sort_order")
+    readonly_fields = ("image_preview",)
+
+    @display(description="Preview")
+    def image_preview(self, obj):
+        if obj and obj.image:
+            return mark_safe(f'<img src="{obj.image.url}" style="height:50px;border-radius:4px;">')
+        return "—"
+
+
+# -------------------------
 # Product Variant
 # -------------------------
 @admin.register(ProductVariant)
@@ -122,8 +141,10 @@ class ProductVariantAdmin(ModelAdmin):
         "edition__product__name",
         "edition__name",
         "edition__product__brand__name",
+        "sku",
     )
     readonly_fields = ("image_preview",)
+    inlines = [ProductVariantImageInline]
 
     @display(description="Variant Product", header=True)
     def display_name_formatted(self, obj):
@@ -154,13 +175,36 @@ class ProductEditionAdmin(ModelAdmin):
         "notes_summary",
         "gender",
         "concentration",
+        "is_indexable",
         "image_preview",
     )
+    list_filter = ("is_indexable",)
 
     search_fields = (
         "product__name",
         "product__brand__name",
         "name",
+    )
+
+    fieldsets = (
+        (None, {
+            "fields": (
+                "product", "name", "slug", "image", "image_preview",
+                "gender", "concentration",
+                "is_best_seller", "is_new_arrival",
+            ),
+        }),
+        ("SEO", {
+            "fields": (
+                "seo_title", "meta_description",
+                "og_title", "og_description",
+                "is_indexable",
+            ),
+            "description": (
+                "Optional overrides for this edition's canonical product page. "
+                "Leave blank to use the auto-generated title/description."
+            ),
+        }),
     )
 
     prepopulated_fields = {"slug": ("name",)}

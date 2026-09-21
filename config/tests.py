@@ -30,3 +30,17 @@ class ResolveDjangoEnvTests(TestCase):
         for env in ("local", "staging", "uat", "production"):
             with patch.dict(os.environ, {"DJANGO_ENV": env}):
                 self.assertEqual(resolve_django_env(fail_closed=True), env)
+
+
+class StagingSettingsModuleTests(TestCase):
+    def test_staging_settings_imports_base_and_disables_debug(self):
+        import importlib
+        staging = importlib.import_module("config.settings.staging")
+        importlib.reload(staging)  # ensure a fresh import, not a cached empty module
+        self.assertFalse(staging.DEBUG)
+        self.assertTrue(hasattr(staging, "SECRET_KEY"))
+        self.assertTrue(hasattr(staging, "DATABASES"))
+        self.assertTrue(hasattr(staging, "INSTALLED_APPS"))
+        self.assertIn("apps.orders", staging.INSTALLED_APPS)
+        self.assertTrue(hasattr(staging, "ALLOWED_HOSTS"))
+        self.assertTrue(hasattr(staging, "CORS_ALLOWED_ORIGINS"))

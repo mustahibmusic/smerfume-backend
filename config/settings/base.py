@@ -26,6 +26,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "django.contrib.postgres",  # GinIndex / trigram search (apps.catalog)
 
     # Third-party
     "rest_framework",

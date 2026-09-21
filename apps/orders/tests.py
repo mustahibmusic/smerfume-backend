@@ -6,6 +6,18 @@ Test groups:
         requests on the same cart produce exactly one Order.
     CartRowLockDeterministicTests  — SEC-003: proves the Cart row lock
         itself blocks a second concurrent acquisition attempt.
+    AuthenticatedCheckoutTests    — existing checkout flow (regression guard)
+    GuestCheckoutTests            — guest checkout end-to-end
+    CheckoutInventoryTests        — Phase 3: reservation integration, insufficient stock
+    CheckoutFinancialSnapshotTests — Phase 3: discount/shipping/tax snapshot fields
+    AllocateDiscountTests         — order_services.allocate_discount unit tests
+    CODVerificationTests          — order_services.verify_cod_order
+    OrderDeliveredAtTests         — Order.save() delivered_at auto-population
+    PackOrderDirectRetailTests    — Phase 4: pack_order for direct retail lines
+    PackOrderDecantTests          — Phase 4: pack_order FIFO/bottle-opening for decants
+    PackOrderRollbackTests        — Phase 4: atomicity across a failed packing attempt
+    OrderStatusAdminLockdownTests — status is not editable through the admin form
+    OperationalStatusServiceTests — Phase 4.5: shipped/delivered/cancel services
 """
 
 import threading
@@ -132,6 +144,824 @@ def _make_decant_pair(source_size_ml=100, decant_volume_ml=10, source_retail_qua
     return source, decant
 
 
+# ── Authenticated checkout regression guard ──────────────────────────────────
+
+class AuthenticatedCheckoutTests(TestCase):
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user()
+        self.client.credentials(**_auth_header(self.user))
+        self.variant = _make_variant()
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=2)
+
+    def test_checkout_creates_order(self):
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.assertEqual(resp.status_code, 201)
+        self.assertTrue(resp.data["order_number"].startswith("SMR-"))
+        self.assertEqual(resp.data["is_guest_order"], False)
+
+    def test_checkout_clears_cart(self):
+        self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        cart = Cart.objects.get(user=self.user)
+        self.assertEqual(cart.items.count(), 0)
+
+    def test_checkout_empty_cart_returns_400(self):
+        Cart.objects.get(user=self.user).items.all().delete()
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_checkout_snapshots_price(self):
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        item = resp.data["items"][0]
+        self.assertEqual(str(item["unit_price"]), str(self.variant.selling_price))
+
+
+# ── Guest checkout tests ─────────────────────────────────────────────────────
+
+class GuestCheckoutTests(TestCase):
+
+    def setUp(self):
+        self.client = APIClient()
+        self.variant = _make_variant(size_ml=20)
+
+    def _make_guest_cart(self, token="guesttoken123"):
+        cart = Cart.objects.create(session_key=token)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=1)
+        return token
+
+    def test_guest_checkout_creates_order_and_user(self):
+        """A new guest mobile creates a User and links the order."""
+        token = self._make_guest_cart()
+        resp = self.client.post(
+            CHECKOUT_URL,
+            {"guest_email": "guest@example.com", "shipping_address": _SHIPPING},
+            format="json",
+            HTTP_X_CART_TOKEN=token,
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["is_guest_order"], True)
+
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        self.assertEqual(order.guest_email, "guest@example.com")
+        self.assertIsNotNone(order.user)
+        self.assertEqual(order.user.mobile_number, "9876543210")
+
+    def test_guest_checkout_clears_guest_cart(self):
+        token = self._make_guest_cart(token="cleartoken")
+        self.client.post(
+            CHECKOUT_URL,
+            {"guest_email": "guest2@example.com", "shipping_address": _SHIPPING},
+            format="json",
+            HTTP_X_CART_TOKEN="cleartoken",
+        )
+        cart = Cart.objects.get(session_key="cleartoken")
+        self.assertEqual(cart.items.count(), 0)
+
+    def test_guest_checkout_missing_email_returns_400(self):
+        token = self._make_guest_cart(token="noemail")
+        resp = self.client.post(
+            CHECKOUT_URL,
+            {"shipping_address": _SHIPPING},
+            format="json",
+            HTTP_X_CART_TOKEN="noemail",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("guest_email", resp.data["error"])
+
+    def test_guest_checkout_missing_cart_token_returns_400(self):
+        resp = self.client.post(
+            CHECKOUT_URL,
+            {"guest_email": "g@example.com", "shipping_address": _SHIPPING},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("X-Cart-Token", resp.data["error"])
+
+    def test_guest_checkout_invalid_cart_token_returns_400(self):
+        resp = self.client.post(
+            CHECKOUT_URL,
+            {"guest_email": "g@example.com", "shipping_address": _SHIPPING},
+            format="json",
+            HTTP_X_CART_TOKEN="doesnotexist",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_guest_checkout_empty_cart_returns_400(self):
+        Cart.objects.create(session_key="emptyguest")
+        resp = self.client.post(
+            CHECKOUT_URL,
+            {"guest_email": "g@example.com", "shipping_address": _SHIPPING},
+            format="json",
+            HTTP_X_CART_TOKEN="emptyguest",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_guest_checkout_links_to_existing_user_by_mobile(self):
+        """If the mobile already has an account, the order links to it."""
+        existing_user = _make_user(mobile="9876543210")
+        token = self._make_guest_cart(token="existingmobile")
+        resp = self.client.post(
+            CHECKOUT_URL,
+            {"guest_email": "new@example.com", "shipping_address": _SHIPPING},
+            format="json",
+            HTTP_X_CART_TOKEN="existingmobile",
+        )
+        self.assertEqual(resp.status_code, 201)
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        self.assertEqual(order.user.pk, existing_user.pk)
+
+    def test_guest_checkout_sets_email_on_new_user(self):
+        token = self._make_guest_cart(token="emailtoken")
+        self.client.post(
+            CHECKOUT_URL,
+            {"guest_email": "setme@example.com", "shipping_address": _SHIPPING},
+            format="json",
+            HTTP_X_CART_TOKEN="emailtoken",
+        )
+        user = User.objects.get(mobile_number="9876543210")
+        self.assertEqual(user.email, "setme@example.com")
+
+    def test_guest_checkout_does_not_overwrite_existing_email(self):
+        """If the existing user already has an email, it is not overwritten."""
+        _make_user(mobile="9876543210", email="original@example.com")
+        token = self._make_guest_cart(token="dontoverwrite")
+        self.client.post(
+            CHECKOUT_URL,
+            {"guest_email": "new@example.com", "shipping_address": _SHIPPING},
+            format="json",
+            HTTP_X_CART_TOKEN="dontoverwrite",
+        )
+        user = User.objects.get(mobile_number="9876543210")
+        self.assertEqual(user.email, "original@example.com")
+
+    def test_auto_created_user_can_see_order_after_login(self):
+        """Guest user created at checkout appears in order list after OTP login."""
+        token = self._make_guest_cart(token="logincheck")
+        resp = self.client.post(
+            CHECKOUT_URL,
+            {"guest_email": "logincheck@example.com", "shipping_address": _SHIPPING},
+            format="json",
+            HTTP_X_CART_TOKEN="logincheck",
+        )
+        self.assertEqual(resp.status_code, 201)
+
+        user = User.objects.get(mobile_number="9876543210")
+        self.client.credentials(**_auth_header(user))
+        list_resp = self.client.get("/api/orders/")
+        self.assertEqual(list_resp.status_code, 200)
+        results = list_resp.data["results"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["order_number"], resp.data["order_number"])
+
+
+# ── Phase 3: inventory reservation integration ────────────────────────────────
+
+class CheckoutInventoryTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user()
+        self.client.credentials(**_auth_header(self.user))
+        self.variant = _make_variant()
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=2)
+        self.warehouse = Warehouse.objects.get(is_default=True)
+
+    def test_checkout_reserves_inventory(self):
+        stock_before = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        )
+        self.assertEqual(stock_before.quantity_reserved, Decimal("0"))
+
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.assertEqual(resp.status_code, 201)
+
+        stock_after = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        )
+        self.assertEqual(stock_after.quantity_reserved, Decimal("2"))
+
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        order_item = order.items.get()
+        reservation = StockReservation.objects.get(order_item=order_item)
+        self.assertEqual(reservation.status, StockReservation.STATUS_HELD)
+        self.assertEqual(reservation.quantity, Decimal("2"))
+
+    def test_checkout_insufficient_stock_rejected_and_rolls_back(self):
+        stock = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        )
+        stock.quantity = Decimal("1")  # cart wants 2
+        stock.save(update_fields=["quantity"])
+
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+        self.assertEqual(Order.objects.count(), 0)
+        cart = Cart.objects.get(user=self.user)
+        self.assertEqual(cart.items.count(), 1)  # cart untouched — rolled back
+
+        stock.refresh_from_db()
+        self.assertEqual(stock.quantity_reserved, Decimal("0"))  # nothing partially reserved
+
+
+class CheckoutFinancialSnapshotTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user()
+        self.client.credentials(**_auth_header(self.user))
+        self.variant = _make_variant(selling_price="500.00")
+        self.variant.shipping_surcharge = Decimal("50.00")
+        self.variant.save(update_fields=["shipping_surcharge"])
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=3)
+
+    def test_financial_snapshot_fields_populated(self):
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.assertEqual(resp.status_code, 201)
+
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        item = order.items.get()
+
+        self.assertEqual(item.gross_line_amount, Decimal("1500.00"))  # 500 * 3
+        self.assertEqual(item.discount_allocated, Decimal("0.00"))    # no discount engine yet
+        self.assertEqual(item.net_line_amount, Decimal("1500.00"))
+        self.assertEqual(item.tax_amount, Decimal("0.00"))
+        self.assertEqual(item.final_paid_line_amount, Decimal("1500.00"))
+        self.assertEqual(item.shipping_surcharge, Decimal("150.00"))  # 50 * 3
+
+        self.assertEqual(order.base_shipping_charge, Decimal("0.00"))
+        self.assertEqual(order.shipping_charge, Decimal("150.00"))
+        self.assertEqual(order.total, order.subtotal + order.shipping_charge)
+        self.assertEqual(order.payment_method, Order.PAYMENT_METHOD_COD)
+
+
+class _FakeCartItem:
+    """Minimal stand-in with the .id/.line_total attributes allocate_discount needs."""
+
+    def __init__(self, id, line_total):
+        self.id = id
+        self.line_total = line_total
+
+
+class AllocateDiscountTests(TestCase):
+    def test_zero_discount_returns_all_zero(self):
+        items = [_FakeCartItem(1, Decimal("100.00")), _FakeCartItem(2, Decimal("200.00"))]
+        result = order_services.allocate_discount(items, Decimal("0.00"))
+        self.assertEqual(result, {1: Decimal("0.00"), 2: Decimal("0.00")})
+
+    def test_proportional_allocation_sums_exactly(self):
+        items = [_FakeCartItem(1, Decimal("300.00")), _FakeCartItem(2, Decimal("700.00"))]
+        result = order_services.allocate_discount(items, Decimal("100.00"))
+        self.assertEqual(result[1], Decimal("30.00"))
+        self.assertEqual(result[2], Decimal("70.00"))
+        self.assertEqual(sum(result.values()), Decimal("100.00"))
+
+    def test_rounding_remainder_goes_to_last_item(self):
+        items = [
+            _FakeCartItem(1, Decimal("100.00")),
+            _FakeCartItem(2, Decimal("100.00")),
+            _FakeCartItem(3, Decimal("100.00")),
+        ]
+        result = order_services.allocate_discount(items, Decimal("10.00"))
+        self.assertEqual(sum(result.values()), Decimal("10.00"))
+
+    def test_empty_items_returns_empty(self):
+        self.assertEqual(order_services.allocate_discount([], Decimal("50.00")), {})
+
+
+class CODVerificationTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user()
+        self.client.credentials(**_auth_header(self.user))
+        self.staff = _make_user(mobile="+919700000099", username="staffuser")
+        self.variant = _make_variant()
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=2)
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.order = Order.objects.get(order_number=resp.data["order_number"])
+
+    def test_verify_cod_order_confirms_order_and_reservations(self):
+        self.assertEqual(self.order.status, Order.STATUS_PENDING)
+        order_services.verify_cod_order(self.order, verified_by=self.staff)
+
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_CONFIRMED)
+        self.assertEqual(self.order.cod_verified_by, self.staff)
+        self.assertIsNotNone(self.order.cod_verified_at)
+
+        for reservation in StockReservation.objects.filter(order_item__order=self.order):
+            self.assertEqual(reservation.status, StockReservation.STATUS_CONFIRMED)
+
+    def test_cannot_verify_already_confirmed_order(self):
+        order_services.verify_cod_order(self.order, verified_by=self.staff)
+        with self.assertRaises(order_services.CODVerificationError):
+            order_services.verify_cod_order(self.order, verified_by=self.staff)
+
+    def test_cannot_verify_prepaid_order(self):
+        self.order.payment_method = Order.PAYMENT_METHOD_PREPAID
+        self.order.save(update_fields=["payment_method"])
+        with self.assertRaises(order_services.CODVerificationError):
+            order_services.verify_cod_order(self.order, verified_by=self.staff)
+
+
+class OrderDeliveredAtTests(TestCase):
+    def setUp(self):
+        self.user = _make_user()
+
+    def test_delivered_at_set_on_transition_to_delivered(self):
+        order = Order.objects.create(
+            user=self.user, order_number="SMR-DELIVTEST-000001",
+            subtotal=Decimal("100.00"), total=Decimal("100.00"),
+        )
+        self.assertIsNone(order.delivered_at)
+
+        order.status = Order.STATUS_DELIVERED
+        order.save()
+
+        order.refresh_from_db()
+        self.assertIsNotNone(order.delivered_at)
+
+    def test_delivered_at_not_overwritten_on_subsequent_saves(self):
+        order = Order.objects.create(
+            user=self.user, order_number="SMR-DELIVTEST-000002",
+            subtotal=Decimal("100.00"), total=Decimal("100.00"),
+        )
+        order.status = Order.STATUS_DELIVERED
+        order.save()
+        order.refresh_from_db()
+        first_delivered_at = order.delivered_at
+        self.assertIsNotNone(first_delivered_at)
+
+        order.customer_notes = "updated"
+        order.save()
+        order.refresh_from_db()
+        self.assertEqual(order.delivered_at, first_delivered_at)
+
+    def test_delivered_at_not_set_for_other_statuses(self):
+        order = Order.objects.create(
+            user=self.user, order_number="SMR-DELIVTEST-000003",
+            subtotal=Decimal("100.00"), total=Decimal("100.00"),
+        )
+        order.status = Order.STATUS_PROCESSING
+        order.save()
+        self.assertIsNone(order.delivered_at)
+
+
+# ── Phase 4: packing / exact reservation consumption ──────────────────────────
+
+class PackOrderDirectRetailTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user()
+        self.client.credentials(**_auth_header(self.user))
+        self.staff = _make_user(mobile="+919700000090", username="packstaff1")
+        self.variant = _make_variant()
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=3)
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.order = Order.objects.get(order_number=resp.data["order_number"])
+        self.warehouse = Warehouse.objects.get(is_default=True)
+
+    def test_pack_rejects_order_not_yet_confirmed(self):
+        with self.assertRaises(order_services.OrderPackingError):
+            order_services.pack_order(self.order, performed_by=self.staff)
+
+    def test_pack_consumes_exact_reserved_quantity_and_advances_status(self):
+        order_services.verify_cod_order(self.order, verified_by=self.staff)
+        stock_before = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        )
+        self.assertEqual(stock_before.quantity, Decimal("100"))
+        self.assertEqual(stock_before.quantity_reserved, Decimal("3"))
+
+        order_services.pack_order(self.order, performed_by=self.staff)
+
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_PROCESSING)
+
+        stock_after = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        )
+        self.assertEqual(stock_after.quantity, Decimal("97"))
+        self.assertEqual(stock_after.quantity_reserved, Decimal("0"))
+
+        reservation = StockReservation.objects.get(order_item__order=self.order)
+        self.assertEqual(reservation.status, StockReservation.STATUS_CONSUMED)
+
+    def test_pack_creates_sale_out_movement_linked_to_order_item(self):
+        order_services.verify_cod_order(self.order, verified_by=self.staff)
+        order_item = self.order.items.get()
+        order_services.pack_order(self.order, performed_by=self.staff)
+
+        movement = StockMovement.objects.get(source_order_item=order_item)
+        self.assertEqual(movement.movement_type, StockMovement.MOVEMENT_SALE_OUT)
+        self.assertEqual(movement.quantity_delta, Decimal("-3"))
+        self.assertEqual(movement.performed_by, self.staff)
+
+    def test_cannot_pack_the_same_order_twice(self):
+        order_services.verify_cod_order(self.order, verified_by=self.staff)
+        order_services.pack_order(self.order, performed_by=self.staff)
+        with self.assertRaises(order_services.OrderPackingError):
+            order_services.pack_order(self.order, performed_by=self.staff)
+
+    def test_shipped_and_delivered_do_not_deduct_inventory_again(self):
+        order_services.verify_cod_order(self.order, verified_by=self.staff)
+        order_services.pack_order(self.order, performed_by=self.staff)
+
+        stock_after_pack = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+        movement_count_after_pack = StockMovement.objects.count()
+
+        self.order.refresh_from_db()
+        self.order.status = Order.STATUS_SHIPPED
+        self.order.save()
+        self.order.status = Order.STATUS_DELIVERED
+        self.order.save()
+
+        stock_after_delivery = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+        self.assertEqual(stock_after_delivery, stock_after_pack)
+        self.assertEqual(StockMovement.objects.count(), movement_count_after_pack)
+        self.order.refresh_from_db()
+        self.assertIsNotNone(self.order.delivered_at)
+
+
+class PackOrderDecantTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user()
+        self.client.credentials(**_auth_header(self.user))
+        self.staff = _make_user(mobile="+919700000091", username="packstaff2")
+        self.warehouse = Warehouse.objects.get(is_default=True)
+
+    def _checkout_decant(self, source, decant, quantity):
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=decant, quantity=quantity)
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.assertEqual(resp.status_code, 201)
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        order_services.verify_cod_order(order, verified_by=self.staff)
+        return order
+
+    def test_pack_decant_from_existing_partial_lot_consumes_exact_lot(self):
+        source, decant = _make_decant_pair(source_size_ml=100, decant_volume_ml=10, source_retail_quantity=10)
+        txn = StockTransaction.objects.create(
+            transaction_type=StockTransaction.TYPE_DECANT_BOTTLE_OPENED
+        )
+        lot = PartialBottleLot.objects.create(
+            variant=source, warehouse=self.warehouse, remaining_ml=Decimal("50.00"),
+            opened_at=timezone.now(), source_transaction=txn,
+        )
+        order = self._checkout_decant(source, decant, quantity=1)  # 10ml needed
+
+        order_services.pack_order(order, performed_by=self.staff)
+
+        retail = InventoryStock.objects.get(variant=source, warehouse=self.warehouse, stock_type="retail")
+        self.assertEqual(retail.quantity, Decimal("10"))  # no bottle opened — no decrement
+
+        lot.refresh_from_db()
+        self.assertEqual(lot.remaining_ml, Decimal("40.00"))
+        self.assertEqual(lot.reserved_ml, Decimal("0.00"))
+        self.assertFalse(lot.is_depleted)
+
+        # No independent stock pool for the decant variant itself.
+        self.assertFalse(InventoryStock.objects.filter(variant=decant).exists())
+
+    def test_pack_decant_opens_bottle_and_creates_leftover_partial_lot(self):
+        source, decant = _make_decant_pair(source_size_ml=100, decant_volume_ml=10, source_retail_quantity=10)
+        order = self._checkout_decant(source, decant, quantity=1)  # 10ml, no partial stock exists
+
+        order_services.pack_order(order, performed_by=self.staff)
+
+        retail = InventoryStock.objects.get(variant=source, warehouse=self.warehouse, stock_type="retail")
+        self.assertEqual(retail.quantity, Decimal("9"))  # one bottle opened
+
+        lot = PartialBottleLot.objects.get(variant=source, warehouse=self.warehouse)
+        self.assertEqual(lot.remaining_ml, Decimal("90.00"))  # nothing lost
+        self.assertFalse(lot.is_depleted)
+
+        movements = list(StockMovement.objects.filter(
+            source_order_item=order.items.get()
+        ).order_by("id"))
+        self.assertEqual(
+            [m.movement_type for m in movements],
+            [
+                StockMovement.MOVEMENT_DECANT_BOTTLE_OPENED_RETAIL_OUT,
+                StockMovement.MOVEMENT_DECANT_BOTTLE_OPENED_PARTIAL_IN,
+                StockMovement.MOVEMENT_DECANT_FULFILLED_FROM_PARTIAL,
+            ],
+        )
+        group_ids = {m.transaction_group_id for m in movements}
+        self.assertEqual(len(group_ids), 1)  # all grouped under one StockTransaction
+
+    def test_pack_decant_mixed_partial_and_bottle_opening(self):
+        """15ml already sits in a partial lot; a 20ml order draws all 15ml
+        from it, then must open a bottle for the remaining 5ml — leaving
+        95ml as a fresh partial lot. Nothing is lost or double-counted."""
+        source, decant = _make_decant_pair(source_size_ml=100, decant_volume_ml=20, source_retail_quantity=5)
+        txn = StockTransaction.objects.create(
+            transaction_type=StockTransaction.TYPE_DECANT_BOTTLE_OPENED
+        )
+        existing_lot = PartialBottleLot.objects.create(
+            variant=source, warehouse=self.warehouse, remaining_ml=Decimal("15.00"),
+            opened_at=timezone.now(), source_transaction=txn,
+        )
+        order = self._checkout_decant(source, decant, quantity=1)  # 20ml needed
+
+        order_services.pack_order(order, performed_by=self.staff)
+
+        existing_lot.refresh_from_db()
+        self.assertEqual(existing_lot.remaining_ml, Decimal("0.00"))
+        self.assertTrue(existing_lot.is_depleted)
+
+        retail = InventoryStock.objects.get(variant=source, warehouse=self.warehouse, stock_type="retail")
+        self.assertEqual(retail.quantity, Decimal("4"))  # exactly one new bottle opened
+
+        new_lot = PartialBottleLot.objects.exclude(pk=existing_lot.pk).get(
+            variant=source, warehouse=self.warehouse
+        )
+        self.assertEqual(new_lot.remaining_ml, Decimal("95.00"))  # 100 opened - 5 claimed
+
+
+class PackOrderRollbackTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user()
+        self.client.credentials(**_auth_header(self.user))
+        self.staff = _make_user(mobile="+919700000092", username="packstaff3")
+        self.variant_a = _make_variant()
+        self.variant_b = _make_variant()
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant_a, quantity=1)
+        CartItem.objects.create(cart=cart, variant=self.variant_b, quantity=1)
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.order = Order.objects.get(order_number=resp.data["order_number"])
+        order_services.verify_cod_order(self.order, verified_by=self.staff)
+        self.warehouse = Warehouse.objects.get(is_default=True)
+
+    def test_failed_packing_rolls_back_all_inventory_changes(self):
+        stock_a_before = InventoryStock.objects.get(
+            variant=self.variant_a, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+        stock_b_before = InventoryStock.objects.get(
+            variant=self.variant_b, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+
+        original_consume = reservation_service.consume_reservation
+        call_count = {"n": 0}
+
+        def _flaky_consume(reservation, performed_by=None):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise RuntimeError("simulated failure mid-packing")
+            return original_consume(reservation, performed_by=performed_by)
+
+        with patch(
+            "apps.orders.services.reservation_service.consume_reservation",
+            side_effect=_flaky_consume,
+        ):
+            with self.assertRaises(RuntimeError):
+                order_services.pack_order(self.order, performed_by=self.staff)
+
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_CONFIRMED)  # never advanced
+
+        stock_a_after = InventoryStock.objects.get(
+            variant=self.variant_a, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+        stock_b_after = InventoryStock.objects.get(
+            variant=self.variant_b, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+        # Item A "succeeded" before item B's simulated failure — but the
+        # whole packing transaction must roll back together.
+        self.assertEqual(stock_a_after, stock_a_before)
+        self.assertEqual(stock_b_after, stock_b_before)
+
+        for res in StockReservation.objects.filter(order_item__order=self.order):
+            self.assertEqual(res.status, StockReservation.STATUS_CONFIRMED)
+
+
+# ── Admin integrity: status is not directly editable ──────────────────────────
+
+class OrderStatusAdminLockdownTests(TestCase):
+    def setUp(self):
+        self.staff = User.objects.create_superuser(
+            username="adminstaff", email="adminstaff@example.com", password="testpass123",
+        )
+        self.user = _make_user(mobile="+919700000093")
+        self.order = Order.objects.create(
+            user=self.user, order_number="SMR-ADMINTEST-000001",
+            subtotal=Decimal("500.00"), total=Decimal("500.00"),
+            status=Order.STATUS_CONFIRMED,
+        )
+        self.order_admin = OrderAdmin(Order, django_admin.site)
+
+    def test_status_is_declared_readonly(self):
+        self.assertIn("status", self.order_admin.readonly_fields)
+
+    def test_admin_form_excludes_status_from_editable_fields(self):
+        """readonly_fields are excluded from the ModelForm entirely — this
+        is what actually makes the field non-editable, not just visually
+        disabled. Proving it at the form-class level, not just by rendering."""
+        request = RequestFactory().get("/")
+        request.user = self.staff
+        form_class = self.order_admin.get_form(request, self.order)
+        self.assertNotIn("status", form_class.base_fields)
+
+    def test_admin_change_page_does_not_render_status_as_an_editable_widget(self):
+        self.client.login(username="adminstaff@example.com", password="testpass123")
+        url = f"/admin/orders/order/{self.order.pk}/change/"
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotContains(resp, 'name="status"')
+        # Still visible for staff to see, just not as an editable input —
+        # readonly fields render their human-readable choice label.
+        self.assertContains(resp, "Confirmed")
+
+    def test_pack_order_remains_the_only_path_to_processing(self):
+        """Regression guard: the lockdown must not have broken the service
+        path itself — pack_order still works exactly as Phase 4 left it."""
+        variant = _make_variant()
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=variant, quantity=1)
+        self.client_api = APIClient()
+        self.client_api.credentials(**_auth_header(self.user))
+        resp = self.client_api.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        order = Order.objects.get(order_number=resp.data["order_number"])
+
+        with self.assertRaises(order_services.OrderPackingError):
+            order_services.pack_order(order, performed_by=self.staff)  # still pending
+
+        order_services.verify_cod_order(order, verified_by=self.staff)
+        order_services.pack_order(order, performed_by=self.staff)
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.STATUS_PROCESSING)
+
+
+# ── Phase 4.5: operational status services ────────────────────────────────────
+
+class OperationalStatusServiceTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user()
+        self.client.credentials(**_auth_header(self.user))
+        self.staff = _make_user(mobile="+919700000094", username="opsstaff")
+        self.variant = _make_variant()
+        self.warehouse = Warehouse.objects.get(is_default=True)
+
+    def _new_order(self, quantity=2):
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=quantity)
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.assertEqual(resp.status_code, 201)
+        return Order.objects.get(order_number=resp.data["order_number"])
+
+    def _order_at_processing(self, quantity=2):
+        order = self._new_order(quantity)
+        order_services.verify_cod_order(order, verified_by=self.staff)
+        order_services.pack_order(order, performed_by=self.staff)
+        order.refresh_from_db()
+        return order
+
+    # ── mark_order_shipped ──────────────────────────────────────────────
+
+    def test_processing_to_shipped_works(self):
+        order = self._order_at_processing()
+        order_services.mark_order_shipped(order, tracking_number="TRK123")
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.STATUS_SHIPPED)
+        self.assertEqual(order.tracking_number, "TRK123")
+
+    def test_mark_shipped_rejected_from_non_processing_status(self):
+        order = self._new_order()  # still pending
+        with self.assertRaises(order_services.OrderTransitionError):
+            order_services.mark_order_shipped(order)
+
+    def test_mark_shipped_without_tracking_number_is_allowed(self):
+        order = self._order_at_processing()
+        order_services.mark_order_shipped(order)
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.STATUS_SHIPPED)
+        self.assertIsNone(order.tracking_number)
+
+    def test_shipped_does_not_mutate_inventory(self):
+        order = self._order_at_processing()
+        stock_before = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+        movement_count_before = StockMovement.objects.count()
+
+        order_services.mark_order_shipped(order, tracking_number="TRK456")
+
+        stock_after = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+        self.assertEqual(stock_after, stock_before)
+        self.assertEqual(StockMovement.objects.count(), movement_count_before)
+
+    # ── mark_order_delivered ────────────────────────────────────────────
+
+    def test_shipped_to_delivered_works_and_sets_delivered_at(self):
+        order = self._order_at_processing()
+        order_services.mark_order_shipped(order)
+        order.refresh_from_db()
+        self.assertIsNone(order.delivered_at)
+
+        order_services.mark_order_delivered(order)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.STATUS_DELIVERED)
+        self.assertIsNotNone(order.delivered_at)
+
+    def test_mark_delivered_rejected_from_non_shipped_status(self):
+        order = self._order_at_processing()  # processing, not shipped
+        with self.assertRaises(order_services.OrderTransitionError):
+            order_services.mark_order_delivered(order)
+
+    def test_delivered_does_not_mutate_inventory(self):
+        order = self._order_at_processing()
+        order_services.mark_order_shipped(order)
+        stock_before = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+        movement_count_before = StockMovement.objects.count()
+
+        order_services.mark_order_delivered(order)
+
+        stock_after = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+        self.assertEqual(stock_after, stock_before)
+        self.assertEqual(StockMovement.objects.count(), movement_count_before)
+
+    # ── cancel_order ─────────────────────────────────────────────────────
+
+    def test_cancelling_from_pending_releases_reservation(self):
+        order = self._new_order(quantity=3)
+        stock = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        )
+        self.assertEqual(stock.quantity_reserved, Decimal("3"))
+
+        order_services.cancel_order(order)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.STATUS_CANCELLED)
+        stock.refresh_from_db()
+        self.assertEqual(stock.quantity_reserved, Decimal("0"))
+        reservation = StockReservation.objects.get(order_item__order=order)
+        self.assertEqual(reservation.status, StockReservation.STATUS_RELEASED)
+
+    def test_cancelling_from_confirmed_releases_reservation(self):
+        order = self._new_order(quantity=4)
+        order_services.verify_cod_order(order, verified_by=self.staff)
+        stock = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        )
+        self.assertEqual(stock.quantity_reserved, Decimal("4"))
+
+        order_services.cancel_order(order)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.STATUS_CANCELLED)
+        stock.refresh_from_db()
+        self.assertEqual(stock.quantity_reserved, Decimal("0"))
+        reservation = StockReservation.objects.get(order_item__order=order)
+        self.assertEqual(reservation.status, StockReservation.STATUS_RELEASED)
+
+    def test_cancelling_after_processing_is_rejected(self):
+        order = self._order_at_processing()
+        with self.assertRaises(order_services.OrderTransitionError):
+            order_services.cancel_order(order)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.STATUS_PROCESSING)  # unchanged
+
+    def test_cancelling_after_shipped_is_rejected(self):
+        order = self._order_at_processing()
+        order_services.mark_order_shipped(order)
+        with self.assertRaises(order_services.OrderTransitionError):
+            order_services.cancel_order(order)
+
+    def test_reservation_cannot_be_released_twice_via_repeated_cancellation(self):
+        order = self._new_order(quantity=2)
+        order_services.cancel_order(order)
+
+        with self.assertRaises(order_services.OrderTransitionError):
+            order_services.cancel_order(order)  # already cancelled
+
+        stock = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        )
+        self.assertEqual(stock.quantity_reserved, Decimal("0"))  # never went negative
+        reservation = StockReservation.objects.get(order_item__order=order)
+        self.assertEqual(reservation.status, StockReservation.STATUS_RELEASED)
 # ── Checkout concurrency (SEC-003) ───────────────────────────────────────────
 #
 # Two tests, deliberately at different levels, per explicit instruction that

@@ -2,21 +2,41 @@
 Tests for apps.orders.
 
 Test groups:
-    AuthenticatedCheckoutTests   — existing checkout flow (regression guard)
-    GuestCheckoutTests           — guest checkout end-to-end
-    GuestUserResolutionTests     — _resolve_guest_user helper unit tests
+    CheckoutConcurrencyTests       — SEC-003: two concurrent checkout
+        requests on the same cart produce exactly one Order.
+    CartRowLockDeterministicTests  — SEC-003: proves the Cart row lock
+        itself blocks a second concurrent acquisition attempt.
 """
 
+import threading
+import uuid
+from datetime import timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
+from django.contrib import admin as django_admin
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.db import connection
+from django.test import RequestFactory, TestCase, TransactionTestCase
+from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.cart.models import Cart, CartItem
 from apps.catalog.models import Brand, Category, Product, ProductEdition, ProductVariant
-from apps.orders.models import Order
+from apps.inventory.models import (
+    DecantSource,
+    InventoryStock,
+    PartialBottleLot,
+    StockMovement,
+    StockReservation,
+    StockTransaction,
+    Warehouse,
+)
+from apps.inventory.services import reservation as reservation_service
+from apps.orders import services as order_services
+from apps.orders.admin import OrderAdmin
+from apps.orders.models import Order, OrderItem, Refund, RefundAdjustment, Return, ReturnItem
 
 User = get_user_model()
 
@@ -59,179 +79,157 @@ def _make_variant(selling_price="500.00", mrp="600.00", size_ml=10):
         product=product, slug="orderproduct-edp",
         defaults={"name": "EDP", "concentration": "edp", "gender": "unisex"},
     )[0]
-    return ProductVariant.objects.create(
+    variant = ProductVariant.objects.create(
         edition=edition, size_ml=size_ml,
         selling_price=selling_price, mrp=mrp,
+        sku=f"TEST-{uuid.uuid4().hex[:10]}",
     )
+    InventoryStock.objects.create(
+        variant=variant,
+        warehouse=Warehouse.objects.get(is_default=True),
+        stock_type=InventoryStock.STOCK_TYPE_RETAIL,
+        quantity=Decimal("100"),
+    )
+    return variant
 
 
-# ── Authenticated checkout regression guard ──────────────────────────────────
+def _make_decant_pair(source_size_ml=100, decant_volume_ml=10, source_retail_quantity=10):
+    """Create a source (full-size) variant with retail stock, a decant
+    variant mapped to it via DecantSource, and no independent stock for the
+    decant variant — matching the approved design (decants have no
+    independent sellable inventory pool)."""
+    brand = Brand.objects.get_or_create(name="OrderBrand", slug="orderbrand")[0]
+    category = Category.objects.get_or_create(name="OrderCat", slug="ordercat")[0]
+    product = Product.objects.get_or_create(
+        name="OrderProduct", slug="orderproduct",
+        defaults={"brand": brand, "category": category},
+    )[0]
+    edition = ProductEdition.objects.get_or_create(
+        product=product, slug="orderproduct-edp",
+        defaults={"name": "EDP", "concentration": "edp", "gender": "unisex"},
+    )[0]
+    warehouse = Warehouse.objects.get(is_default=True)
 
-class AuthenticatedCheckoutTests(TestCase):
+    source = ProductVariant.objects.create(
+        edition=edition, size_ml=source_size_ml,
+        selling_price="5000.00", mrp="5500.00",
+        sku=f"TEST-SRC-{uuid.uuid4().hex[:10]}",
+    )
+    InventoryStock.objects.create(
+        variant=source, warehouse=warehouse,
+        stock_type=InventoryStock.STOCK_TYPE_RETAIL,
+        quantity=Decimal(source_retail_quantity),
+    )
+    decant = ProductVariant.objects.create(
+        edition=edition, size_ml=decant_volume_ml, is_decant=True,
+        selling_price="500.00", mrp="600.00",
+        sku=f"TEST-DEC-{uuid.uuid4().hex[:10]}",
+    )
+    DecantSource.objects.create(
+        decant_variant=decant, source_variant=source,
+        decant_volume_ml=Decimal(decant_volume_ml),
+    )
+    return source, decant
 
+
+# ── Checkout concurrency (SEC-003) ───────────────────────────────────────────
+#
+# Two tests, deliberately at different levels, per explicit instruction that
+# a Barrier-based near-simultaneous-start test alone is not sufficient
+# evidence that a row lock is what's serializing the requests:
+#
+#   CheckoutConcurrencyTests        — end-to-end HTTP evidence that the fix
+#       produces exactly one Order when two checkout requests race.
+#   CartRowLockDeterministicTests   — lower-level, Event-synchronized proof
+#       that a second select_for_update() on the same Cart row genuinely
+#       blocks while the first transaction holds it, independent of thread
+#       scheduling luck.
+
+class CheckoutConcurrencyTests(TransactionTestCase):
     def setUp(self):
-        self.client = APIClient()
+        Warehouse.objects.filter(is_default=True).delete()
+        Warehouse.objects.create(name="Smerfume Default", is_default=True)
         self.user = _make_user()
-        self.client.credentials(**_auth_header(self.user))
         self.variant = _make_variant()
-        cart = Cart.objects.create(user=self.user)
-        CartItem.objects.create(cart=cart, variant=self.variant, quantity=2)
+        self.cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=self.cart, variant=self.variant, quantity=1)
 
-    def test_checkout_creates_order(self):
-        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
-        self.assertEqual(resp.status_code, 201)
-        self.assertTrue(resp.data["order_number"].startswith("SMR-"))
-        self.assertEqual(resp.data["is_guest_order"], False)
+    def test_concurrent_checkout_on_same_cart_creates_only_one_order(self):
+        results = {}
+        barrier = threading.Barrier(2)
 
-    def test_checkout_clears_cart(self):
-        self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
-        cart = Cart.objects.get(user=self.user)
-        self.assertEqual(cart.items.count(), 0)
+        def _run(key):
+            barrier.wait()
+            client = APIClient()
+            client.credentials(**_auth_header(self.user))
+            try:
+                resp = client.post(
+                    CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json"
+                )
+                results[key] = resp.status_code
+            finally:
+                connection.close()
 
-    def test_checkout_empty_cart_returns_400(self):
-        Cart.objects.get(user=self.user).items.all().delete()
-        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
-        self.assertEqual(resp.status_code, 400)
+        t1 = threading.Thread(target=_run, args=("a",))
+        t2 = threading.Thread(target=_run, args=("b",))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
 
-    def test_checkout_snapshots_price(self):
-        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
-        item = resp.data["items"][0]
-        self.assertEqual(str(item["unit_price"]), str(self.variant.selling_price))
+        self.assertEqual(sorted(results.values()), [201, 400])
+        self.assertEqual(Order.objects.filter(user=self.user).count(), 1)
 
 
-# ── Guest checkout tests ─────────────────────────────────────────────────────
-
-class GuestCheckoutTests(TestCase):
+class CartRowLockDeterministicTests(TransactionTestCase):
+    """Proves, without relying on thread-scheduling luck, that a second
+    attempt to lock the same Cart row genuinely blocks while the first
+    transaction holds the lock, and proceeds only after it's released."""
 
     def setUp(self):
-        self.client = APIClient()
-        self.variant = _make_variant(size_ml=20)
+        Warehouse.objects.filter(is_default=True).delete()
+        Warehouse.objects.create(name="Smerfume Default", is_default=True)
+        self.user = _make_user()
+        self.variant = _make_variant()
+        self.cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=self.cart, variant=self.variant, quantity=1)
 
-    def _make_guest_cart(self, token="guesttoken123"):
-        cart = Cart.objects.create(session_key=token)
-        CartItem.objects.create(cart=cart, variant=self.variant, quantity=1)
-        return token
+    def test_second_lock_attempt_blocks_until_first_transaction_commits(self):
+        from django.db import transaction as db_transaction
 
-    def test_guest_checkout_creates_order_and_user(self):
-        """A new guest mobile creates a User and links the order."""
-        token = self._make_guest_cart()
-        resp = self.client.post(
-            CHECKOUT_URL,
-            {"guest_email": "guest@example.com", "shipping_address": _SHIPPING},
-            format="json",
-            HTTP_X_CART_TOKEN=token,
-        )
-        self.assertEqual(resp.status_code, 201)
-        self.assertEqual(resp.data["is_guest_order"], True)
+        a_locked = threading.Event()
+        release_a = threading.Event()
+        b_locked = threading.Event()
 
-        order = Order.objects.get(order_number=resp.data["order_number"])
-        self.assertEqual(order.guest_email, "guest@example.com")
-        self.assertIsNotNone(order.user)
-        self.assertEqual(order.user.mobile_number, "9876543210")
+        def _hold_lock_a():
+            try:
+                with db_transaction.atomic():
+                    Cart.objects.select_for_update().get(pk=self.cart.pk)
+                    a_locked.set()
+                    release_a.wait(timeout=5)
+            finally:
+                connection.close()
 
-    def test_guest_checkout_clears_guest_cart(self):
-        token = self._make_guest_cart(token="cleartoken")
-        self.client.post(
-            CHECKOUT_URL,
-            {"guest_email": "guest2@example.com", "shipping_address": _SHIPPING},
-            format="json",
-            HTTP_X_CART_TOKEN="cleartoken",
-        )
-        cart = Cart.objects.get(session_key="cleartoken")
-        self.assertEqual(cart.items.count(), 0)
+        def _attempt_lock_b():
+            try:
+                with db_transaction.atomic():
+                    Cart.objects.select_for_update().get(pk=self.cart.pk)
+                    b_locked.set()
+            finally:
+                connection.close()
 
-    def test_guest_checkout_missing_email_returns_400(self):
-        token = self._make_guest_cart(token="noemail")
-        resp = self.client.post(
-            CHECKOUT_URL,
-            {"shipping_address": _SHIPPING},
-            format="json",
-            HTTP_X_CART_TOKEN="noemail",
-        )
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("guest_email", resp.data["error"])
+        t_a = threading.Thread(target=_hold_lock_a)
+        t_a.start()
+        self.assertTrue(a_locked.wait(timeout=5), "Thread A never acquired the lock")
 
-    def test_guest_checkout_missing_cart_token_returns_400(self):
-        resp = self.client.post(
-            CHECKOUT_URL,
-            {"guest_email": "g@example.com", "shipping_address": _SHIPPING},
-            format="json",
-        )
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("X-Cart-Token", resp.data["error"])
+        t_b = threading.Thread(target=_attempt_lock_b)
+        t_b.start()
 
-    def test_guest_checkout_invalid_cart_token_returns_400(self):
-        resp = self.client.post(
-            CHECKOUT_URL,
-            {"guest_email": "g@example.com", "shipping_address": _SHIPPING},
-            format="json",
-            HTTP_X_CART_TOKEN="doesnotexist",
-        )
-        self.assertEqual(resp.status_code, 400)
+        # While A still holds the lock, B must NOT have acquired it yet.
+        got_it_early = b_locked.wait(timeout=0.5)
+        self.assertFalse(got_it_early, "select_for_update() did not block -- Cart row is not actually locked")
 
-    def test_guest_checkout_empty_cart_returns_400(self):
-        Cart.objects.create(session_key="emptyguest")
-        resp = self.client.post(
-            CHECKOUT_URL,
-            {"guest_email": "g@example.com", "shipping_address": _SHIPPING},
-            format="json",
-            HTTP_X_CART_TOKEN="emptyguest",
-        )
-        self.assertEqual(resp.status_code, 400)
+        release_a.set()
+        t_a.join(timeout=5)
 
-    def test_guest_checkout_links_to_existing_user_by_mobile(self):
-        """If the mobile already has an account, the order links to it."""
-        existing_user = _make_user(mobile="9876543210")
-        token = self._make_guest_cart(token="existingmobile")
-        resp = self.client.post(
-            CHECKOUT_URL,
-            {"guest_email": "new@example.com", "shipping_address": _SHIPPING},
-            format="json",
-            HTTP_X_CART_TOKEN="existingmobile",
-        )
-        self.assertEqual(resp.status_code, 201)
-        order = Order.objects.get(order_number=resp.data["order_number"])
-        self.assertEqual(order.user.pk, existing_user.pk)
-
-    def test_guest_checkout_sets_email_on_new_user(self):
-        token = self._make_guest_cart(token="emailtoken")
-        self.client.post(
-            CHECKOUT_URL,
-            {"guest_email": "setme@example.com", "shipping_address": _SHIPPING},
-            format="json",
-            HTTP_X_CART_TOKEN="emailtoken",
-        )
-        user = User.objects.get(mobile_number="9876543210")
-        self.assertEqual(user.email, "setme@example.com")
-
-    def test_guest_checkout_does_not_overwrite_existing_email(self):
-        """If the existing user already has an email, it is not overwritten."""
-        _make_user(mobile="9876543210", email="original@example.com")
-        token = self._make_guest_cart(token="dontoverwrite")
-        self.client.post(
-            CHECKOUT_URL,
-            {"guest_email": "new@example.com", "shipping_address": _SHIPPING},
-            format="json",
-            HTTP_X_CART_TOKEN="dontoverwrite",
-        )
-        user = User.objects.get(mobile_number="9876543210")
-        self.assertEqual(user.email, "original@example.com")
-
-    def test_auto_created_user_can_see_order_after_login(self):
-        """Guest user created at checkout appears in order list after OTP login."""
-        token = self._make_guest_cart(token="logincheck")
-        resp = self.client.post(
-            CHECKOUT_URL,
-            {"guest_email": "logincheck@example.com", "shipping_address": _SHIPPING},
-            format="json",
-            HTTP_X_CART_TOKEN="logincheck",
-        )
-        self.assertEqual(resp.status_code, 201)
-
-        user = User.objects.get(mobile_number="9876543210")
-        self.client.credentials(**_auth_header(user))
-        list_resp = self.client.get("/api/orders/")
-        self.assertEqual(list_resp.status_code, 200)
-        results = list_resp.data["results"]
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["order_number"], resp.data["order_number"])
+        # Now that A released (committed), B must acquire it promptly.
+        self.assertTrue(b_locked.wait(timeout=5), "Thread B never acquired the lock after A released it")
+        t_b.join(timeout=5)

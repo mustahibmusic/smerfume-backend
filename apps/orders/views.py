@@ -15,6 +15,7 @@ Guest checkout flow:
 import datetime
 import logging
 import secrets
+from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
@@ -30,7 +31,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.cart.models import Cart
+from apps.inventory.models import Warehouse
+from apps.inventory.services import reservation as reservation_service
+from apps.inventory.services.reservation import InsufficientStockError
 
+from . import services as order_services
 from .models import Order, OrderItem, ShippingAddress
 from .serializers import CheckoutSerializer, OrderSerializer
 
@@ -44,6 +49,11 @@ _CART_TOKEN_HEADER = OpenApiParameter(
     required=False,
     description="Guest cart token. Required for unauthenticated checkout.",
 )
+
+
+class EmptyCartError(Exception):
+    """Raised when a locked cart has no items — either it started empty,
+    or a concurrent request already checked it out and cleared it."""
 
 
 def _generate_order_number():
@@ -173,7 +183,6 @@ class CheckoutView(APIView):
             ),
         ],
     )
-    @transaction.atomic
     def post(self, request):
         serializer = CheckoutSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -189,39 +198,84 @@ class CheckoutView(APIView):
         if cart is None:
             return Response({"error": "Your cart is empty."}, status=status.HTTP_400_BAD_REQUEST)
 
-        cart_items = list(cart.items.select_related("variant").all())
-        if not cart_items:
+        try:
+            with transaction.atomic():
+                locked_cart = Cart.objects.select_for_update().get(pk=cart.pk)
+                cart_items = list(locked_cart.items.select_related("variant").all())
+                if not cart_items:
+                    raise EmptyCartError()
+                order = self._create_order_with_reservations(
+                    locked_cart, cart_items, user, guest_email, serializer
+                )
+        except InsufficientStockError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except EmptyCartError:
             return Response({"error": "Your cart is empty."}, status=status.HTTP_400_BAD_REQUEST)
 
-        subtotal = sum(item.line_total for item in cart_items)
-        total = subtotal  # discount logic added later via offers app
+        return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
+
+    def _create_order_with_reservations(self, cart, cart_items, user, guest_email, serializer):
+        """Everything that must succeed or fail together: Order/OrderItem
+        creation, inventory reservation per line, the shipping address, and
+        clearing the cart. Raises InsufficientStockError (caller maps it to
+        a 400) if any line can't be reserved — the whole transaction rolls
+        back, nothing partially created.
+        """
+        warehouse = Warehouse.objects.get(is_default=True)
+
+        subtotal = sum((item.line_total for item in cart_items), Decimal("0.00"))
+        # No discount engine is wired in yet (apps.offers is still an empty
+        # stub) — this is always 0 today. The allocation machinery below is
+        # ready for when a coupon/offer sets a real Order-level discount.
+        discount_amount = Decimal("0.00")
+        discount_allocations = order_services.allocate_discount(cart_items, discount_amount)
+
+        item_financials = {
+            item.id: order_services.build_order_item_financials(item, discount_allocations[item.id])
+            for item in cart_items
+        }
+
+        # base_shipping_charge is intentionally 0 and free_shipping_applied
+        # False — there is no free-shipping-threshold/base-charge rules
+        # engine defined anywhere in the project yet. Flagged as an open
+        # business decision rather than assumed. Per-item shipping_surcharge
+        # IS applied, since it's a direct snapshot of an already-configured
+        # ProductVariant.shipping_surcharge value.
+        base_shipping_charge = Decimal("0.00")
+        shipping_charge = base_shipping_charge + sum(
+            (f["shipping_surcharge"] for f in item_financials.values()), Decimal("0.00")
+        )
+
+        total = subtotal - discount_amount + shipping_charge
 
         order = Order.objects.create(
             user=user,
             order_number=_generate_order_number(),
             subtotal=subtotal,
+            discount_amount=discount_amount,
             total=total,
+            base_shipping_charge=base_shipping_charge,
+            shipping_charge=shipping_charge,
             customer_notes=serializer.validated_data.get("customer_notes", ""),
             guest_email=guest_email,
         )
 
-        OrderItem.objects.bulk_create([
-            OrderItem(
+        for cart_item in cart_items:
+            order_item = OrderItem.objects.create(
                 order=order,
-                variant=item.variant,
-                quantity=item.quantity,
-                unit_price=item.variant.selling_price,
-                line_total=item.line_total,
+                variant=cart_item.variant,
+                quantity=cart_item.quantity,
+                unit_price=cart_item.variant.selling_price,
+                **item_financials[cart_item.id],
             )
-            for item in cart_items
-        ])
+            reservation_service.reserve_for_order_item(order_item, warehouse)
 
         addr_data = serializer.validated_data["shipping_address"]
         ShippingAddress.objects.create(order=order, **addr_data)
 
         cart.items.all().delete()
 
-        return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
+        return order
 
     def _resolve_authenticated(self, request):
         """Return (cart, user, guest_email=None) for an authenticated request."""

@@ -54,6 +54,15 @@ class NormalizedNote:
     position: str  # "top" | "heart" | "base"
 
 
+@dataclass(frozen=True)
+class NotePositionConflict:
+    """One note listed by Parfumly in more than one pyramid position."""
+
+    name: str
+    positions: tuple  # every source position, in source order
+    kept: str  # position actually imported (the first one)
+
+
 @dataclass
 class NormalizedProduct:
     external_slug: str
@@ -65,6 +74,7 @@ class NormalizedProduct:
     notes: list[NormalizedNote]
     retail_sizes: list[RetailSize]
     warnings: list[str] = field(default_factory=list)
+    note_position_conflicts: list[NotePositionConflict] = field(default_factory=list)
 
 
 def clean_name(value):
@@ -93,20 +103,37 @@ def normalize_release_year(value, current_year=None):
     return None
 
 
-def is_possible_duplicate(a, b, threshold=NEAR_DUPLICATE_RATIO):
-    """
-    Heuristic flag for staff review — never used to merge records.
+def compact_key(value):
+    """match_key() with spaces and punctuation removed."""
+    return re.sub(r"[^0-9a-z]", "", match_key(value))
 
-    True when two names are not an exact key match but are either very
-    similar ("Blu" / "Blue", "Blush Noir" / "Blush Noire"), identical once
-    spaces/punctuation are ignored ("Oak Moss" / "Oakmoss"), or one
-    multi-word name is a whole-word prefix of the other ("Bin Shaikh" /
-    "Bin Shaikh Made In Uae").
+
+def is_strong_duplicate(a, b):
+    """
+    Strong alias evidence: not an exact key match, but identical once
+    spaces and punctuation are ignored ("Oud Rose" / "Oud-Rose",
+    "Oak Moss" / "Oakmoss").
     """
     key_a, key_b = match_key(a), match_key(b)
     if not key_a or not key_b or key_a == key_b:
         return False
-    if re.sub(r"[^0-9a-z]", "", key_a) == re.sub(r"[^0-9a-z]", "", key_b):
+    return bool(compact_key(a)) and compact_key(a) == compact_key(b)
+
+
+def is_possible_duplicate(a, b, threshold=NEAR_DUPLICATE_RATIO):
+    """
+    Heuristic similarity flag for staff review — never used to merge or
+    block records.
+
+    True for strong duplicates (see is_strong_duplicate) and for names that
+    are merely similar ("Blu" / "Blue", "Blush Noir" / "Blush Noire") or
+    where one multi-word name is a whole-word prefix of the other
+    ("Bin Shaikh" / "Bin Shaikh Made In Uae").
+    """
+    key_a, key_b = match_key(a), match_key(b)
+    if not key_a or not key_b or key_a == key_b:
+        return False
+    if is_strong_duplicate(a, b):
         return True
     if difflib.SequenceMatcher(None, key_a, key_b).ratio() >= threshold:
         return True
@@ -154,7 +181,7 @@ def normalize_product(detail):
         warnings.append(f"unsupported concentration {raw_conc!r} skipped")
 
     notes = []
-    seen = {}
+    seen = {}  # note key -> (display name, [positions in source order])
     raw_notes = detail.get("notes")
     if isinstance(raw_notes, dict):
         for position, entries in raw_notes.items():
@@ -167,15 +194,20 @@ def normalize_product(detail):
                     continue
                 key = match_key(note_name)
                 if key in seen:
-                    if seen[key] != position:
-                        warnings.append(
-                            f"note {note_name!r} listed as {seen[key]} and {position}; kept {seen[key]}"
-                        )
+                    seen[key][1].append(position)
                     continue
-                seen[key] = position
+                seen[key] = (note_name, [position])
                 notes.append(NormalizedNote(note_name, position))
     elif raw_notes:
         warnings.append("notes without positions skipped")
+
+    # EditionNote allows one position per note: the first position is kept
+    # and every conflict is surfaced rather than silently dropped.
+    note_position_conflicts = [
+        NotePositionConflict(note_name, tuple(dict.fromkeys(positions)), positions[0])
+        for note_name, positions in seen.values()
+        if len(set(positions)) > 1
+    ]
 
     return NormalizedProduct(
         external_slug=external_slug,
@@ -187,4 +219,5 @@ def normalize_product(detail):
         notes=notes,
         retail_sizes=retail_sizes,
         warnings=warnings,
+        note_position_conflicts=note_position_conflicts,
     )

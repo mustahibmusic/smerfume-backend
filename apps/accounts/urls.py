@@ -1,5 +1,6 @@
 from django.urls import path
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
+from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from rest_framework_simplejwt.views import TokenRefreshView
 
 from .views import LogoutView, MeView, RequestOTPView, ResendOTPView, VerifyOTPView
@@ -16,6 +17,38 @@ class _TaggedTokenRefreshView(TokenRefreshView):
             "With `ROTATE_REFRESH_TOKENS=True` (enabled) a new refresh token is also "
             "issued and the old one is blacklisted immediately."
         ),
+        examples=[
+            OpenApiExample(
+                "Refresh request",
+                request_only=True,
+                value={"refresh": "<refresh_token>"},
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(
+                response=TokenRefreshSerializer,
+                description="New access token, plus a rotated refresh token.",
+                examples=[
+                    OpenApiExample(
+                        "Success",
+                        value={"access": "<new_access_token>", "refresh": "<new_refresh_token>"},
+                    )
+                ],
+            ),
+            401: OpenApiResponse(
+                description="Refresh token is invalid, expired, or already blacklisted.",
+                examples=[
+                    OpenApiExample(
+                        "Expired token",
+                        value={"detail": "Token is expired", "code": "token_not_valid"},
+                    ),
+                    OpenApiExample(
+                        "Blacklisted token",
+                        value={"detail": "Token is blacklisted", "code": "token_not_valid"},
+                    ),
+                ],
+            ),
+        },
         auth=[],
     )
     def post(self, request, *args, **kwargs):

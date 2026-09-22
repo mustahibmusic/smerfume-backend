@@ -207,6 +207,9 @@ class ResendOTPView(APIView):
             400: OpenApiResponse(
                 description="Cooldown active, resend limit reached, or invalid session token.",
             ),
+            429: OpenApiResponse(
+                description="Global anonymous/user request rate limit exceeded.",
+            ),
         },
         auth=[],
     )

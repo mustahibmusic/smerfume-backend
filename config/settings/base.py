@@ -104,7 +104,9 @@ SPECTACULAR_SETTINGS = {
         {"name": "Orders", "description": "Checkout and order history"},
     ],
     "SECURITY": [{"BearerAuth": []}],
-    "COMPONENTS": {
+    # APPEND_COMPONENTS (not COMPONENTS) is the drf-spectacular key that merges
+    # custom entries into the generated components section.
+    "APPEND_COMPONENTS": {
         "securitySchemes": {
             "BearerAuth": {
                 "type": "http",

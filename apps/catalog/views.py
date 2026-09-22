@@ -1,6 +1,12 @@
 from apps.inventory.models import InventoryStock
 from django.db.models import Prefetch
-from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
+from drf_spectacular.utils import (
+    OpenApiExample,
+    OpenApiParameter,
+    OpenApiResponse,
+    extend_schema,
+    extend_schema_view,
+)
 from rest_framework import filters, viewsets
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny
@@ -26,6 +32,27 @@ from .serializers import (
 # Precomputed valid choice sets — avoids recomputing per request
 _VALID_GENDERS = {c[0] for c in ProductEdition.GENDER_CHOICES}
 _VALID_CONCENTRATIONS = {c[0] for c in ProductEdition.CONCENTRATION_CHOICES}
+
+
+def _slug_path_param(resource):
+    return OpenApiParameter(
+        "slug",
+        str,
+        OpenApiParameter.PATH,
+        description=f"URL slug of the {resource}.",
+    )
+
+
+def _not_found_response(resource, model_name):
+    return OpenApiResponse(
+        description=f"No active {resource} exists with this identifier.",
+        examples=[
+            OpenApiExample(
+                "Not found",
+                value={"detail": f"No {model_name} matches the given query."},
+            )
+        ],
+    )
 
 
 @extend_schema_view(
@@ -56,12 +83,41 @@ _VALID_CONCENTRATIONS = {c[0] for c in ProductEdition.CONCENTRATION_CHOICES}
             OpenApiParameter("is_new_arrival", str, description="true | false"),
             OpenApiParameter("ordering", str, description="name | -name | brand__name | -brand__name"),
         ],
+        responses={
+            200: ProductListSerializer(many=True),
+            400: OpenApiResponse(
+                description=(
+                    "Invalid filter value: unknown `gender` or `concentration`, "
+                    "`is_best_seller` / `is_new_arrival` not `true` or `false`, "
+                    "or more than 5 `note` values."
+                ),
+                examples=[
+                    OpenApiExample(
+                        "Invalid gender",
+                        value={"gender": "Invalid value. Must be one of: men, unisex, women."},
+                    ),
+                    OpenApiExample(
+                        "Invalid boolean flag",
+                        value={"is_best_seller": "Must be 'true' or 'false'."},
+                    ),
+                    OpenApiExample(
+                        "Too many notes",
+                        value={"note": "Maximum 5 notes can be specified."},
+                    ),
+                ],
+            ),
+        },
         auth=[],
     ),
     retrieve=extend_schema(
         tags=["Catalog"],
         summary="Get product detail",
         description="Return full detail for a single product including all editions, notes, and variants.",
+        parameters=[_slug_path_param("product")],
+        responses={
+            200: ProductDetailSerializer,
+            404: _not_found_response("product", "Product"),
+        },
         auth=[],
     ),
 )
@@ -211,6 +267,12 @@ class ProductViewSet(viewsets.ReadOnlyModelViewSet):
     retrieve=extend_schema(
         tags=["Catalog"],
         summary="Get brand detail",
+        description="Return a single active brand by slug.",
+        parameters=[_slug_path_param("brand")],
+        responses={
+            200: BrandSerializer,
+            404: _not_found_response("brand", "Brand"),
+        },
         auth=[],
     ),
 )
@@ -233,6 +295,12 @@ class BrandViewSet(viewsets.ReadOnlyModelViewSet):
     retrieve=extend_schema(
         tags=["Catalog"],
         summary="Get category detail",
+        description="Return a single active product category by slug.",
+        parameters=[_slug_path_param("category")],
+        responses={
+            200: CategorySerializer,
+            404: _not_found_response("category", "Category"),
+        },
         auth=[],
     ),
 )
@@ -253,6 +321,11 @@ class CategoryViewSet(viewsets.ReadOnlyModelViewSet):
     retrieve=extend_schema(
         tags=["Catalog"],
         summary="Get perfume note detail",
+        description="Return a single active perfume note by ID.",
+        responses={
+            200: PerfumeNoteSerializer,
+            404: _not_found_response("perfume note", "PerfumeNote"),
+        },
         auth=[],
     ),
 )

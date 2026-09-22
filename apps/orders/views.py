@@ -19,6 +19,7 @@ from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
+from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
     OpenApiExample,
     OpenApiParameter,
@@ -53,6 +54,13 @@ _CART_TOKEN_HEADER = OpenApiParameter(
     location=OpenApiParameter.HEADER,
     required=False,
     description="Guest cart token. Required for unauthenticated checkout.",
+)
+
+_RETURN_PUBLIC_ID_PATH = OpenApiParameter(
+    "public_id",
+    OpenApiTypes.UUID,
+    OpenApiParameter.PATH,
+    description="Public UUID of the return request.",
 )
 
 
@@ -475,6 +483,7 @@ class ReturnDetailView(generics.RetrieveAPIView):
         tags=["Orders"],
         summary="Get return detail",
         description="Return full details of a single return request.",
+        parameters=[_RETURN_PUBLIC_ID_PATH],
         responses={
             200: ReturnDetailSerializer,
             401: OpenApiResponse(description="Access token missing or expired."),
@@ -502,6 +511,7 @@ class CancelReturnView(APIView):
             "cancel_return() for the exact rule, enforced entirely by the "
             "service layer."
         ),
+        parameters=[_RETURN_PUBLIC_ID_PATH],
         request=None,
         responses={
             200: ReturnDetailSerializer,

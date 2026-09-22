@@ -197,3 +197,120 @@ class ShippingAddress(BaseModel):
 
     def __str__(self):
         return f"{self.full_name}, {self.city}, {self.state} - {self.pincode}"
+
+
+class Return(BaseModel):
+    """The customer's overall return request/process. Disposition and
+    resolution live on ReturnItem (per-line), not here — this model tracks
+    only the process lifecycle."""
+
+    STATUS_REQUESTED = "requested"
+    STATUS_APPROVED = "approved"
+    STATUS_IN_TRANSIT = "in_transit"
+    STATUS_RECEIVED = "received"
+    STATUS_INSPECTION_PENDING = "inspection_pending"
+    STATUS_COMPLETED = "completed"
+    STATUS_REJECTED = "rejected"
+    STATUS_CANCELLED = "cancelled"
+
+    STATUS_CHOICES = [
+        (STATUS_REQUESTED, "Requested"),
+        (STATUS_APPROVED, "Approved"),
+        (STATUS_IN_TRANSIT, "In Transit"),
+        (STATUS_RECEIVED, "Received"),
+        (STATUS_INSPECTION_PENDING, "Inspection Pending"),
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_REJECTED, "Rejected"),
+        (STATUS_CANCELLED, "Cancelled"),
+    ]
+
+    order = models.ForeignKey(Order, on_delete=models.PROTECT, related_name="returns")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_REQUESTED, db_index=True)
+
+    class Meta:
+        db_table = "orders_return"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Return({self.order.order_number}, {self.status})"
+
+
+class ReturnItem(BaseModel):
+    """One returned line within a Return. Eligibility is enforced entirely
+    through `reason` — only documented, Smerfume-fault/logistics reasons are
+    valid; customer-preference returns ("didn't like it", "changed my
+    mind") are not supported and have no corresponding choice here."""
+
+    REASON_WRONG_ITEM = "wrong_item"
+    REASON_WRONG_VARIANT = "wrong_variant"
+    REASON_TRANSIT_DAMAGE = "transit_damage"
+    REASON_MANUFACTURING_DEFECT = "manufacturing_defect"
+    REASON_MISSING_ITEMS = "missing_items"
+
+    REASON_CHOICES = [
+        (REASON_WRONG_ITEM, "Wrong Item Received"),
+        (REASON_WRONG_VARIANT, "Wrong Variant/Size Received"),
+        (REASON_TRANSIT_DAMAGE, "Transit Damage"),
+        (REASON_MANUFACTURING_DEFECT, "Manufacturing Defect"),
+        (REASON_MISSING_ITEMS, "Missing Items"),
+    ]
+
+    DISPOSITION_RESTOCKED_RETAIL = "restocked_retail"
+    DISPOSITION_RESTOCKED_PARTIAL = "restocked_partial"
+    DISPOSITION_DAMAGED = "damaged"
+    DISPOSITION_REJECTED = "rejected"
+
+    DISPOSITION_CHOICES = [
+        (DISPOSITION_RESTOCKED_RETAIL, "Restocked - Retail"),
+        (DISPOSITION_RESTOCKED_PARTIAL, "Restocked - Partial"),
+        (DISPOSITION_DAMAGED, "Damaged"),
+        (DISPOSITION_REJECTED, "Rejected"),
+    ]
+
+    RESOLUTION_REFUND = "refund"
+    RESOLUTION_REPLACEMENT = "replacement"
+    RESOLUTION_NOT_APPLICABLE = "not_applicable"
+
+    RESOLUTION_CHOICES = [
+        (RESOLUTION_REFUND, "Refund"),
+        (RESOLUTION_REPLACEMENT, "Replacement"),
+        (RESOLUTION_NOT_APPLICABLE, "Not Applicable"),
+    ]
+
+    return_request = models.ForeignKey(Return, on_delete=models.CASCADE, related_name="items")
+    order_item = models.ForeignKey(OrderItem, on_delete=models.PROTECT, related_name="return_items")
+    reason = models.CharField(max_length=30, choices=REASON_CHOICES)
+    reason_notes = models.TextField(blank=True)
+    requested_quantity = models.PositiveSmallIntegerField()
+    # Set automatically (== requested_quantity) when the parent Return is
+    # approved — see approve_return(). Per-line approval below the requested
+    # quantity is not implemented; this field exists so finalize_return_item
+    # has a stable cap to validate received_quantity against.
+    approved_quantity = models.PositiveSmallIntegerField(null=True, blank=True)
+    received_quantity = models.PositiveSmallIntegerField(null=True, blank=True)
+
+    # ── Inspection / disposition — set only via finalize_return_item() ────
+    disposition = models.CharField(max_length=20, choices=DISPOSITION_CHOICES, null=True, blank=True)
+    resolution = models.CharField(max_length=20, choices=RESOLUTION_CHOICES, null=True, blank=True)
+    remaining_quantity_ml = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    inspection_notes = models.TextField(blank=True)
+    inspected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    inspected_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "orders_returnitem"
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(requested_quantity__gt=0), name="returnitem_requested_quantity_gt_0"
+            ),
+            models.CheckConstraint(
+                condition=models.Q(remaining_quantity_ml__isnull=True) | models.Q(remaining_quantity_ml__gt=0),
+                name="returnitem_remaining_ml_positive_or_null",
+            ),
+        ]
+
+    def __str__(self):
+        return f"ReturnItem({self.order_item}, {self.reason})"
+

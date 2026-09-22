@@ -1,6 +1,7 @@
 """
 Tests for apps.orders.
 
+
 Test groups:
     CheckoutConcurrencyTests       — SEC-003: two concurrent checkout
         requests on the same cart produce exactly one Order.
@@ -16,6 +17,10 @@ Test groups:
     PackOrderDirectRetailTests    — Phase 4: pack_order for direct retail lines
     PackOrderDecantTests          — Phase 4: pack_order FIFO/bottle-opening for decants
     PackOrderRollbackTests        — Phase 4: atomicity across a failed packing attempt
+    CreateReturnEligibilityTests   — Phase 5.1: create_return eligibility rules
+    ReturnLifecycleTests           — Phase 5.1: Return status transitions
+    ReturnEntitlementConcurrencyTests — Phase 5.1: concurrent-request safety
+    ReturnAPITests                 — Phase 5.1b: customer-facing Return API
     OrderStatusAdminLockdownTests — status is not editable through the admin form
     OperationalStatusServiceTests — Phase 4.5: shipped/delivered/cancel services
 """
@@ -48,7 +53,7 @@ from apps.inventory.models import (
 from apps.inventory.services import reservation as reservation_service
 from apps.orders import services as order_services
 from apps.orders.admin import OrderAdmin
-from apps.orders.models import Order, OrderItem
+from apps.orders.models import Order, OrderItem, Return, ReturnItem
 
 User = get_user_model()
 
@@ -1063,3 +1068,459 @@ class CartRowLockDeterministicTests(TransactionTestCase):
         # Now that A released (committed), B must acquire it promptly.
         self.assertTrue(b_locked.wait(timeout=5), "Thread B never acquired the lock after A released it")
         t_b.join(timeout=5)
+
+
+class CreateReturnEligibilityTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user()
+        self.client.credentials(**_auth_header(self.user))
+        self.staff = _make_user(mobile="+919700000095", username="returnstaff1")
+        self.variant = _make_variant()
+
+    def _delivered_order(self, quantity=3):
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=quantity)
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        order_services.verify_cod_order(order, verified_by=self.staff)
+        order_services.pack_order(order, performed_by=self.staff)
+        order_services.mark_order_shipped(order)
+        order_services.mark_order_delivered(order)
+        order.refresh_from_db()
+        return order
+
+    def test_valid_return_request_succeeds(self):
+        order = self._delivered_order(quantity=3)
+        order_item = order.items.get()
+
+        return_request = order_services.create_return(order, items=[
+            {"order_item": order_item, "reason": ReturnItem.REASON_WRONG_VARIANT,
+             "requested_quantity": 1, "reason_notes": "wrong size shipped"},
+        ])
+
+        self.assertEqual(return_request.status, Return.STATUS_REQUESTED)
+        item = return_request.items.get()
+        self.assertEqual(item.order_item, order_item)
+        self.assertEqual(item.reason, ReturnItem.REASON_WRONG_VARIANT)
+        self.assertEqual(item.requested_quantity, 1)
+
+    def test_rejected_when_order_not_delivered(self):
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=1)
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        order = Order.objects.get(order_number=resp.data["order_number"])  # still pending
+        order_item = order.items.get()
+
+        with self.assertRaises(order_services.ReturnEligibilityError):
+            order_services.create_return(order, items=[
+                {"order_item": order_item, "reason": ReturnItem.REASON_WRONG_ITEM, "requested_quantity": 1},
+            ])
+        self.assertEqual(Return.objects.count(), 0)
+
+    def test_rejected_outside_return_window(self):
+        order = self._delivered_order(quantity=1)
+        order.delivered_at = timezone.now() - timedelta(days=2)
+        order.save(update_fields=["delivered_at"])
+        order_item = order.items.get()
+
+        with self.assertRaises(order_services.ReturnEligibilityError):
+            order_services.create_return(order, items=[
+                {"order_item": order_item, "reason": ReturnItem.REASON_TRANSIT_DAMAGE, "requested_quantity": 1},
+            ])
+
+    def test_invalid_reason_rejected(self):
+        order = self._delivered_order(quantity=1)
+        order_item = order.items.get()
+
+        with self.assertRaises(order_services.ReturnEligibilityError):
+            order_services.create_return(order, items=[
+                {"order_item": order_item, "reason": "did_not_like_fragrance", "requested_quantity": 1},
+            ])
+        # Change-of-mind reasons simply have no matching choice at all.
+        self.assertNotIn("did_not_like_fragrance", dict(ReturnItem.REASON_CHOICES))
+
+    def test_requested_quantity_cannot_exceed_purchased_quantity(self):
+        order = self._delivered_order(quantity=2)
+        order_item = order.items.get()
+
+        with self.assertRaises(order_services.ReturnEligibilityError):
+            order_services.create_return(order, items=[
+                {"order_item": order_item, "reason": ReturnItem.REASON_MISSING_ITEMS, "requested_quantity": 3},
+            ])
+
+    def test_cumulative_quantity_across_multiple_returns_is_capped(self):
+        order = self._delivered_order(quantity=3)
+        order_item = order.items.get()
+
+        order_services.create_return(order, items=[
+            {"order_item": order_item, "reason": ReturnItem.REASON_WRONG_VARIANT, "requested_quantity": 1},
+        ])
+        order_services.create_return(order, items=[
+            {"order_item": order_item, "reason": ReturnItem.REASON_TRANSIT_DAMAGE, "requested_quantity": 2},
+        ])
+        # 1 + 2 == 3, fully claimed — a further return must be rejected.
+        with self.assertRaises(order_services.ReturnEligibilityError):
+            order_services.create_return(order, items=[
+                {"order_item": order_item, "reason": ReturnItem.REASON_MISSING_ITEMS, "requested_quantity": 1},
+            ])
+
+    def test_rejected_return_releases_entitlement(self):
+        order = self._delivered_order(quantity=2)
+        order_item = order.items.get()
+
+        first = order_services.create_return(order, items=[
+            {"order_item": order_item, "reason": ReturnItem.REASON_WRONG_VARIANT, "requested_quantity": 2},
+        ])
+        order_services.reject_return(first)
+
+        # The full quantity is claimable again since the rejected return no
+        # longer counts toward the cumulative entitlement.
+        second = order_services.create_return(order, items=[
+            {"order_item": order_item, "reason": ReturnItem.REASON_TRANSIT_DAMAGE, "requested_quantity": 2},
+        ])
+        self.assertEqual(second.items.get().requested_quantity, 2)
+
+
+class ReturnLifecycleTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user()
+        self.client.credentials(**_auth_header(self.user))
+        self.staff = _make_user(mobile="+919700000096", username="returnstaff2")
+        self.variant = _make_variant()
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=2)
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        order_services.verify_cod_order(order, verified_by=self.staff)
+        order_services.pack_order(order, performed_by=self.staff)
+        order_services.mark_order_shipped(order)
+        order_services.mark_order_delivered(order)
+        order.refresh_from_db()
+        self.order_item = order.items.get()
+        self.return_request = order_services.create_return(order, items=[
+            {"order_item": self.order_item, "reason": ReturnItem.REASON_WRONG_VARIANT, "requested_quantity": 2},
+        ])
+
+    def test_full_happy_path_lifecycle(self):
+        order_services.approve_return(self.return_request)
+        self.return_request.refresh_from_db()
+        self.assertEqual(self.return_request.status, Return.STATUS_APPROVED)
+
+        order_services.mark_return_in_transit(self.return_request)
+        self.return_request.refresh_from_db()
+        self.assertEqual(self.return_request.status, Return.STATUS_IN_TRANSIT)
+
+        item = self.return_request.items.get()
+        item.received_quantity = 2
+        item.save(update_fields=["received_quantity"])
+
+        order_services.mark_return_received(self.return_request)
+        self.return_request.refresh_from_db()
+        self.assertEqual(self.return_request.status, Return.STATUS_RECEIVED)
+
+        order_services.start_inspection(self.return_request)
+        self.return_request.refresh_from_db()
+        self.assertEqual(self.return_request.status, Return.STATUS_INSPECTION_PENDING)
+
+    def test_reject_from_requested(self):
+        order_services.reject_return(self.return_request)
+        self.return_request.refresh_from_db()
+        self.assertEqual(self.return_request.status, Return.STATUS_REJECTED)
+
+    def test_cannot_approve_twice(self):
+        order_services.approve_return(self.return_request)
+        with self.assertRaises(order_services.ReturnTransitionError):
+            order_services.approve_return(self.return_request)
+
+    def test_mark_received_rejects_when_quantity_not_recorded(self):
+        order_services.approve_return(self.return_request)
+        order_services.mark_return_in_transit(self.return_request)
+        # received_quantity never set on the item.
+        with self.assertRaises(order_services.ReturnTransitionError):
+            order_services.mark_return_received(self.return_request)
+
+    def test_cannot_skip_lifecycle_states(self):
+        with self.assertRaises(order_services.ReturnTransitionError):
+            order_services.mark_return_in_transit(self.return_request)  # still requested
+
+    def test_cancel_allowed_before_received(self):
+        order_services.approve_return(self.return_request)
+        order_services.cancel_return(self.return_request)
+        self.return_request.refresh_from_db()
+        self.assertEqual(self.return_request.status, Return.STATUS_CANCELLED)
+
+    def test_cancel_rejected_after_received(self):
+        order_services.approve_return(self.return_request)
+        order_services.mark_return_in_transit(self.return_request)
+        item = self.return_request.items.get()
+        item.received_quantity = 2
+        item.save(update_fields=["received_quantity"])
+        order_services.mark_return_received(self.return_request)
+
+        with self.assertRaises(order_services.ReturnTransitionError):
+            order_services.cancel_return(self.return_request)
+
+
+class ReturnEntitlementConcurrencyTests(TransactionTestCase):
+    def setUp(self):
+        Warehouse.objects.filter(is_default=True).delete()
+        self.warehouse = Warehouse.objects.create(name="Smerfume Default", is_default=True)
+        self.client = APIClient()
+        self.user = User.objects.create(
+            username="returnconcurrencyuser", mobile_number="+919700000097", role="customer",
+        )
+        self.user.set_unusable_password()
+        self.user.save()
+        self.client.credentials(**_auth_header(self.user))
+        self.staff = User.objects.create(
+            username="returnconcurrencystaff", mobile_number="+919700000098", role="staff",
+        )
+
+        brand = Brand.objects.get_or_create(name="OrderBrand", slug="orderbrand")[0]
+        category = Category.objects.get_or_create(name="OrderCat", slug="ordercat")[0]
+        product = Product.objects.get_or_create(
+            name="OrderProduct", slug="orderproduct",
+            defaults={"brand": brand, "category": category},
+        )[0]
+        edition = ProductEdition.objects.get_or_create(
+            product=product, slug="orderproduct-edp",
+            defaults={"name": "EDP", "concentration": "edp", "gender": "unisex"},
+        )[0]
+        self.variant = ProductVariant.objects.create(
+            edition=edition, size_ml=10, selling_price="500.00", mrp="600.00",
+            sku=f"TEST-{uuid.uuid4().hex[:10]}",
+        )
+        InventoryStock.objects.create(
+            variant=self.variant, warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal("100"),
+        )
+
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=3)
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.order = Order.objects.get(order_number=resp.data["order_number"])
+        order_services.verify_cod_order(self.order, verified_by=self.staff)
+        order_services.pack_order(self.order, performed_by=self.staff)
+        order_services.mark_order_shipped(self.order)
+        order_services.mark_order_delivered(self.order)
+        self.order.refresh_from_db()
+        self.order_item = self.order.items.get()  # quantity=3
+
+    def test_concurrent_return_requests_cannot_exceed_purchased_quantity(self):
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def _run(key, quantity):
+            barrier.wait()
+            try:
+                order_services.create_return(self.order, items=[
+                    {"order_item": self.order_item, "reason": ReturnItem.REASON_WRONG_VARIANT,
+                     "requested_quantity": quantity},
+                ])
+                results[key] = "ok"
+            except order_services.ReturnEligibilityError:
+                results[key] = "rejected"
+            finally:
+                connection.close()
+
+        t1 = threading.Thread(target=_run, args=("a", 2))
+        t2 = threading.Thread(target=_run, args=("b", 2))  # 2 + 2 > 3
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        self.assertEqual(sorted(results.values()), ["ok", "rejected"])
+        total_claimed = sum(
+            ri.requested_quantity for ri in ReturnItem.objects.filter(order_item=self.order_item)
+        )
+        self.assertLessEqual(total_claimed, self.order_item.quantity)
+
+
+# ── Phase 5.1b: customer-facing Return API ─────────────────────────────────────
+
+RETURNS_LIST_URL = "/api/orders/returns/"
+
+
+def _return_detail_url(public_id):
+    return f"/api/orders/returns/{public_id}/"
+
+
+def _return_cancel_url(public_id):
+    return f"/api/orders/returns/{public_id}/cancel/"
+
+
+def _order_return_create_url(order_number):
+    return f"/api/orders/{order_number}/returns/"
+
+
+class ReturnAPITests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user(mobile="+919700000099")
+        self.other_user = _make_user(mobile="+919700000100")
+        self.staff = _make_user(mobile="+919700000101", username="returnapistaff")
+        self.variant = _make_variant()
+
+    def _deliver_order_for(self, user, quantity=3):
+        client = APIClient()
+        client.credentials(**_auth_header(user))
+        cart = Cart.objects.create(user=user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=quantity)
+        resp = client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        order_services.verify_cod_order(order, verified_by=self.staff)
+        order_services.pack_order(order, performed_by=self.staff)
+        order_services.mark_order_shipped(order)
+        order_services.mark_order_delivered(order)
+        order.refresh_from_db()
+        return order
+
+    def test_authenticated_customer_creates_eligible_return(self):
+        order = self._deliver_order_for(self.user, quantity=3)
+        order_item = order.items.get()
+        self.client.credentials(**_auth_header(self.user))
+
+        resp = self.client.post(_order_return_create_url(order.order_number), {
+            "items": [
+                {"order_item": str(order_item.public_id), "reason": "wrong_variant",
+                 "requested_quantity": 1, "reason_notes": "size mismatch"},
+            ],
+        }, format="json")
+
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["status"], Return.STATUS_REQUESTED)
+        self.assertEqual(len(resp.data["items"]), 1)
+        self.assertEqual(resp.data["items"][0]["reason"], "wrong_variant")
+
+    def test_unauthenticated_request_rejected(self):
+        order = self._deliver_order_for(self.user, quantity=1)
+        order_item = order.items.get()
+        anon_client = APIClient()
+
+        resp = anon_client.post(_order_return_create_url(order.order_number), {
+            "items": [{"order_item": str(order_item.public_id), "reason": "wrong_item", "requested_quantity": 1}],
+        }, format="json")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_cannot_create_return_for_another_customers_order(self):
+        order = self._deliver_order_for(self.other_user, quantity=1)
+        order_item = order.items.get()
+        self.client.credentials(**_auth_header(self.user))  # different customer
+
+        resp = self.client.post(_order_return_create_url(order.order_number), {
+            "items": [{"order_item": str(order_item.public_id), "reason": "wrong_item", "requested_quantity": 1}],
+        }, format="json")
+        self.assertEqual(resp.status_code, 404)  # order not found for this user, existence not confirmed
+        self.assertEqual(Return.objects.count(), 0)
+
+    def test_cannot_reference_another_customers_order_item(self):
+        own_order = self._deliver_order_for(self.user, quantity=1)
+        other_order = self._deliver_order_for(self.other_user, quantity=1)
+        other_order_item = other_order.items.get()
+        self.client.credentials(**_auth_header(self.user))
+
+        resp = self.client.post(_order_return_create_url(own_order.order_number), {
+            "items": [
+                {"order_item": str(other_order_item.public_id), "reason": "wrong_item", "requested_quantity": 1},
+            ],
+        }, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(Return.objects.count(), 0)
+
+    def test_existing_eligibility_rules_still_apply_via_api(self):
+        """Order not yet delivered — the service's eligibility check, not
+        anything re-implemented in the API layer, is what rejects this."""
+        self.client.credentials(**_auth_header(self.user))
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=1)
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        order_item = order.items.get()
+
+        resp = self.client.post(_order_return_create_url(order.order_number), {
+            "items": [{"order_item": str(order_item.public_id), "reason": "wrong_item", "requested_quantity": 1}],
+        }, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(Return.objects.count(), 0)
+
+    def test_list_returns_only_authenticated_customers_returns(self):
+        own_order = self._deliver_order_for(self.user, quantity=1)
+        other_order = self._deliver_order_for(self.other_user, quantity=1)
+        own_return = order_services.create_return(own_order, items=[
+            {"order_item": own_order.items.get(), "reason": "wrong_item", "requested_quantity": 1},
+        ])
+        order_services.create_return(other_order, items=[
+            {"order_item": other_order.items.get(), "reason": "wrong_item", "requested_quantity": 1},
+        ])
+
+        self.client.credentials(**_auth_header(self.user))
+        resp = self.client.get(RETURNS_LIST_URL)
+        self.assertEqual(resp.status_code, 200)
+        results = resp.data["results"] if isinstance(resp.data, dict) and "results" in resp.data else resp.data
+        public_ids = [r["public_id"] for r in results]
+        self.assertEqual(public_ids, [str(own_return.public_id)])
+
+    def test_detail_ownership_enforced(self):
+        other_order = self._deliver_order_for(self.other_user, quantity=1)
+        other_return = order_services.create_return(other_order, items=[
+            {"order_item": other_order.items.get(), "reason": "wrong_item", "requested_quantity": 1},
+        ])
+
+        self.client.credentials(**_auth_header(self.user))  # different customer
+        resp = self.client.get(_return_detail_url(other_return.public_id))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_customer_can_cancel_eligible_return(self):
+        order = self._deliver_order_for(self.user, quantity=1)
+        return_request = order_services.create_return(order, items=[
+            {"order_item": order.items.get(), "reason": "wrong_item", "requested_quantity": 1},
+        ])
+        self.client.credentials(**_auth_header(self.user))
+
+        resp = self.client.post(_return_cancel_url(return_request.public_id))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["status"], Return.STATUS_CANCELLED)
+        return_request.refresh_from_db()
+        self.assertEqual(return_request.status, Return.STATUS_CANCELLED)
+
+    def test_invalid_cancellation_rejected_by_service(self):
+        order = self._deliver_order_for(self.user, quantity=1)
+        return_request = order_services.create_return(order, items=[
+            {"order_item": order.items.get(), "reason": "wrong_item", "requested_quantity": 1},
+        ])
+        order_services.approve_return(return_request)
+        order_services.mark_return_in_transit(return_request)
+        item = return_request.items.get()
+        item.received_quantity = 1
+        item.save(update_fields=["received_quantity"])
+        order_services.mark_return_received(return_request)  # no longer cancellable
+
+        self.client.credentials(**_auth_header(self.user))
+        resp = self.client.post(_return_cancel_url(return_request.public_id))
+        self.assertEqual(resp.status_code, 400)
+        return_request.refresh_from_db()
+        self.assertEqual(return_request.status, Return.STATUS_RECEIVED)  # unchanged
+
+    def test_status_field_in_create_payload_is_ignored(self):
+        order = self._deliver_order_for(self.user, quantity=1)
+        order_item = order.items.get()
+        self.client.credentials(**_auth_header(self.user))
+
+        resp = self.client.post(_order_return_create_url(order.order_number), {
+            "status": Return.STATUS_APPROVED,  # not a field the serializer accepts
+            "items": [{"order_item": str(order_item.public_id), "reason": "wrong_item", "requested_quantity": 1}],
+        }, format="json")
+
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["status"], Return.STATUS_REQUESTED)  # always starts here, unaffected
+
+    def test_no_generic_update_endpoint_exists_for_return(self):
+        order = self._deliver_order_for(self.user, quantity=1)
+        return_request = order_services.create_return(order, items=[
+            {"order_item": order.items.get(), "reason": "wrong_item", "requested_quantity": 1},
+        ])
+        self.client.credentials(**_auth_header(self.user))
+
+        resp = self.client.patch(_return_detail_url(return_request.public_id), {"status": "approved"}, format="json")
+        self.assertEqual(resp.status_code, 405)  # RetrieveAPIView — GET only, no update mixin

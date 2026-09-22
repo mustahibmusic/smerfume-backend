@@ -36,8 +36,13 @@ from apps.inventory.services import reservation as reservation_service
 from apps.inventory.services.reservation import InsufficientStockError
 
 from . import services as order_services
-from .models import Order, OrderItem, ShippingAddress
-from .serializers import CheckoutSerializer, OrderSerializer
+from .models import Order, OrderItem, Return, ShippingAddress
+from .serializers import (
+    CheckoutSerializer,
+    CreateReturnSerializer,
+    OrderSerializer,
+    ReturnDetailSerializer,
+)
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -371,3 +376,149 @@ class OrderDetailView(generics.RetrieveAPIView):
         return Order.objects.filter(user=self.request.user).prefetch_related(
             "items__variant", "shipping_address"
         )
+
+
+# ── Returns ─────────────────────────────────────────────────────────────────
+#
+# Thin by design: every view here does authentication + ownership + input
+# validation, then delegates entirely to apps.orders.services (create_return,
+# cancel_return). No eligibility, quantity, date-window, or concurrency logic
+# is duplicated here — that all remains authoritative in the service layer,
+# unchanged from Phase 5.1. Return.status and every ReturnItem field are
+# read-only everywhere in this surface; there is no endpoint that accepts
+# status, disposition, or any lifecycle field as customer input.
+
+class CreateReturnView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Orders"],
+        summary="Request a return",
+        description=(
+            "Request a return for one or more lines of a delivered order. "
+            "Eligibility (delivery status, 1-day window, valid reason, "
+            "remaining returnable quantity) is enforced by the service layer, "
+            "not this endpoint — see create_return()."
+        ),
+        parameters=[
+            OpenApiParameter(
+                "order_number", str, OpenApiParameter.PATH,
+                description="Order number e.g. SMR-20260819-A3F2B1",
+            )
+        ],
+        request=CreateReturnSerializer,
+        responses={
+            201: ReturnDetailSerializer,
+            400: OpenApiResponse(description="Ineligible order/item, invalid reason, or quantity exceeds what's returnable."),
+            401: OpenApiResponse(description="Access token missing or expired."),
+            404: OpenApiResponse(description="Order not found or does not belong to this user."),
+        },
+    )
+    def post(self, request, order_number):
+        try:
+            order = Order.objects.get(order_number=order_number, user=request.user)
+        except Order.DoesNotExist:
+            return Response({"error": "Order not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = CreateReturnSerializer(data=request.data, context={"order": order})
+        serializer.is_valid(raise_exception=True)
+
+        items = [
+            {
+                "order_item": entry["order_item"],
+                "reason": entry["reason"],
+                "requested_quantity": entry["requested_quantity"],
+                "reason_notes": entry.get("reason_notes", ""),
+            }
+            for entry in serializer.validated_data["items"]
+        ]
+
+        try:
+            return_request = order_services.create_return(order, items=items)
+        except order_services.ReturnEligibilityError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(ReturnDetailSerializer(return_request).data, status=status.HTTP_201_CREATED)
+
+
+class ReturnListView(generics.ListAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = ReturnDetailSerializer
+
+    @extend_schema(
+        tags=["Orders"],
+        summary="List my returns",
+        description="Return the authenticated user's return requests across all orders, newest first.",
+        responses={
+            200: ReturnDetailSerializer(many=True),
+            401: OpenApiResponse(description="Access token missing or expired."),
+        },
+    )
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
+    def get_queryset(self):
+        return (
+            Return.objects.filter(order__user=self.request.user)
+            .select_related("order")
+            .prefetch_related("items__order_item__variant")
+            .order_by("-created_at")
+        )
+
+
+class ReturnDetailView(generics.RetrieveAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = ReturnDetailSerializer
+    lookup_field = "public_id"
+
+    @extend_schema(
+        tags=["Orders"],
+        summary="Get return detail",
+        description="Return full details of a single return request.",
+        responses={
+            200: ReturnDetailSerializer,
+            401: OpenApiResponse(description="Access token missing or expired."),
+            404: OpenApiResponse(description="Return not found or does not belong to this user."),
+        },
+    )
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
+    def get_queryset(self):
+        return Return.objects.filter(order__user=self.request.user).prefetch_related(
+            "items__order_item__variant"
+        )
+
+
+class CancelReturnView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["Orders"],
+        summary="Cancel a return request",
+        description=(
+            "Cancel a return the customer no longer wants to proceed with. "
+            "Only allowed before the return has been received — see "
+            "cancel_return() for the exact rule, enforced entirely by the "
+            "service layer."
+        ),
+        request=None,
+        responses={
+            200: ReturnDetailSerializer,
+            400: OpenApiResponse(description="Return is no longer in a cancellable state."),
+            401: OpenApiResponse(description="Access token missing or expired."),
+            404: OpenApiResponse(description="Return not found or does not belong to this user."),
+        },
+    )
+    def post(self, request, public_id):
+        try:
+            return_request = Return.objects.get(public_id=public_id, order__user=request.user)
+        except Return.DoesNotExist:
+            return Response({"error": "Return not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            return_request = order_services.cancel_return(return_request)
+        except order_services.ReturnTransitionError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(ReturnDetailSerializer(return_request).data, status=status.HTTP_200_OK)

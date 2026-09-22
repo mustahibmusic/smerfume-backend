@@ -3,7 +3,7 @@ from django.contrib import messages
 from unfold.admin import ModelAdmin
 
 from . import services as order_services
-from .models import Order, OrderItem, ShippingAddress
+from .models import Order, OrderItem, Return, ReturnItem, ShippingAddress
 
 
 class OrderItemInline(admin.TabularInline):
@@ -172,3 +172,93 @@ class OrderAdmin(ModelAdmin):
             )
 
 
+
+
+class ReturnItemInline(admin.TabularInline):
+    model = ReturnItem
+    extra = 0
+    fields = ("order_item", "reason", "reason_notes", "requested_quantity", "received_quantity")
+    readonly_fields = ("order_item", "reason", "reason_notes", "requested_quantity")
+    can_delete = False
+
+
+@admin.register(Return)
+class ReturnAdmin(ModelAdmin):
+    list_display = ("id", "order", "status", "created_at")
+    list_filter = ("status", "created_at")
+    search_fields = ("order__order_number",)
+    readonly_fields = ("public_id", "order", "status", "created_at")
+    fields = ("public_id", "order", "status", "created_at")
+    inlines = [ReturnItemInline]
+    actions = [
+        "approve_returns", "reject_returns", "cancel_returns",
+        "mark_in_transit", "mark_received", "start_inspection",
+    ]
+
+    def has_add_permission(self, request):
+        # Return creation must go through create_return()'s eligibility
+        # checks (delivery status, 1-day window, structured reason,
+        # cumulative-quantity cap) — a raw admin "Add" form has no way to
+        # enforce those, so it's disabled here rather than left as a bypass.
+        # Customers create returns via POST /api/orders/<order_number>/returns/
+        # (apps/orders/views.py::CreateReturnView) — this admin intentionally
+        # offers no equivalent staff-initiated creation path.
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def _run_action(self, request, queryset, service_fn, error_cls, verb):
+        count = 0
+        for return_request in queryset:
+            try:
+                service_fn(return_request)
+                count += 1
+            except error_cls as exc:
+                self.message_user(
+                    request, f"Return #{return_request.pk}: {exc}", level=messages.WARNING
+                )
+        if count:
+            self.message_user(request, f"{verb} {count} return(s).", level=messages.SUCCESS)
+
+    @admin.action(description="Approve selected returns")
+    def approve_returns(self, request, queryset):
+        self._run_action(
+            request, queryset, order_services.approve_return,
+            order_services.ReturnTransitionError, "Approved",
+        )
+
+    @admin.action(description="Reject selected returns")
+    def reject_returns(self, request, queryset):
+        self._run_action(
+            request, queryset, order_services.reject_return,
+            order_services.ReturnTransitionError, "Rejected",
+        )
+
+    @admin.action(description="Cancel selected returns")
+    def cancel_returns(self, request, queryset):
+        self._run_action(
+            request, queryset, order_services.cancel_return,
+            order_services.ReturnTransitionError, "Cancelled",
+        )
+
+    @admin.action(description="Mark selected returns as In Transit")
+    def mark_in_transit(self, request, queryset):
+        self._run_action(
+            request, queryset, order_services.mark_return_in_transit,
+            order_services.ReturnTransitionError, "Marked in-transit",
+        )
+
+    @admin.action(description="Mark selected returns as Received (requires received_quantity set on every line)")
+    def mark_received(self, request, queryset):
+        self._run_action(
+            request, queryset, order_services.mark_return_received,
+            order_services.ReturnTransitionError, "Marked received",
+        )
+
+    @admin.action(description="Start inspection on selected returns")
+    def start_inspection(self, request, queryset):
+        self._run_action(
+            request, queryset, order_services.start_inspection,
+            order_services.ReturnTransitionError, "Started inspection on",
+        )

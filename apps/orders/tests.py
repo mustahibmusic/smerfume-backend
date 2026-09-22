@@ -1,12 +1,7 @@
 """
 Tests for apps.orders.
 
-
 Test groups:
-    CheckoutConcurrencyTests       — SEC-003: two concurrent checkout
-        requests on the same cart produce exactly one Order.
-    CartRowLockDeterministicTests  — SEC-003: proves the Cart row lock
-        itself blocks a second concurrent acquisition attempt.
     AuthenticatedCheckoutTests    — existing checkout flow (regression guard)
     GuestCheckoutTests            — guest checkout end-to-end
     CheckoutInventoryTests        — Phase 3: reservation integration, insufficient stock
@@ -17,12 +12,26 @@ Test groups:
     PackOrderDirectRetailTests    — Phase 4: pack_order for direct retail lines
     PackOrderDecantTests          — Phase 4: pack_order FIFO/bottle-opening for decants
     PackOrderRollbackTests        — Phase 4: atomicity across a failed packing attempt
-    CreateReturnEligibilityTests   — Phase 5.1: create_return eligibility rules
-    ReturnLifecycleTests           — Phase 5.1: Return status transitions
-    ReturnEntitlementConcurrencyTests — Phase 5.1: concurrent-request safety
-    ReturnAPITests                 — Phase 5.1b: customer-facing Return API
     OrderStatusAdminLockdownTests — status is not editable through the admin form
     OperationalStatusServiceTests — Phase 4.5: shipped/delivered/cancel services
+    CreateReturnEligibilityTests  — Phase 5.1: create_return eligibility rules
+    ReturnLifecycleTests          — Phase 5.1: Return status transitions
+    ReturnEntitlementConcurrencyTests — Phase 5.1: concurrent-request safety
+    ReturnAPITests                — Phase 5.1b: customer-facing Return API
+    ReturnInspectionRetailTests   — Phase 5.2: restocked_retail/damaged/rejected
+    ReturnInspectionPartialTests  — Phase 5.2: restocked_partial lot creation
+    ReturnInspectionDecantTests   — Phase 5.2: decant-specific disposition rules
+    ReturnInspectionIntegrityTests — Phase 5.2: validation, atomicity, idempotency
+    ReturnInspectionConcurrencyTests — Phase 5.2: concurrent finalization safety
+    ReturnItemAdminInspectionTests — Phase 5.2: admin cannot bypass the service
+    RefundCalculationProductTests — Phase 5.3: per-item product refund amount
+    RefundCalculationShippingTests — Phase 5.3: base shipping / surcharge refund
+    RefundCODTests                — Phase 5.3: manual COD refund recording
+    RefundConcurrencyTests         — Phase 5.3: concurrent refund-creation safety
+    RefundOrderStatusTests         — Phase 5.3: Order delivered/refunded transition
+    RefundImmutabilityTests        — Phase 5.3: completed refunds + RefundAdjustment
+    RefundTaxHandlingTests         — Phase 5.3: historical tax_amount flow-through
+    OrdersAdminDeletePermissionTests — stabilization: Order/Return/Refund/RefundAdjustment undeletable
 """
 
 import threading
@@ -53,7 +62,7 @@ from apps.inventory.models import (
 from apps.inventory.services import reservation as reservation_service
 from apps.orders import services as order_services
 from apps.orders.admin import OrderAdmin
-from apps.orders.models import Order, OrderItem, Return, ReturnItem
+from apps.orders.models import Order, OrderItem, Refund, RefundAdjustment, Return, ReturnItem
 
 User = get_user_model()
 
@@ -967,108 +976,9 @@ class OperationalStatusServiceTests(TestCase):
         self.assertEqual(stock.quantity_reserved, Decimal("0"))  # never went negative
         reservation = StockReservation.objects.get(order_item__order=order)
         self.assertEqual(reservation.status, StockReservation.STATUS_RELEASED)
-# ── Checkout concurrency (SEC-003) ───────────────────────────────────────────
-#
-# Two tests, deliberately at different levels, per explicit instruction that
-# a Barrier-based near-simultaneous-start test alone is not sufficient
-# evidence that a row lock is what's serializing the requests:
-#
-#   CheckoutConcurrencyTests        — end-to-end HTTP evidence that the fix
-#       produces exactly one Order when two checkout requests race.
-#   CartRowLockDeterministicTests   — lower-level, Event-synchronized proof
-#       that a second select_for_update() on the same Cart row genuinely
-#       blocks while the first transaction holds it, independent of thread
-#       scheduling luck.
-
-class CheckoutConcurrencyTests(TransactionTestCase):
-    def setUp(self):
-        Warehouse.objects.filter(is_default=True).delete()
-        Warehouse.objects.create(name="Smerfume Default", is_default=True)
-        self.user = _make_user()
-        self.variant = _make_variant()
-        self.cart = Cart.objects.create(user=self.user)
-        CartItem.objects.create(cart=self.cart, variant=self.variant, quantity=1)
-
-    def test_concurrent_checkout_on_same_cart_creates_only_one_order(self):
-        results = {}
-        barrier = threading.Barrier(2)
-
-        def _run(key):
-            barrier.wait()
-            client = APIClient()
-            client.credentials(**_auth_header(self.user))
-            try:
-                resp = client.post(
-                    CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json"
-                )
-                results[key] = resp.status_code
-            finally:
-                connection.close()
-
-        t1 = threading.Thread(target=_run, args=("a",))
-        t2 = threading.Thread(target=_run, args=("b",))
-        t1.start(); t2.start()
-        t1.join(); t2.join()
-
-        self.assertEqual(sorted(results.values()), [201, 400])
-        self.assertEqual(Order.objects.filter(user=self.user).count(), 1)
 
 
-class CartRowLockDeterministicTests(TransactionTestCase):
-    """Proves, without relying on thread-scheduling luck, that a second
-    attempt to lock the same Cart row genuinely blocks while the first
-    transaction holds the lock, and proceeds only after it's released."""
-
-    def setUp(self):
-        Warehouse.objects.filter(is_default=True).delete()
-        Warehouse.objects.create(name="Smerfume Default", is_default=True)
-        self.user = _make_user()
-        self.variant = _make_variant()
-        self.cart = Cart.objects.create(user=self.user)
-        CartItem.objects.create(cart=self.cart, variant=self.variant, quantity=1)
-
-    def test_second_lock_attempt_blocks_until_first_transaction_commits(self):
-        from django.db import transaction as db_transaction
-
-        a_locked = threading.Event()
-        release_a = threading.Event()
-        b_locked = threading.Event()
-
-        def _hold_lock_a():
-            try:
-                with db_transaction.atomic():
-                    Cart.objects.select_for_update().get(pk=self.cart.pk)
-                    a_locked.set()
-                    release_a.wait(timeout=5)
-            finally:
-                connection.close()
-
-        def _attempt_lock_b():
-            try:
-                with db_transaction.atomic():
-                    Cart.objects.select_for_update().get(pk=self.cart.pk)
-                    b_locked.set()
-            finally:
-                connection.close()
-
-        t_a = threading.Thread(target=_hold_lock_a)
-        t_a.start()
-        self.assertTrue(a_locked.wait(timeout=5), "Thread A never acquired the lock")
-
-        t_b = threading.Thread(target=_attempt_lock_b)
-        t_b.start()
-
-        # While A still holds the lock, B must NOT have acquired it yet.
-        got_it_early = b_locked.wait(timeout=0.5)
-        self.assertFalse(got_it_early, "select_for_update() did not block -- Cart row is not actually locked")
-
-        release_a.set()
-        t_a.join(timeout=5)
-
-        # Now that A released (committed), B must acquire it promptly.
-        self.assertTrue(b_locked.wait(timeout=5), "Thread B never acquired the lock after A released it")
-        t_b.join(timeout=5)
-
+# ── Phase 5.1: Return/ReturnItem eligibility and lifecycle ────────────────────
 
 class CreateReturnEligibilityTests(TestCase):
     def setUp(self):
@@ -1525,6 +1435,8 @@ class ReturnAPITests(TestCase):
         resp = self.client.patch(_return_detail_url(return_request.public_id), {"status": "approved"}, format="json")
         self.assertEqual(resp.status_code, 405)  # RetrieveAPIView — GET only, no update mixin
 
+
+# ── Phase 5.2: inspection, per-item disposition, physical inventory impact ────
 
 def _return_item_ready_for_inspection(client, user, staff, variant, quantity=1, reason=ReturnItem.REASON_WRONG_VARIANT):
     """Drive one order+return through checkout -> delivered -> requested ->
@@ -2034,3 +1946,991 @@ def _finalize_one_item_return(
         item, received_quantity=received_quantity, disposition=disposition, resolution=resolution,
         inspected_by=staff, remaining_quantity_ml=remaining_quantity_ml,
     )
+
+
+class RefundCalculationProductTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user(mobile="+919700000114")
+        self.staff = _make_user(mobile="+919700000115", username="refundstaff1")
+        self.variant = _make_variant(selling_price="1000.00")
+
+    def test_full_single_line_refund_matches_historical_paid_amount(self):
+        item = _finalize_one_item_return(
+            self.client, self.user, self.staff, self.variant, quantity=1,
+            reason=ReturnItem.REASON_WRONG_VARIANT,
+            disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL, resolution=ReturnItem.RESOLUTION_REFUND,
+        )
+        return_request = Return.objects.get(pk=item.return_request_id)
+        refund = order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+
+        item.refresh_from_db()
+        order_item = item.order_item
+        self.assertEqual(item.refund_line_amount, order_item.final_paid_line_amount)
+        self.assertEqual(refund.refund_amount, order_item.final_paid_line_amount)
+        self.assertEqual(refund.refund_status, Refund.STATUS_PENDING)
+
+    def test_partial_quantity_refund_is_prorated(self):
+        item = _finalize_one_item_return(
+            self.client, self.user, self.staff, self.variant, quantity=4,
+            reason=ReturnItem.REASON_TRANSIT_DAMAGE,
+            disposition=ReturnItem.DISPOSITION_DAMAGED, resolution=ReturnItem.RESOLUTION_REFUND,
+            received_quantity=1,
+        )
+        return_request = Return.objects.get(pk=item.return_request_id)
+        refund = order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+
+        item.refresh_from_db()
+        order_item = item.order_item
+        expected = (order_item.final_paid_line_amount / order_item.quantity * 1).quantize(Decimal("0.01"))
+        self.assertEqual(item.refund_line_amount, expected)
+        self.assertEqual(refund.refund_amount, expected)
+
+    def test_discounted_line_refund_respects_discount_allocated(self):
+        item = _finalize_one_item_return(
+            self.client, self.user, self.staff, self.variant, quantity=1,
+            reason=ReturnItem.REASON_WRONG_ITEM,
+            disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL, resolution=ReturnItem.RESOLUTION_REFUND,
+        )
+        order_item = item.order_item
+        order_item.refresh_from_db()
+        gross = order_item.gross_line_amount
+        discount = Decimal("150.00")
+        # Simulate a discount having been allocated at checkout — no live
+        # offers engine exists yet to produce this naturally.
+        order_item.discount_allocated = discount
+        order_item.net_line_amount = gross - discount
+        order_item.final_paid_line_amount = order_item.net_line_amount + order_item.tax_amount
+        order_item.save(update_fields=[
+            "discount_allocated", "net_line_amount", "final_paid_line_amount", "updated_at",
+        ])
+
+        return_request = Return.objects.get(pk=item.return_request_id)
+        refund = order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+
+        self.assertEqual(refund.refund_amount, gross - discount)
+        self.assertNotEqual(refund.refund_amount, gross)
+
+    def test_multiple_order_items_each_refund_their_own_proportional_share(self):
+        variant_b = _make_variant(selling_price="2000.00")
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=1)
+        CartItem.objects.create(cart=cart, variant=variant_b, quantity=1)
+        self.client.credentials(**_auth_header(self.user))
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        order_services.verify_cod_order(order, verified_by=self.staff)
+        order_services.pack_order(order, performed_by=self.staff)
+        order_services.mark_order_shipped(order)
+        order_services.mark_order_delivered(order)
+        order.refresh_from_db()
+        oi_a, oi_b = list(order.items.order_by("id"))
+
+        # Simulate a proportionally-allocated order-level discount (gross
+        # 1000 + 2000 = 3000; a 300 discount -> 100/200 split).
+        oi_a.discount_allocated = Decimal("100.00")
+        oi_a.net_line_amount = oi_a.gross_line_amount - Decimal("100.00")
+        oi_a.final_paid_line_amount = oi_a.net_line_amount + oi_a.tax_amount
+        oi_a.save(update_fields=["discount_allocated", "net_line_amount", "final_paid_line_amount", "updated_at"])
+        oi_b.discount_allocated = Decimal("200.00")
+        oi_b.net_line_amount = oi_b.gross_line_amount - Decimal("200.00")
+        oi_b.final_paid_line_amount = oi_b.net_line_amount + oi_b.tax_amount
+        oi_b.save(update_fields=["discount_allocated", "net_line_amount", "final_paid_line_amount", "updated_at"])
+
+        return_request = order_services.create_return(order, items=[
+            {"order_item": oi_a, "reason": ReturnItem.REASON_WRONG_VARIANT, "requested_quantity": 1},
+            {"order_item": oi_b, "reason": ReturnItem.REASON_WRONG_ITEM, "requested_quantity": 1},
+        ])
+        order_services.approve_return(return_request)
+        order_services.mark_return_in_transit(return_request)
+        for ri in return_request.items.all():
+            ri.received_quantity = 1
+            ri.save(update_fields=["received_quantity"])
+        order_services.mark_return_received(return_request)
+        order_services.start_inspection(return_request)
+
+        return_items = list(return_request.items.order_by("id"))
+        order_services.finalize_return_item(
+            return_items[0], received_quantity=1, disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+            resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+        )
+        order_services.finalize_return_item(
+            return_items[1], received_quantity=1, disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+            resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+        )
+
+        return_request_fresh = Return.objects.get(pk=return_request.pk)
+        refund = order_services.create_refund_for_return(
+            return_request_fresh, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+
+        return_items[0].refresh_from_db()
+        return_items[1].refresh_from_db()
+        self.assertEqual(return_items[0].refund_line_amount, Decimal("900.00"))
+        self.assertEqual(return_items[1].refund_line_amount, Decimal("1800.00"))
+        self.assertEqual(refund.refund_amount, Decimal("2700.00"))
+
+    def test_second_return_against_fully_returned_item_rejected(self):
+        item = _finalize_one_item_return(
+            self.client, self.user, self.staff, self.variant, quantity=1,
+            reason=ReturnItem.REASON_WRONG_VARIANT,
+            disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL, resolution=ReturnItem.RESOLUTION_REFUND,
+        )
+        return_request = Return.objects.get(pk=item.return_request_id)
+        order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+
+        order = item.order_item.order
+        with self.assertRaises(order_services.ReturnEligibilityError):
+            order_services.create_return(order, items=[
+                {"order_item": item.order_item, "reason": ReturnItem.REASON_WRONG_ITEM, "requested_quantity": 1},
+            ])
+
+    def test_current_catalogue_price_change_does_not_affect_refund(self):
+        item = _finalize_one_item_return(
+            self.client, self.user, self.staff, self.variant, quantity=1,
+            reason=ReturnItem.REASON_WRONG_VARIANT,
+            disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL, resolution=ReturnItem.RESOLUTION_REFUND,
+        )
+        historical_amount = item.order_item.final_paid_line_amount
+
+        self.variant.selling_price = Decimal("50000.00")
+        self.variant.save(update_fields=["selling_price"])
+
+        return_request = Return.objects.get(pk=item.return_request_id)
+        refund = order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+        self.assertEqual(refund.refund_amount, historical_amount)
+        self.assertNotEqual(refund.refund_amount, Decimal("50000.00"))
+
+
+class RefundCalculationShippingTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user(mobile="+919700000116")
+        self.staff = _make_user(mobile="+919700000117", username="refundstaff2")
+
+    def _checkout_with_shipping(self, base_shipping, surcharge, quantity=1, selling_price="500.00"):
+        variant = _make_variant(selling_price=selling_price)
+        variant.shipping_surcharge = Decimal(surcharge)
+        variant.save(update_fields=["shipping_surcharge"])
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=variant, quantity=quantity)
+        self.client.credentials(**_auth_header(self.user))
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        # base_shipping_charge is always 0 from checkout today (no
+        # free-shipping-threshold engine exists) — set it directly here to
+        # exercise the refund rule against a nonzero value.
+        order.base_shipping_charge = Decimal(base_shipping)
+        order.shipping_charge = order.base_shipping_charge + sum(
+            (oi.shipping_surcharge for oi in order.items.all()), Decimal("0.00")
+        )
+        order.save(update_fields=["base_shipping_charge", "shipping_charge"])
+        order_services.verify_cod_order(order, verified_by=self.staff)
+        order_services.pack_order(order, performed_by=self.staff)
+        order_services.mark_order_shipped(order)
+        order_services.mark_order_delivered(order)
+        order.refresh_from_db()
+        return order, variant
+
+    def _return_and_finalize(self, order, reason, disposition, quantity=1):
+        order_item = order.items.get()
+        return_request = order_services.create_return(order, items=[
+            {"order_item": order_item, "reason": reason, "requested_quantity": quantity},
+        ])
+        order_services.approve_return(return_request)
+        order_services.mark_return_in_transit(return_request)
+        ri = return_request.items.get()
+        ri.received_quantity = quantity
+        ri.save(update_fields=["received_quantity"])
+        order_services.mark_return_received(return_request)
+        order_services.start_inspection(return_request)
+        order_services.finalize_return_item(
+            return_request.items.get(), received_quantity=quantity, disposition=disposition,
+            resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+        )
+        return Return.objects.get(pk=return_request.pk), ri
+
+    def test_full_order_qualifying_return_refunds_base_shipping(self):
+        order, variant = self._checkout_with_shipping(base_shipping="150.00", surcharge="0.00", quantity=1)
+        return_request, ri = self._return_and_finalize(
+            order, ReturnItem.REASON_WRONG_VARIANT, ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+        )
+        order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+        return_request.refresh_from_db()
+        self.assertEqual(return_request.base_shipping_refund_amount, Decimal("150.00"))
+
+    def test_partial_return_does_not_refund_base_shipping(self):
+        order, variant = self._checkout_with_shipping(base_shipping="150.00", surcharge="0.00", quantity=2)
+        return_request, ri = self._return_and_finalize(
+            order, ReturnItem.REASON_WRONG_VARIANT, ReturnItem.DISPOSITION_RESTOCKED_RETAIL, quantity=1,
+        )
+        order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+        return_request.refresh_from_db()
+        self.assertEqual(return_request.base_shipping_refund_amount, Decimal("0.00"))
+
+    def test_manufacturing_defect_does_not_refund_base_shipping_by_default(self):
+        order, variant = self._checkout_with_shipping(base_shipping="150.00", surcharge="0.00", quantity=1)
+        return_request, ri = self._return_and_finalize(
+            order, ReturnItem.REASON_MANUFACTURING_DEFECT, ReturnItem.DISPOSITION_DAMAGED,
+        )
+        order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+        return_request.refresh_from_db()
+        self.assertEqual(return_request.base_shipping_refund_amount, Decimal("0.00"))
+
+    def test_staff_override_forces_base_shipping_refund_on_partial_return(self):
+        order, variant = self._checkout_with_shipping(base_shipping="150.00", surcharge="0.00", quantity=2)
+        return_request, ri = self._return_and_finalize(
+            order, ReturnItem.REASON_WRONG_VARIANT, ReturnItem.DISPOSITION_RESTOCKED_RETAIL, quantity=1,
+        )
+        return_request.base_shipping_refund_override = True
+        return_request.save(update_fields=["base_shipping_refund_override"])
+
+        order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+        return_request.refresh_from_db()
+        self.assertEqual(return_request.base_shipping_refund_amount, Decimal("150.00"))
+
+    def test_qualifying_reason_refunds_product_surcharge(self):
+        order, variant = self._checkout_with_shipping(base_shipping="0.00", surcharge="30.00", quantity=1)
+        order_item = order.items.get()
+        self.assertEqual(order_item.shipping_surcharge, Decimal("30.00"))
+
+        return_request, ri = self._return_and_finalize(
+            order, ReturnItem.REASON_TRANSIT_DAMAGE, ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+        )
+        order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+        ri.refresh_from_db()
+        self.assertEqual(ri.surcharge_refund_amount, Decimal("30.00"))
+
+    def test_manufacturing_defect_does_not_refund_surcharge_by_default(self):
+        order, variant = self._checkout_with_shipping(base_shipping="0.00", surcharge="30.00", quantity=1)
+        return_request, ri = self._return_and_finalize(
+            order, ReturnItem.REASON_MANUFACTURING_DEFECT, ReturnItem.DISPOSITION_DAMAGED,
+        )
+        order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+        ri.refresh_from_db()
+        self.assertEqual(ri.surcharge_refund_amount, Decimal("0.00"))
+
+    def test_surcharge_refund_guard_rejects_cumulative_overflow(self):
+        order, variant = self._checkout_with_shipping(base_shipping="0.00", surcharge="10.00", quantity=1)
+        order_item = order.items.get()
+        return_request, ri = self._return_and_finalize(
+            order, ReturnItem.REASON_WRONG_VARIANT, ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+        )
+
+        # Simulate a prior, already-completed surcharge claim on this same
+        # OrderItem via a separate Return/ReturnItem/Refund, exhausting the
+        # full surcharge — proves the cumulative guard catches it regardless
+        # of how the prior claim arose.
+        other_return = Return.objects.create(order=order, status=Return.STATUS_COMPLETED)
+        ReturnItem.objects.create(
+            return_request=other_return, order_item=order_item, reason=ReturnItem.REASON_WRONG_ITEM,
+            requested_quantity=1, approved_quantity=1, received_quantity=1,
+            disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL, resolution=ReturnItem.RESOLUTION_REFUND,
+            surcharge_refund_amount=Decimal("10.00"), refund_line_amount=Decimal("0.00"),
+        )
+        Refund.objects.create(
+            return_request=other_return, refund_amount=Decimal("10.00"),
+            refund_status=Refund.STATUS_COMPLETED, refund_method=Refund.METHOD_BANK_TRANSFER,
+        )
+
+        with self.assertRaises(order_services.RefundError):
+            order_services.create_refund_for_return(
+                return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+            )
+
+
+class RefundCODTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user(mobile="+919700000122")
+        self.staff = _make_user(mobile="+919700000123", username="refundstaff5")
+        self.variant = _make_variant(selling_price="500.00")
+
+    def test_cod_refund_stores_manual_reference_data(self):
+        item = _finalize_one_item_return(
+            self.client, self.user, self.staff, self.variant, quantity=1,
+            reason=ReturnItem.REASON_WRONG_VARIANT,
+            disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL, resolution=ReturnItem.RESOLUTION_REFUND,
+        )
+        order = item.order_item.order
+        self.assertEqual(order.payment_method, Order.PAYMENT_METHOD_COD)
+
+        return_request = Return.objects.get(pk=item.return_request_id)
+        refund = order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+        order_services.mark_refund_processing(refund)
+        completed = order_services.complete_refund(
+            refund, refund_reference="UTR20260914001", processed_by=self.staff,
+            notes="Refunded via bank transfer",
+        )
+
+        self.assertEqual(completed.refund_method, Refund.METHOD_BANK_TRANSFER)
+        self.assertEqual(completed.refund_reference, "UTR20260914001")
+        self.assertEqual(completed.processed_by, self.staff)
+        self.assertIsNotNone(completed.processed_at)
+        self.assertEqual(completed.notes, "Refunded via bank transfer")
+        # No external gateway/HTTP call happens anywhere in this module —
+        # verified by inspection (apps/orders/services.py imports no HTTP
+        # client), not mocked here, since there is nothing to mock.
+
+
+class RefundMethodSelectionTests(TestCase):
+    """refund_method is never inferred from Order.payment_method — there is
+    no live gateway to infer a channel from, so it's left unset at
+    creation and must be explicitly chosen by staff before processing."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user(mobile="+919700000222")
+        self.staff = _make_user(mobile="+919700000223", username="refundstaff6")
+        self.variant = _make_variant(selling_price="500.00")
+
+    def _completed_return(self):
+        item = _finalize_one_item_return(
+            self.client, self.user, self.staff, self.variant, quantity=1,
+            reason=ReturnItem.REASON_WRONG_VARIANT,
+            disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL, resolution=ReturnItem.RESOLUTION_REFUND,
+        )
+        return Return.objects.get(pk=item.return_request_id)
+
+    def test_create_refund_for_return_leaves_method_unset_by_default(self):
+        return_request = self._completed_return()
+        refund = order_services.create_refund_for_return(return_request, approved_by=self.staff)
+        self.assertIsNone(refund.refund_method)
+
+    def test_mark_processing_rejected_when_method_unset(self):
+        return_request = self._completed_return()
+        refund = order_services.create_refund_for_return(return_request, approved_by=self.staff)
+        with self.assertRaises(order_services.RefundError):
+            order_services.mark_refund_processing(refund)
+
+    def test_set_refund_method_then_mark_processing_succeeds(self):
+        return_request = self._completed_return()
+        refund = order_services.create_refund_for_return(return_request, approved_by=self.staff)
+        refund = order_services.set_refund_method(refund, Refund.METHOD_BANK_TRANSFER)
+        self.assertEqual(refund.refund_method, Refund.METHOD_BANK_TRANSFER)
+        processing = order_services.mark_refund_processing(refund)
+        self.assertEqual(processing.refund_status, Refund.STATUS_PROCESSING)
+
+    def test_set_refund_method_rejected_once_no_longer_pending(self):
+        return_request = self._completed_return()
+        refund = order_services.create_refund_for_return(return_request, approved_by=self.staff)
+        refund = order_services.set_refund_method(refund, Refund.METHOD_BANK_TRANSFER)
+        order_services.mark_refund_processing(refund)
+        with self.assertRaises(order_services.RefundError):
+            order_services.set_refund_method(refund, Refund.METHOD_GATEWAY)
+
+
+class RefundConcurrencyTests(TransactionTestCase):
+    def setUp(self):
+        Warehouse.objects.filter(is_default=True).delete()
+        self.warehouse = Warehouse.objects.create(name="Smerfume Default", is_default=True)
+        self.client = APIClient()
+        self.user = User.objects.create(
+            username="refundconcuser", mobile_number="+919700000126", role="customer",
+        )
+        self.user.set_unusable_password()
+        self.user.save()
+        self.staff = User.objects.create(
+            username="refundconcstaff", mobile_number="+919700000127", role="staff",
+        )
+        self.client.credentials(**_auth_header(self.user))
+
+        brand = Brand.objects.get_or_create(name="OrderBrand", slug="orderbrand")[0]
+        category = Category.objects.get_or_create(name="OrderCat", slug="ordercat")[0]
+        product = Product.objects.get_or_create(
+            name="OrderProduct", slug="orderproduct",
+            defaults={"brand": brand, "category": category},
+        )[0]
+        edition = ProductEdition.objects.get_or_create(
+            product=product, slug="orderproduct-edp",
+            defaults={"name": "EDP", "concentration": "edp", "gender": "unisex"},
+        )[0]
+        self.variant = ProductVariant.objects.create(
+            edition=edition, size_ml=10, selling_price="400.00", mrp="500.00",
+            sku=f"TEST-{uuid.uuid4().hex[:10]}",
+        )
+        InventoryStock.objects.create(
+            variant=self.variant, warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal("50"),
+        )
+
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=4)
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        order_services.verify_cod_order(order, verified_by=self.staff)
+        order_services.pack_order(order, performed_by=self.staff)
+        order_services.mark_order_shipped(order)
+        order_services.mark_order_delivered(order)
+        order.refresh_from_db()
+        self.order = order
+        self.order_item = order.items.get()  # quantity=4
+
+        def _finalized_return(quantity):
+            return_request = order_services.create_return(order, items=[
+                {"order_item": self.order_item, "reason": ReturnItem.REASON_WRONG_VARIANT, "requested_quantity": quantity},
+            ])
+            order_services.approve_return(return_request)
+            order_services.mark_return_in_transit(return_request)
+            ri = return_request.items.get()
+            ri.received_quantity = quantity
+            ri.save(update_fields=["received_quantity"])
+            order_services.mark_return_received(return_request)
+            order_services.start_inspection(return_request)
+            order_services.finalize_return_item(
+                return_request.items.get(), received_quantity=quantity,
+                disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+                resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+            )
+            return Return.objects.get(pk=return_request.pk)
+
+        # Two independent returns against the SAME OrderItem, quantities
+        # summing exactly to the purchased quantity (2 + 2 = 4) — both
+        # individually valid per create_return's own cap.
+        self.return_a = _finalized_return(2)
+        self.return_b = _finalized_return(2)
+
+    def test_concurrent_refund_creation_does_not_exceed_historical_amount(self):
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def _run(key, return_request):
+            barrier.wait()
+            try:
+                order_services.create_refund_for_return(
+                    return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+                )
+                results[key] = "ok"
+            except order_services.RefundError:
+                results[key] = "rejected"
+            finally:
+                connection.close()
+
+        t1 = threading.Thread(target=_run, args=("a", self.return_a))
+        t2 = threading.Thread(target=_run, args=("b", self.return_b))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        # Both are individually valid (2 + 2 == 4, the full purchased
+        # quantity) — the property under test is that the LOCKED cumulative
+        # check never lets their combined refund_line_amount exceed the
+        # order item's historical paid amount, regardless of thread timing.
+        self.assertEqual(sorted(results.values()), ["ok", "ok"])
+        order_item = OrderItem.objects.get(pk=self.order_item.pk)
+        total_refunded = order_services._already_claimed_product_refund(order_item)
+        self.assertLessEqual(total_refunded, order_item.final_paid_line_amount)
+        self.assertEqual(total_refunded, order_item.final_paid_line_amount)  # exactly — no gap, no overshoot
+
+
+class RefundOrderStatusTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user(mobile="+919700000118")
+        self.staff = _make_user(mobile="+919700000119", username="refundstaff3")
+        self.variant = _make_variant(selling_price="1000.00")
+
+    def test_full_refund_moves_order_to_refunded(self):
+        item = _finalize_one_item_return(
+            self.client, self.user, self.staff, self.variant, quantity=1,
+            reason=ReturnItem.REASON_WRONG_VARIANT,
+            disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL, resolution=ReturnItem.RESOLUTION_REFUND,
+        )
+        order = item.order_item.order
+        return_request = Return.objects.get(pk=item.return_request_id)
+        refund = order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+        order_services.mark_refund_processing(refund)
+        order_services.complete_refund(refund, refund_reference="UTR123", processed_by=self.staff)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.STATUS_REFUNDED)
+
+    def test_partial_refund_leaves_order_delivered(self):
+        item = _finalize_one_item_return(
+            self.client, self.user, self.staff, self.variant, quantity=2,
+            reason=ReturnItem.REASON_WRONG_VARIANT,
+            disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL, resolution=ReturnItem.RESOLUTION_REFUND,
+            received_quantity=1,
+        )
+        order = item.order_item.order
+        return_request = Return.objects.get(pk=item.return_request_id)
+        refund = order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+        order_services.mark_refund_processing(refund)
+        order_services.complete_refund(refund, refund_reference="UTR124", processed_by=self.staff)
+
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.STATUS_DELIVERED)
+
+    def test_replacement_resolution_creates_no_refund_obligation(self):
+        item = _finalize_one_item_return(
+            self.client, self.user, self.staff, self.variant, quantity=1,
+            reason=ReturnItem.REASON_MANUFACTURING_DEFECT,
+            disposition=ReturnItem.DISPOSITION_DAMAGED, resolution=ReturnItem.RESOLUTION_REPLACEMENT,
+        )
+        return_request = Return.objects.get(pk=item.return_request_id)
+        with self.assertRaises(order_services.RefundError):
+            order_services.create_refund_for_return(
+                return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+            )
+        self.assertFalse(Refund.objects.filter(return_request=return_request).exists())
+
+    def test_not_applicable_resolution_creates_no_refund(self):
+        item = _finalize_one_item_return(
+            self.client, self.user, self.staff, self.variant, quantity=1,
+            reason=ReturnItem.REASON_WRONG_ITEM,
+            disposition=ReturnItem.DISPOSITION_REJECTED, resolution=ReturnItem.RESOLUTION_NOT_APPLICABLE,
+        )
+        return_request = Return.objects.get(pk=item.return_request_id)
+        with self.assertRaises(order_services.RefundError):
+            order_services.create_refund_for_return(
+                return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+            )
+
+
+class RefundImmutabilityTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user(mobile="+919700000120")
+        self.staff = _make_user(mobile="+919700000121", username="refundstaff4")
+        self.variant = _make_variant(selling_price="1000.00")
+
+    def _completed_refund(self):
+        item = _finalize_one_item_return(
+            self.client, self.user, self.staff, self.variant, quantity=1,
+            reason=ReturnItem.REASON_WRONG_VARIANT,
+            disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL, resolution=ReturnItem.RESOLUTION_REFUND,
+        )
+        return_request = Return.objects.get(pk=item.return_request_id)
+        refund = order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+        order_services.mark_refund_processing(refund)
+        order_services.complete_refund(refund, refund_reference="UTR200", processed_by=self.staff)
+        refund.refresh_from_db()
+        return refund
+
+    def test_completed_refund_cannot_be_completed_again(self):
+        refund = self._completed_refund()
+        original_amount = refund.refund_amount
+        with self.assertRaises(order_services.RefundError):
+            order_services.complete_refund(refund, refund_reference="UTR-DUPLICATE", processed_by=self.staff)
+        refund.refresh_from_db()
+        self.assertEqual(refund.refund_amount, original_amount)
+        self.assertEqual(refund.refund_reference, "UTR200")
+
+    def test_refund_adjustment_corrects_reporting_without_touching_original(self):
+        refund = self._completed_refund()
+        original_amount = refund.refund_amount
+
+        adjustment = order_services.create_refund_adjustment(
+            refund, adjustment_amount=Decimal("-50.00"), reason="overpaid by mistake", approved_by=self.staff,
+        )
+
+        refund.refresh_from_db()
+        self.assertEqual(refund.refund_amount, original_amount)
+        self.assertEqual(adjustment.adjustment_amount, Decimal("-50.00"))
+        effective_total = refund.refund_amount + sum(a.adjustment_amount for a in refund.adjustments.all())
+        self.assertEqual(effective_total, original_amount - Decimal("50.00"))
+
+    def test_adjustment_rejected_against_non_completed_refund(self):
+        item = _finalize_one_item_return(
+            self.client, self.user, self.staff, self.variant, quantity=1,
+            reason=ReturnItem.REASON_WRONG_VARIANT,
+            disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL, resolution=ReturnItem.RESOLUTION_REFUND,
+        )
+        return_request = Return.objects.get(pk=item.return_request_id)
+        refund = order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+        with self.assertRaises(order_services.RefundError):
+            order_services.create_refund_adjustment(refund, Decimal("-10.00"), "test", approved_by=self.staff)
+
+
+class RefundTaxHandlingTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user(mobile="+919700000124")
+        self.staff = _make_user(mobile="+919700000125", username="refundstaff6")
+        self.variant = _make_variant(selling_price="1000.00")
+
+    def test_refund_calculation_includes_whatever_tax_amount_is_recorded(self):
+        """tax_amount is always 0.00 in real checkout today (no GST engine
+        exists) — this proves the refund formula still correctly flows
+        through a nonzero value if one is ever present, rather than
+        hardcoding an assumption that tax is always zero. Whether that
+        formula (net + tax, i.e. tax-exclusive) is the RIGHT one once real
+        GST lands is a separate, unresolved question — see the module
+        docstring note in apps/orders/services.py."""
+        item = _finalize_one_item_return(
+            self.client, self.user, self.staff, self.variant, quantity=1,
+            reason=ReturnItem.REASON_WRONG_VARIANT,
+            disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL, resolution=ReturnItem.RESOLUTION_REFUND,
+        )
+        order_item = item.order_item
+        order_item.refresh_from_db()
+        self.assertEqual(order_item.tax_amount, Decimal("0.00"))
+
+        order_item.tax_amount = Decimal("180.00")
+        order_item.final_paid_line_amount = order_item.net_line_amount + order_item.tax_amount
+        order_item.save(update_fields=["tax_amount", "final_paid_line_amount", "updated_at"])
+
+        return_request = Return.objects.get(pk=item.return_request_id)
+        refund = order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+
+        self.assertEqual(refund.refund_amount, order_item.final_paid_line_amount)
+        self.assertEqual(order_item.final_paid_line_amount, Decimal("1180.00"))  # tax flowed straight through
+
+
+# ── Stabilization pass: admin delete-permission audit ──────────────────────────
+
+class OrdersAdminDeletePermissionTests(TestCase):
+    """Order/Return/Refund/RefundAdjustment anchor financial and audit
+    history — none of them should be deletable through the admin, even by
+    a superuser."""
+
+    def setUp(self):
+        self.staff = User.objects.create_superuser(
+            username="deleteaudit", email="deleteaudit@example.com", password="testpass123",
+        )
+        self.request = RequestFactory().get("/")
+        self.request.user = self.staff
+
+        self.user = _make_user(mobile="+919700000128")
+        self.order = Order.objects.create(
+            user=self.user, order_number="SMR-DELAUDIT-000001",
+            subtotal=Decimal("100.00"), total=Decimal("100.00"),
+        )
+        self.return_request = Return.objects.create(order=self.order, status=Return.STATUS_REQUESTED)
+        self.refund = Refund.objects.create(
+            return_request=self.return_request, refund_amount=Decimal("50.00"),
+            refund_status=Refund.STATUS_PENDING, refund_method=Refund.METHOD_BANK_TRANSFER,
+        )
+        self.adjustment = RefundAdjustment.objects.create(
+            refund=self.refund, adjustment_amount=Decimal("-5.00"), reason="test", approved_by=self.staff,
+        )
+
+    def test_order_is_not_deletable(self):
+        from apps.orders.admin import OrderAdmin
+        admin_instance = OrderAdmin(Order, django_admin.site)
+        self.assertFalse(admin_instance.has_delete_permission(self.request, self.order))
+
+    def test_return_is_not_deletable(self):
+        from apps.orders.admin import ReturnAdmin
+        admin_instance = ReturnAdmin(Return, django_admin.site)
+        self.assertFalse(admin_instance.has_delete_permission(self.request, self.return_request))
+
+    def test_refund_is_not_deletable(self):
+        from apps.orders.admin import RefundAdmin
+        admin_instance = RefundAdmin(Refund, django_admin.site)
+        self.assertFalse(admin_instance.has_delete_permission(self.request, self.refund))
+
+    def test_refund_adjustment_is_not_deletable_or_editable(self):
+        from apps.orders.admin import RefundAdjustmentAdmin
+        admin_instance = RefundAdjustmentAdmin(RefundAdjustment, django_admin.site)
+        self.assertFalse(admin_instance.has_delete_permission(self.request, self.adjustment))
+        self.assertFalse(admin_instance.has_change_permission(self.request, self.adjustment))
+
+
+# ── Track A: API integration gaps + full journey ──────────────────────────────
+
+class OrderDetailViewTests(TestCase):
+    """No dedicated HTTP-level test existed for this endpoint before —
+    closing that gap: success, unauthenticated, not-found for another
+    user's order, not-found for a nonexistent order."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user(mobile="+919700000129")
+        self.other_user = _make_user(mobile="+919700000130")
+        self.variant = _make_variant()
+
+    def _checkout_as(self, user):
+        client = APIClient()
+        client.credentials(**_auth_header(user))
+        cart = Cart.objects.create(user=user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=1)
+        resp = client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        return resp.data["order_number"]
+
+    def test_owner_can_retrieve_order_detail(self):
+        order_number = self._checkout_as(self.user)
+        self.client.credentials(**_auth_header(self.user))
+        resp = self.client.get(f"/api/orders/{order_number}/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["order_number"], order_number)
+        self.assertIn("items", resp.data)
+        self.assertIn("shipping_address", resp.data)
+
+    def test_unauthenticated_request_rejected(self):
+        order_number = self._checkout_as(self.user)
+        anon = APIClient()
+        resp = anon.get(f"/api/orders/{order_number}/")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_other_users_order_returns_404(self):
+        order_number = self._checkout_as(self.other_user)
+        self.client.credentials(**_auth_header(self.user))
+        resp = self.client.get(f"/api/orders/{order_number}/")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_nonexistent_order_returns_404(self):
+        self.client.credentials(**_auth_header(self.user))
+        resp = self.client.get("/api/orders/SMR-DOES-NOT-EXIST/")
+        self.assertEqual(resp.status_code, 404)
+
+
+class FullCustomerJourneyIntegrationTests(TestCase):
+    """One continuous, realistic journey through every customer-facing HTTP
+    touchpoint (real OTP login included, not the _make_user/_auth_header
+    shortcut used elsewhere), interleaved with the staff-side service calls
+    an admin action would trigger — proving the whole system wires
+    together end-to-end, covering flows A through G from the stabilization
+    request in one coherent scenario rather than duplicating every
+    already-proven unit/service test at the HTTP level."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.staff = _make_user(mobile="+919700000131", username="journeystaff")
+        self.variant = _make_variant(selling_price="800.00")
+        self.user = User.objects.create(
+            username="journeyuser", mobile_number="+919700000132",
+            email="journeyuser@example.com", role="customer",
+        )
+        self.user.set_unusable_password()
+        self.user.save()
+
+    def test_full_journey_login_through_refund(self):
+        from django.contrib.auth.hashers import make_password
+        from apps.accounts.models import OTPVerification
+
+        # ── A. Real OTP login (not the _make_user/_auth_header shortcut) ──
+        otp_record = OTPVerification.objects.create(
+            user=self.user, otp_hash=make_password("111222"),
+            expires_at=timezone.now() + timedelta(minutes=5),
+        )
+        verify_resp = self.client.post("/api/auth/otp/verify/", {
+            "otp_session_token": str(otp_record.otp_session_token), "otp": "111222",
+        })
+        self.assertEqual(verify_resp.status_code, 200)
+        access_token = verify_resp.data["access"]
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
+
+        # ── A. Cart via real HTTP ──
+        add_resp = self.client.post("/api/cart/add/", {
+            "variant_id": self.variant.pk, "quantity": 2,
+        }, format="json")
+        self.assertEqual(add_resp.status_code, 200)
+        self.assertEqual(add_resp.data["item_count"], 1)
+
+        # ── A. Checkout via real HTTP → reservation created ──
+        checkout_resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.assertEqual(checkout_resp.status_code, 201)
+        order_number = checkout_resp.data["order_number"]
+        order = Order.objects.get(order_number=order_number)
+        self.assertEqual(order.status, Order.STATUS_PENDING)
+        self.assertTrue(StockReservation.objects.filter(order_item__order=order).exists())
+
+        # ── B. COD verification + packing (staff-side service calls) ──
+        order_services.verify_cod_order(order, verified_by=self.staff)
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.STATUS_CONFIRMED)
+
+        order_services.pack_order(order, performed_by=self.staff)
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.STATUS_PROCESSING)
+        self.assertTrue(StockMovement.objects.filter(source_order_item__order=order).exists())
+
+        # ── C. Shipping lifecycle ──
+        order_services.mark_order_shipped(order)
+        order_services.mark_order_delivered(order)
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.STATUS_DELIVERED)
+        self.assertIsNotNone(order.delivered_at)
+
+        # ── D. Customer creates a return via real HTTP ──
+        order_item = order.items.get()
+        create_return_resp = self.client.post(f"/api/orders/{order_number}/returns/", {
+            "items": [{
+                "order_item": str(order_item.public_id),
+                "reason": "wrong_variant",
+                "requested_quantity": 1,
+            }],
+        }, format="json")
+        self.assertEqual(create_return_resp.status_code, 201)
+        self.assertEqual(create_return_resp.data["status"], Return.STATUS_REQUESTED)
+        return_request = Return.objects.get(public_id=create_return_resp.data["public_id"])
+
+        # ── E. Return lifecycle (staff-side service calls) ──
+        order_services.approve_return(return_request)
+        order_services.mark_return_in_transit(return_request)
+        return_item = return_request.items.get()
+        return_item.received_quantity = 1
+        return_item.save(update_fields=["received_quantity"])
+        order_services.mark_return_received(return_request)
+        order_services.start_inspection(return_request)
+        return_request = Return.objects.get(pk=return_request.pk)
+        self.assertEqual(return_request.status, Return.STATUS_INSPECTION_PENDING)
+
+        # ── F. Per-item disposition → real inventory effect ──
+        stock_before = InventoryStock.objects.get(
+            variant=self.variant, warehouse=Warehouse.objects.get(is_default=True), stock_type="retail",
+        ).quantity
+        order_services.finalize_return_item(
+            return_item, received_quantity=1, disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+            resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+        )
+        stock_after = InventoryStock.objects.get(
+            variant=self.variant, warehouse=Warehouse.objects.get(is_default=True), stock_type="retail",
+        ).quantity
+        self.assertEqual(stock_after, stock_before + 1)
+        return_request = Return.objects.get(pk=return_request.pk)
+        self.assertEqual(return_request.status, Return.STATUS_COMPLETED)
+
+        # ── G. Refund creation ──
+        refund = order_services.create_refund_for_return(
+            return_request, refund_method=Refund.METHOD_BANK_TRANSFER, approved_by=self.staff,
+        )
+        self.assertEqual(refund.refund_status, Refund.STATUS_PENDING)
+        self.assertGreater(refund.refund_amount, Decimal("0.00"))
+
+        # ── Customer can see the final state via real HTTP ──
+        detail_resp = self.client.get(f"/api/orders/returns/{return_request.public_id}/")
+        self.assertEqual(detail_resp.status_code, 200)
+        self.assertEqual(detail_resp.data["status"], Return.STATUS_COMPLETED)
+
+        order_detail_resp = self.client.get(f"/api/orders/{order_number}/")
+        self.assertEqual(order_detail_resp.status_code, 200)
+        # Partial return/refund — order stays delivered, per the approved rule.
+        self.assertEqual(order_detail_resp.data["status"], Order.STATUS_DELIVERED)
+
+
+# ── Checkout concurrency (SEC-003) ───────────────────────────────────────────
+#
+# Two tests, deliberately at different levels, per explicit instruction that
+# a Barrier-based near-simultaneous-start test alone is not sufficient
+# evidence that a row lock is what's serializing the requests:
+#
+#   CheckoutConcurrencyTests        — end-to-end HTTP evidence that the fix
+#       produces exactly one Order when two checkout requests race.
+#   CartRowLockDeterministicTests   — lower-level, Event-synchronized proof
+#       that a second select_for_update() on the same Cart row genuinely
+#       blocks while the first transaction holds it, independent of thread
+#       scheduling luck.
+
+class CheckoutConcurrencyTests(TransactionTestCase):
+    def setUp(self):
+        Warehouse.objects.filter(is_default=True).delete()
+        Warehouse.objects.create(name="Smerfume Default", is_default=True)
+        self.user = _make_user()
+        self.variant = _make_variant()
+        self.cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=self.cart, variant=self.variant, quantity=1)
+
+    def test_concurrent_checkout_on_same_cart_creates_only_one_order(self):
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def _run(key):
+            barrier.wait()
+            client = APIClient()
+            client.credentials(**_auth_header(self.user))
+            try:
+                resp = client.post(
+                    CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json"
+                )
+                results[key] = resp.status_code
+            finally:
+                connection.close()
+
+        t1 = threading.Thread(target=_run, args=("a",))
+        t2 = threading.Thread(target=_run, args=("b",))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        self.assertEqual(sorted(results.values()), [201, 400])
+        self.assertEqual(Order.objects.filter(user=self.user).count(), 1)
+
+
+class CartRowLockDeterministicTests(TransactionTestCase):
+    """Proves, without relying on thread-scheduling luck, that a second
+    attempt to lock the same Cart row genuinely blocks while the first
+    transaction holds the lock, and proceeds only after it's released."""
+
+    def setUp(self):
+        Warehouse.objects.filter(is_default=True).delete()
+        Warehouse.objects.create(name="Smerfume Default", is_default=True)
+        self.user = _make_user()
+        self.variant = _make_variant()
+        self.cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=self.cart, variant=self.variant, quantity=1)
+
+    def test_second_lock_attempt_blocks_until_first_transaction_commits(self):
+        from django.db import transaction as db_transaction
+
+        a_locked = threading.Event()
+        release_a = threading.Event()
+        b_locked = threading.Event()
+
+        def _hold_lock_a():
+            try:
+                with db_transaction.atomic():
+                    Cart.objects.select_for_update().get(pk=self.cart.pk)
+                    a_locked.set()
+                    release_a.wait(timeout=5)
+            finally:
+                connection.close()
+
+        def _attempt_lock_b():
+            try:
+                with db_transaction.atomic():
+                    Cart.objects.select_for_update().get(pk=self.cart.pk)
+                    b_locked.set()
+            finally:
+                connection.close()
+
+        t_a = threading.Thread(target=_hold_lock_a)
+        t_a.start()
+        self.assertTrue(a_locked.wait(timeout=5), "Thread A never acquired the lock")
+
+        t_b = threading.Thread(target=_attempt_lock_b)
+        t_b.start()
+
+        # While A still holds the lock, B must NOT have acquired it yet.
+        got_it_early = b_locked.wait(timeout=0.5)
+        self.assertFalse(got_it_early, "select_for_update() did not block -- Cart row is not actually locked")
+
+        release_a.set()
+        t_a.join(timeout=5)
+
+        # Now that A released (committed), B must acquire it promptly.
+        self.assertTrue(b_locked.wait(timeout=5), "Thread B never acquired the lock after A released it")
+        t_b.join(timeout=5)

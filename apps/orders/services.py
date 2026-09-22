@@ -13,6 +13,7 @@ from decimal import Decimal
 from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
+
 from apps.inventory.models import (
     DecantSource,
     InventoryStock,
@@ -22,11 +23,9 @@ from apps.inventory.models import (
     StockTransaction,
     Warehouse,
 )
-from apps.inventory.models import StockReservation
 from apps.inventory.services import reservation as reservation_service
 
 RETURN_WINDOW_DAYS = 1
-
 
 
 def allocate_discount(cart_items, order_discount_amount):
@@ -443,7 +442,6 @@ def start_inspection(return_request):
     return return_request
 
 
-
 class ReturnInspectionError(Exception):
     """Raised when a ReturnItem inspection/finalization request is invalid,
     including an attempt to finalize an already-finalized item."""
@@ -651,3 +649,279 @@ def _complete_return_if_fully_inspected(return_request):
         return
     return_request.status = Return.STATUS_COMPLETED
     return_request.save(update_fields=["status", "updated_at"])
+
+
+# ── Refund calculation and processing ──────────────────────────────────────
+#
+# Kept entirely separate from inspection/disposition: finalize_return_item()
+# never creates a Refund, and nothing here ever mutates inventory. Every
+# amount is derived from the immutable checkout-time snapshots on
+# Order/OrderItem (never today's ProductVariant price) and, once written to
+# a ReturnItem/Return/Refund, is never recalculated — a correction after
+# completion is a RefundAdjustment, never an edit to the original figures.
+#
+# TAX BOUNDARY (flagging, not guessing): OrderItem.final_paid_line_amount is
+# defined (Phase 3) as net_line_amount + tax_amount — i.e. tax added ON TOP
+# of the item price. That's a tax-EXCLUSIVE assumption. Indian MRP pricing
+# is typically tax-INCLUSIVE by law, which would make that formula wrong
+# once real GST lands (it would double-count tax). Today tax_amount is
+# always 0.00 everywhere in this codebase, so the formula is numerically
+# correct right now regardless of which semantic is eventually chosen —
+# but this refund calculation inherits whatever OrderItem.final_paid_line_amount
+# says, correct or not, without re-deriving it. Fixing the tax-inclusive/
+# exclusive question is out of scope here (GST semantics are explicitly not
+# to be invented) and needs a business decision before real tax_amount
+# values ever appear.
+
+SHIPPING_REFUND_REASONS = {
+    "wrong_item", "wrong_variant", "transit_damage", "missing_items",
+}  # manufacturing_defect deliberately excluded — matches the approved rule
+
+
+class RefundError(Exception):
+    """Raised when a refund calculation or lifecycle operation is invalid."""
+
+
+def _already_claimed_product_refund(order_item):
+    """Sum of refund_line_amount across every ReturnItem on this OrderItem
+    whose Refund is not failed — a failed refund releases its claim on the
+    historical paid amount, allowing a later return to claim it instead."""
+    from .models import Refund, ReturnItem
+
+    total = Decimal("0.00")
+    for ri in ReturnItem.objects.filter(order_item=order_item).exclude(refund_line_amount__isnull=True):
+        refund = ri.return_request.refunds.first()
+        if refund is None or refund.refund_status != Refund.STATUS_FAILED:
+            total += ri.refund_line_amount
+    return total
+
+
+def _already_claimed_surcharge_refund(order_item):
+    from .models import Refund, ReturnItem
+
+    total = Decimal("0.00")
+    for ri in ReturnItem.objects.filter(order_item=order_item).exclude(surcharge_refund_amount=Decimal("0.00")):
+        refund = ri.return_request.refunds.first()
+        if refund is None or refund.refund_status != Refund.STATUS_FAILED:
+            total += ri.surcharge_refund_amount
+    return total
+
+
+def _calculate_base_shipping_refund(return_request, order, items):
+    """items: the Return's ReturnItems (already fetched/locked by the
+    caller). Scoped to this one Return only — does not aggregate physical
+    return coverage across multiple Returns against the same order, since
+    that's added complexity no requirement has driven yet."""
+    from .models import ReturnItem
+
+    if return_request.base_shipping_refund_override is True:
+        return order.base_shipping_charge
+    if return_request.base_shipping_refund_override is False:
+        return Decimal("0.00")
+
+    total_order_quantity = sum(oi.quantity for oi in order.items.all())
+    total_returned_quantity = sum(ri.received_quantity or 0 for ri in items)
+    covers_entire_order = total_returned_quantity == total_order_quantity
+    all_refund_resolution = all(ri.resolution == ReturnItem.RESOLUTION_REFUND for ri in items)
+    all_reasons_qualify = all(ri.reason in SHIPPING_REFUND_REASONS for ri in items)
+
+    if covers_entire_order and all_refund_resolution and all_reasons_qualify:
+        return order.base_shipping_charge
+    return Decimal("0.00")
+
+
+@transaction.atomic
+def create_refund_for_return(return_request, refund_method=None, approved_by=None):
+    """Calculate and record the refund owed for a completed Return. Does
+    not move money — this only creates the financial record, status
+    STATUS_PENDING. Locks the Return, Order, and every referenced OrderItem
+    before computing anything, so two concurrent refund calculations
+    against overlapping OrderItems can't both succeed past their
+    historical-amount caps.
+
+    refund_method is optional and defaults to unset: there is no live
+    payment/refund gateway to infer a channel from, so a staff member
+    chooses it explicitly via set_refund_method() before the refund can
+    move to processing.
+    """
+    from .models import Order, OrderItem, Refund, Return, ReturnItem
+
+    return_request = Return.objects.select_for_update().get(pk=return_request.pk)
+    if return_request.status != Return.STATUS_COMPLETED:
+        raise RefundError(
+            f"Cannot create a refund for a return in status={return_request.status}; it must be completed."
+        )
+    if Refund.objects.filter(return_request=return_request).exists():
+        raise RefundError("A refund has already been created for this return.")
+
+    order = Order.objects.select_for_update().get(pk=return_request.order_id)
+    items = list(return_request.items.select_for_update().select_related("order_item"))
+
+    refund_items = [item for item in items if item.resolution == ReturnItem.RESOLUTION_REFUND]
+    if not refund_items:
+        raise RefundError("This return has no resolution=refund items — there is nothing to refund.")
+
+    total_amount = Decimal("0.00")
+
+    for item in refund_items:
+        order_item = OrderItem.objects.select_for_update().get(pk=item.order_item_id)
+
+        unit_paid = order_item.final_paid_line_amount / order_item.quantity
+        line_refund = (unit_paid * item.received_quantity).quantize(Decimal("0.01"))
+
+        already_claimed = _already_claimed_product_refund(order_item)
+        if already_claimed + line_refund > order_item.final_paid_line_amount:
+            raise RefundError(
+                f"Refund for order item {order_item.pk} ({line_refund}) plus what's already "
+                f"claimed ({already_claimed}) would exceed the historical amount paid "
+                f"({order_item.final_paid_line_amount})."
+            )
+
+        surcharge_refund = Decimal("0.00")
+        if item.reason in SHIPPING_REFUND_REASONS and order_item.shipping_surcharge > 0:
+            unit_surcharge = order_item.shipping_surcharge / order_item.quantity
+            surcharge_refund = (unit_surcharge * item.received_quantity).quantize(Decimal("0.01"))
+
+            already_claimed_surcharge = _already_claimed_surcharge_refund(order_item)
+            if already_claimed_surcharge + surcharge_refund > order_item.shipping_surcharge:
+                raise RefundError(
+                    f"Surcharge refund for order item {order_item.pk} would exceed the "
+                    f"original surcharge ({order_item.shipping_surcharge})."
+                )
+
+        item.refund_line_amount = line_refund
+        item.surcharge_refund_amount = surcharge_refund
+        item.save(update_fields=["refund_line_amount", "surcharge_refund_amount", "updated_at"])
+
+        total_amount += line_refund + surcharge_refund
+
+    base_shipping_refund = _calculate_base_shipping_refund(return_request, order, items)
+    return_request.base_shipping_refund_amount = base_shipping_refund
+    return_request.save(update_fields=["base_shipping_refund_amount", "updated_at"])
+    total_amount += base_shipping_refund
+
+    refund = Refund.objects.create(
+        return_request=return_request,
+        refund_amount=total_amount,
+        refund_status=Refund.STATUS_PENDING,
+        refund_method=refund_method,
+        approved_by=approved_by,
+    )
+    return refund
+
+
+@transaction.atomic
+def set_refund_method(refund, refund_method):
+    """Explicitly set/change the refund method while it's still pending.
+    There is no live gateway to infer this from, so it must always be a
+    deliberate staff choice.
+    """
+    from .models import Refund
+
+    refund = Refund.objects.select_for_update().get(pk=refund.pk)
+    if refund.refund_status != Refund.STATUS_PENDING:
+        raise RefundError(f"Cannot change refund method for a refund in status={refund.refund_status}.")
+    refund.refund_method = refund_method
+    refund.save(update_fields=["refund_method", "updated_at"])
+    return refund
+
+
+@transaction.atomic
+def mark_refund_processing(refund):
+    from .models import Refund
+
+    refund = Refund.objects.select_for_update().get(pk=refund.pk)
+    if refund.refund_status != Refund.STATUS_PENDING:
+        raise RefundError(f"Cannot mark processing a refund in status={refund.refund_status}.")
+    if not refund.refund_method:
+        raise RefundError("Cannot mark processing a refund with no refund_method set.")
+    refund.refund_status = Refund.STATUS_PROCESSING
+    refund.save(update_fields=["refund_status", "updated_at"])
+    return refund
+
+
+@transaction.atomic
+def complete_refund(refund, refund_reference, processed_by, notes=""):
+    """processing -> completed. Never called for external gateway execution
+    — this only records that a (manual, for now) payment was made. Once
+    completed, refund_amount is immutable; any later correction must be a
+    RefundAdjustment. If this refund brings the order's cumulative
+    completed refunds up to its full refundable total, the order moves to
+    `refunded` — otherwise it stays `delivered` (see _maybe_mark_order_refunded)."""
+    from .models import Refund
+
+    refund = Refund.objects.select_for_update().get(pk=refund.pk)
+    if refund.refund_status != Refund.STATUS_PROCESSING:
+        raise RefundError(f"Cannot complete a refund in status={refund.refund_status}.")
+
+    refund.refund_status = Refund.STATUS_COMPLETED
+    refund.refund_reference = refund_reference
+    refund.processed_by = processed_by
+    refund.processed_at = timezone.now()
+    if notes:
+        refund.notes = notes
+    refund.save(update_fields=[
+        "refund_status", "refund_reference", "processed_by", "processed_at", "notes", "updated_at",
+    ])
+
+    _maybe_mark_order_refunded(refund.return_request.order_id)
+
+    return refund
+
+
+@transaction.atomic
+def fail_refund(refund, failure_reason, processed_by):
+    """processing -> failed. Not terminal — releases this refund's claim on
+    the historical paid amounts (see _already_claimed_*), so a later return
+    or a retried refund can claim them instead."""
+    from .models import Refund
+
+    refund = Refund.objects.select_for_update().get(pk=refund.pk)
+    if refund.refund_status != Refund.STATUS_PROCESSING:
+        raise RefundError(f"Cannot fail a refund in status={refund.refund_status}.")
+    refund.refund_status = Refund.STATUS_FAILED
+    refund.failure_reason = failure_reason
+    refund.processed_by = processed_by
+    refund.processed_at = timezone.now()
+    refund.save(update_fields=[
+        "refund_status", "failure_reason", "processed_by", "processed_at", "updated_at",
+    ])
+    return refund
+
+
+def _maybe_mark_order_refunded(order_id):
+    """delivered -> refunded only when cumulative COMPLETED refunds cover
+    the order's full refundable total (total minus the always-non-refundable
+    cod_handling_charge/convenience_fee). A partial refund leaves the order
+    at `delivered`, per the approved rule."""
+    from .models import Order, Refund
+
+    order = Order.objects.select_for_update().get(pk=order_id)
+    if order.status != Order.STATUS_DELIVERED:
+        return
+
+    refundable_total = order.total - order.cod_handling_charge - order.convenience_fee
+    completed_total = Refund.objects.filter(
+        return_request__order=order, refund_status=Refund.STATUS_COMPLETED,
+    ).aggregate(total=Sum("refund_amount"))["total"] or Decimal("0.00")
+
+    if completed_total >= refundable_total:
+        order.status = Order.STATUS_REFUNDED
+        order.save(update_fields=["status", "updated_at"])
+
+
+@transaction.atomic
+def create_refund_adjustment(refund, adjustment_amount, reason, approved_by):
+    """Record a correction against an already-completed refund without
+    touching its original refund_amount. Only valid against a completed
+    refund — a pending/processing refund's amount can simply be corrected
+    directly before it's completed, since nothing has been promised yet."""
+    from .models import Refund, RefundAdjustment
+
+    refund = Refund.objects.select_for_update().get(pk=refund.pk)
+    if refund.refund_status != Refund.STATUS_COMPLETED:
+        raise RefundError("Adjustments can only be recorded against a completed refund.")
+
+    return RefundAdjustment.objects.create(
+        refund=refund, adjustment_amount=adjustment_amount, reason=reason, approved_by=approved_by,
+    )

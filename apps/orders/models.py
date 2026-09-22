@@ -202,7 +202,10 @@ class ShippingAddress(BaseModel):
 class Return(BaseModel):
     """The customer's overall return request/process. Disposition and
     resolution live on ReturnItem (per-line), not here — this model tracks
-    only the process lifecycle."""
+    only the process lifecycle. The actual refund transaction is a separate
+    Refund record (apps.orders.services.create_refund_for_return) — this
+    model only carries the base-shipping-refund amount, since that's an
+    order-wide computation, not a per-line one."""
 
     STATUS_REQUESTED = "requested"
     STATUS_APPROVED = "approved"
@@ -227,9 +230,21 @@ class Return(BaseModel):
     order = models.ForeignKey(Order, on_delete=models.PROTECT, related_name="returns")
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_REQUESTED, db_index=True)
 
+    # Set only via create_refund_for_return() — never recalculated once set.
+    base_shipping_refund_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    # None = use the computed rule; True/False = staff-forced override,
+    # applied instead of the computed rule at refund-creation time.
+    base_shipping_refund_override = models.BooleanField(null=True, blank=True)
+
     class Meta:
         db_table = "orders_return"
         ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(base_shipping_refund_amount__gte=0),
+                name="return_base_shipping_refund_amount_gte_0",
+            ),
+        ]
 
     def __str__(self):
         return f"Return({self.order.order_number}, {self.status})"
@@ -299,6 +314,13 @@ class ReturnItem(BaseModel):
     )
     inspected_at = models.DateTimeField(null=True, blank=True)
 
+    # ── Refund calculation — set only via create_refund_for_return(), once,
+    # and never recalculated afterward. Both remain 0/null for resolution
+    # in (replacement, not_applicable) — only resolution=refund lines ever
+    # get a value here.
+    refund_line_amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    surcharge_refund_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
     class Meta:
         db_table = "orders_returnitem"
         constraints = [
@@ -309,8 +331,99 @@ class ReturnItem(BaseModel):
                 condition=models.Q(remaining_quantity_ml__isnull=True) | models.Q(remaining_quantity_ml__gt=0),
                 name="returnitem_remaining_ml_positive_or_null",
             ),
+            models.CheckConstraint(
+                condition=models.Q(refund_line_amount__isnull=True) | models.Q(refund_line_amount__gte=0),
+                name="returnitem_refund_line_amount_gte_0_or_null",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(surcharge_refund_amount__gte=0),
+                name="returnitem_surcharge_refund_amount_gte_0",
+            ),
         ]
 
     def __str__(self):
         return f"ReturnItem({self.order_item}, {self.reason})"
 
+
+class Refund(BaseModel):
+    """The financial record of what's owed back to the customer for a
+    Return, and its processing status. One Refund per Return (created once
+    the Return is fully inspected — see create_refund_for_return()),
+    aggregating every resolution=refund ReturnItem's product + surcharge
+    amounts plus the Return's base_shipping_refund_amount.
+
+    This model records the calculation and (manual, for now) payment
+    workflow — it never calls an external payment gateway. refund_amount
+    is written once at creation and never modified afterward; a correction
+    after completion must go through RefundAdjustment, not a direct edit
+    here."""
+
+    STATUS_PENDING = "pending"
+    STATUS_PROCESSING = "processing"
+    STATUS_COMPLETED = "completed"
+    STATUS_FAILED = "failed"
+
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_PROCESSING, "Processing"),
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    METHOD_GATEWAY = "gateway"
+    METHOD_BANK_TRANSFER = "bank_transfer"
+    METHOD_UPI = "upi"
+
+    METHOD_CHOICES = [
+        (METHOD_GATEWAY, "Payment Gateway"),
+        (METHOD_BANK_TRANSFER, "Bank Transfer"),
+        (METHOD_UPI, "UPI"),
+    ]
+
+    return_request = models.ForeignKey(Return, on_delete=models.PROTECT, related_name="refunds")
+    refund_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    refund_status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING, db_index=True)
+    # Left unset at creation — there is no live gateway to infer a channel
+    # from, so a staff member must explicitly choose it (set_refund_method())
+    # before the refund can move to processing. Never guessed from
+    # Order.payment_method.
+    refund_method = models.CharField(max_length=20, choices=METHOD_CHOICES, null=True, blank=True)
+    # UTR / bank reference (manual COD) or gateway refund id (prepaid) —
+    # either way, entered manually; no live provider integration exists.
+    refund_reference = models.CharField(max_length=100, blank=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    failure_reason = models.TextField(blank=True)
+    processed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        db_table = "orders_refund"
+        constraints = [
+            models.CheckConstraint(condition=models.Q(refund_amount__gte=0), name="refund_amount_gte_0"),
+        ]
+
+    def __str__(self):
+        return f"Refund({self.return_request.order.order_number}, {self.refund_amount}, {self.refund_status})"
+
+
+class RefundAdjustment(BaseModel):
+    """An explicit, audited correction to an already-completed Refund.
+    Refund.refund_amount is never edited directly once refund_status is
+    completed — a correction is recorded here instead, and the effective
+    refunded amount for reporting is refund_amount + sum(adjustments)."""
+
+    refund = models.ForeignKey(Refund, on_delete=models.PROTECT, related_name="adjustments")
+    adjustment_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    reason = models.TextField()
+    approved_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
+
+    class Meta:
+        db_table = "orders_refundadjustment"
+
+    def __str__(self):
+        return f"RefundAdjustment({self.refund_id}, {self.adjustment_amount})"

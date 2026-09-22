@@ -4,7 +4,7 @@ from django.contrib import messages
 from unfold.admin import ModelAdmin
 
 from . import services as order_services
-from .models import Order, OrderItem, Return, ReturnItem, ShippingAddress
+from .models import Order, OrderItem, Refund, RefundAdjustment, Return, ReturnItem, ShippingAddress
 
 
 class OrderItemInline(admin.TabularInline):
@@ -173,8 +173,6 @@ class OrderAdmin(ModelAdmin):
             )
 
 
-
-
 class ReturnItemInline(admin.TabularInline):
     model = ReturnItem
     extra = 0
@@ -188,12 +186,21 @@ class ReturnAdmin(ModelAdmin):
     list_display = ("id", "order", "status", "created_at")
     list_filter = ("status", "created_at")
     search_fields = ("order__order_number",)
-    readonly_fields = ("public_id", "order", "status", "created_at")
-    fields = ("public_id", "order", "status", "created_at")
+    # base_shipping_refund_override is intentionally editable — it's the
+    # staff override point ("unless an explicit staff override is used")
+    # for the computed base-shipping-refund rule; create_refund reads it
+    # at calculation time. base_shipping_refund_amount is the resulting
+    # computed/stored value and stays read-only.
+    readonly_fields = ("public_id", "order", "status", "created_at", "base_shipping_refund_amount")
+    fields = (
+        "public_id", "order", "status", "created_at",
+        "base_shipping_refund_override", "base_shipping_refund_amount",
+    )
     inlines = [ReturnItemInline]
     actions = [
         "approve_returns", "reject_returns", "cancel_returns",
         "mark_in_transit", "mark_received", "start_inspection",
+        "create_refund",
     ]
 
     def has_add_permission(self, request):
@@ -263,6 +270,30 @@ class ReturnAdmin(ModelAdmin):
             request, queryset, order_services.start_inspection,
             order_services.ReturnTransitionError, "Started inspection on",
         )
+
+    @admin.action(description="Create refund for selected returns (completed returns only)")
+    def create_refund(self, request, queryset):
+        count = 0
+        for return_request in queryset:
+            try:
+                # refund_method is left unset — there is no live payment
+                # provider to infer it from. Staff must explicitly choose
+                # it on the Refund's own change form before it can be
+                # marked processing.
+                order_services.create_refund_for_return(
+                    return_request, approved_by=request.user,
+                )
+                count += 1
+            except order_services.RefundError as exc:
+                self.message_user(
+                    request, f"Return #{return_request.pk}: {exc}", level=messages.WARNING
+                )
+        if count:
+            self.message_user(
+                request,
+                f"Created {count} refund(s). Set each refund's method before marking it processing.",
+                level=messages.SUCCESS,
+            )
 
 
 class ReturnItemInspectionForm(forms.ModelForm):
@@ -352,3 +383,157 @@ class ReturnItemAdmin(ModelAdmin):
             self.message_user(request, str(exc), level=messages.ERROR)
 
 
+class RefundProcessingForm(forms.ModelForm):
+    """Like ReturnItemInspectionForm: looks like a normal ModelForm, but
+    RefundAdmin.save_model() never calls form.save()/obj.save() — every
+    field change is routed through mark_refund_processing()/complete_refund()/
+    fail_refund() instead, so refund_amount can never be hand-edited and a
+    completed refund's figures can never be silently overwritten."""
+
+    ACTION_NONE = ""
+    ACTION_COMPLETE = "complete"
+    ACTION_FAIL = "fail"
+
+    action = forms.ChoiceField(
+        choices=[
+            (ACTION_NONE, "— No change —"),
+            (ACTION_COMPLETE, "Mark Completed"),
+            (ACTION_FAIL, "Mark Failed"),
+        ],
+        required=False,
+    )
+    refund_reference = forms.CharField(required=False, help_text="UTR / bank reference / gateway refund id.")
+    failure_reason = forms.CharField(required=False, widget=forms.Textarea)
+
+    class Meta:
+        model = Refund
+        fields = ["refund_method", "notes"]
+
+
+@admin.register(Refund)
+class RefundAdmin(ModelAdmin):
+    list_display = (
+        "id", "return_request", "refund_amount", "refund_status",
+        "refund_method", "refund_reference", "processed_at",
+    )
+    list_filter = ("refund_status", "refund_method")
+    search_fields = ("return_request__order__order_number", "refund_reference")
+    form = RefundProcessingForm
+    actions = ["mark_processing"]
+
+    def has_add_permission(self, request):
+        # Refunds are only ever created via create_refund_for_return()
+        # (the "Create refund" action on ReturnAdmin) — never a raw add
+        # form, since the amount must come from the calculation, not a
+        # hand-typed figure.
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def get_fields(self, request, obj=None):
+        return [
+            "return_request", "refund_amount", "refund_status", "refund_method",
+            "refund_reference", "failure_reason", "processed_at", "processed_by",
+            "approved_by", "notes", "action",
+        ]
+
+    def get_readonly_fields(self, request, obj=None):
+        always_readonly = [
+            "return_request", "refund_amount", "refund_status",
+            "processed_at", "processed_by", "approved_by",
+        ]
+        if obj is not None and obj.refund_status in (Refund.STATUS_COMPLETED, Refund.STATUS_FAILED):
+            # Terminal states — nothing left to change through this form.
+            return always_readonly + ["refund_method", "refund_reference", "failure_reason", "notes"]
+        if obj is not None and obj.refund_status == Refund.STATUS_PROCESSING:
+            # The method has already been committed to processing money —
+            # only the completion fields (reference/failure reason/notes)
+            # stay editable from here.
+            return always_readonly + ["refund_method"]
+        return always_readonly
+
+    def save_model(self, request, obj, form, change):
+        action = form.cleaned_data.get("action")
+        method_changed = False
+        try:
+            # refund_method is excluded from the form once readonly (see
+            # get_readonly_fields), so it's only present here while the
+            # refund is still pending and staff explicitly picked a value.
+            if "refund_method" in form.cleaned_data:
+                new_method = form.cleaned_data["refund_method"]
+                current = Refund.objects.get(pk=obj.pk)
+                if new_method != current.refund_method:
+                    order_services.set_refund_method(obj, new_method)
+                    method_changed = True
+            if action == RefundProcessingForm.ACTION_COMPLETE:
+                order_services.complete_refund(
+                    obj,
+                    refund_reference=form.cleaned_data.get("refund_reference", ""),
+                    processed_by=request.user,
+                    notes=form.cleaned_data.get("notes", ""),
+                )
+                self.message_user(request, "Refund marked completed.", level=messages.SUCCESS)
+            elif action == RefundProcessingForm.ACTION_FAIL:
+                order_services.fail_refund(
+                    obj,
+                    failure_reason=form.cleaned_data.get("failure_reason", ""),
+                    processed_by=request.user,
+                )
+                self.message_user(request, "Refund marked failed.", level=messages.WARNING)
+            elif method_changed:
+                self.message_user(request, "Refund method updated.", level=messages.SUCCESS)
+            else:
+                self.message_user(request, "No action selected — nothing changed.", level=messages.INFO)
+        except order_services.RefundError as exc:
+            self.message_user(request, str(exc), level=messages.ERROR)
+
+    @admin.action(description="Mark selected refunds as Processing")
+    def mark_processing(self, request, queryset):
+        count = 0
+        for refund in queryset:
+            try:
+                order_services.mark_refund_processing(refund)
+                count += 1
+            except order_services.RefundError as exc:
+                self.message_user(request, f"Refund #{refund.pk}: {exc}", level=messages.WARNING)
+        if count:
+            self.message_user(request, f"Marked {count} refund(s) as processing.", level=messages.SUCCESS)
+
+
+class RefundAdjustmentForm(forms.ModelForm):
+    class Meta:
+        model = RefundAdjustment
+        fields = ["refund", "adjustment_amount", "reason"]
+
+
+@admin.register(RefundAdjustment)
+class RefundAdjustmentAdmin(ModelAdmin):
+    list_display = ("id", "refund", "adjustment_amount", "approved_by", "created_at")
+    search_fields = ("refund__return_request__order__order_number",)
+    form = RefundAdjustmentForm
+
+    def has_change_permission(self, request, obj=None):
+        # Adjustments are an append-only correction log — never edited
+        # once recorded.
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj is not None:
+            return ("refund", "adjustment_amount", "reason", "approved_by", "created_at")
+        return ("approved_by", "created_at")
+
+    def save_model(self, request, obj, form, change):
+        try:
+            order_services.create_refund_adjustment(
+                form.cleaned_data["refund"],
+                form.cleaned_data["adjustment_amount"],
+                form.cleaned_data["reason"],
+                approved_by=request.user,
+            )
+            self.message_user(request, "Refund adjustment recorded.", level=messages.SUCCESS)
+        except order_services.RefundError as exc:
+            self.message_user(request, str(exc), level=messages.ERROR)

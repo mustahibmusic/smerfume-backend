@@ -154,13 +154,13 @@ class PartialBottleLotAdmin(ModelAdmin):
     def get_fields(self, request, obj=None):
         return [
             "variant", "warehouse", "remaining_ml", "reserved_ml", "opened_at", "is_depleted",
-            "source_transaction", "ml_delta", "reason", "notes",
+            "source_transaction", "source_return_item", "ml_delta", "reason", "notes",
         ]
 
     def get_readonly_fields(self, request, obj=None):
         return [
             "variant", "warehouse", "remaining_ml", "reserved_ml", "opened_at", "is_depleted",
-            "source_transaction",
+            "source_transaction", "source_return_item",
         ]
 
     def save_model(self, request, obj, form, change):
@@ -215,7 +215,7 @@ class StockMovementAdmin(ModelAdmin):
     readonly_fields = (
         "transaction_group", "variant", "warehouse", "stock_type", "movement_type",
         "quantity_delta", "reason", "notes", "supplier", "partial_lot",
-        "source_order_item", "performed_by", "created_at",
+        "source_order_item", "source_return_item", "performed_by", "created_at",
     )
 
     def has_add_permission(self, request):

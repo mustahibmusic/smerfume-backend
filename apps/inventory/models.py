@@ -128,6 +128,15 @@ class PartialBottleLot(BaseModel):
         on_delete=models.PROTECT,
         related_name="partial_lots_opened",
     )
+    # Set only when this lot was created by a restocked_partial return
+    # disposition — deferred in Phase 1 pending ReturnItem's existence.
+    source_return_item = models.ForeignKey(
+        "orders.ReturnItem",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="restocked_lots",
+    )
 
     class Meta:
         indexes = [
@@ -309,6 +318,17 @@ class StockMovement(BaseModel):
     )
     source_order_item = models.ForeignKey(
         "orders.OrderItem",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="stock_movements",
+    )
+    # Set only on movements caused by a return disposition — deferred in
+    # Phase 1 pending ReturnItem's existence. Populated alongside
+    # source_order_item (not instead of it) so a return-caused movement
+    # traces both to the specific return event and the original sale line.
+    source_return_item = models.ForeignKey(
+        "orders.ReturnItem",
         on_delete=models.SET_NULL,
         null=True,
         blank=True,

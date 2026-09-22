@@ -840,6 +840,11 @@ class InventoryAdminIntegrityTests(TestCase):
         admin_instance = PartialBottleLotAdmin(PartialBottleLot, django_admin.site)
         self.assertFalse(admin_instance.has_add_permission(self.request))
 
+    def test_stock_movement_source_return_item_is_readonly(self):
+        admin_instance = StockMovementAdmin(StockMovement, django_admin.site)
+        self.assertIn("source_return_item", admin_instance.readonly_fields)
+        self.assertIn("quantity_delta", admin_instance.readonly_fields)
+
     def test_stock_movement_has_no_add_or_delete_permission(self):
         admin_instance = StockMovementAdmin(StockMovement, django_admin.site)
         self.assertFalse(admin_instance.has_add_permission(self.request))

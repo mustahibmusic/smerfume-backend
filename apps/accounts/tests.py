@@ -460,7 +460,8 @@ class CartMergeOnLoginTests(TestCase):
             defaults={"name": "EDP", "concentration": "edp", "gender": "unisex"},
         )[0]
         self.variant = ProductVariant.objects.create(
-            edition=edition, size_ml=10, selling_price="200.00", mrp="250.00"
+            edition=edition, size_ml=10, selling_price="200.00", mrp="250.00",
+            sku="TEST-CARTMERGE-10ML",
         )
 
         self.guest_cart = Cart.objects.create(session_key="mergetoken")

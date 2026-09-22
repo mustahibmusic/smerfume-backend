@@ -5,7 +5,10 @@ Test groups:
     GuestCartTests        — guest cart creation and X-Cart-Token resolution
     AuthenticatedCartTests — authenticated cart CRUD (regression guard)
     CartMergeServiceTests  — merge_guest_cart service unit tests
+    CartOwnershipTests      — stabilization: cross-owner item access is rejected
 """
+
+import uuid
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
@@ -55,6 +58,7 @@ def _make_variant(selling_price="500.00", mrp="600.00", size_ml=10):
         size_ml=size_ml,
         selling_price=selling_price,
         mrp=mrp,
+        sku=f"TEST-{uuid.uuid4().hex[:10]}",
     )
 
 
@@ -237,3 +241,58 @@ class CartMergeServiceTests(TestCase):
         guest_cart = self._make_guest_cart(token="token_empty")
         merge_guest_cart(guest_cart.session_key, self.user)
         self.assertFalse(Cart.objects.filter(session_key="token_empty").exists())
+
+
+# ── Ownership/authorization (stabilization pass — no dedicated test existed) ──
+
+class CartOwnershipTests(TestCase):
+    """_get_cart_item() in apps/cart/views.py already scopes its query by
+    owner (cart__user=request.user, or cart__session_key=<token> for a
+    guest) — this proves that scoping actually holds at the HTTP layer,
+    since item_id in the URL is a raw integer pk with no token-cross-check
+    other than that query."""
+
+    def setUp(self):
+        self.variant = _make_variant()
+
+    def test_guest_a_cannot_modify_guest_b_cart_item(self):
+        client_a = APIClient()
+        client_a.credentials(HTTP_X_CART_TOKEN="token_guest_a")
+        resp = client_a.post(ADD_URL, {"variant_id": self.variant.pk, "quantity": 1}, format="json")
+        item_id = resp.data["items"][0]["id"]
+
+        client_b = APIClient()
+        client_b.credentials(HTTP_X_CART_TOKEN="token_guest_b")
+        patch_resp = client_b.patch(f"/api/cart/items/{item_id}/", {"quantity": 5}, format="json")
+        self.assertEqual(patch_resp.status_code, 404)
+
+        delete_resp = client_b.delete(f"/api/cart/items/{item_id}/")
+        self.assertEqual(delete_resp.status_code, 404)
+
+        # Item A's cart is untouched by B's failed attempts.
+        check_resp = client_a.get(CART_URL)
+        self.assertEqual(check_resp.data["items"][0]["quantity"], 1)
+
+    def test_authenticated_user_cannot_modify_another_users_cart_item(self):
+        user_a = _make_user(mobile="+919800000010")
+        user_b = _make_user(mobile="+919800000011")
+
+        client_a = APIClient()
+        client_a.credentials(**_auth_header(user_a))
+        resp = client_a.post(ADD_URL, {"variant_id": self.variant.pk, "quantity": 1}, format="json")
+        item_id = resp.data["items"][0]["id"]
+
+        client_b = APIClient()
+        client_b.credentials(**_auth_header(user_b))
+        patch_resp = client_b.patch(f"/api/cart/items/{item_id}/", {"quantity": 5}, format="json")
+        self.assertEqual(patch_resp.status_code, 404)
+
+    def test_guest_cannot_access_item_without_sending_a_token(self):
+        client = APIClient()
+        client.credentials(HTTP_X_CART_TOKEN="token_guest_c")
+        resp = client.post(ADD_URL, {"variant_id": self.variant.pk, "quantity": 1}, format="json")
+        item_id = resp.data["items"][0]["id"]
+
+        anon = APIClient()  # no X-Cart-Token at all
+        patch_resp = anon.patch(f"/api/cart/items/{item_id}/", {"quantity": 2}, format="json")
+        self.assertEqual(patch_resp.status_code, 404)

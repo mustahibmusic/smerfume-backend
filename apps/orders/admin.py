@@ -1,3 +1,4 @@
+from django import forms
 from django.contrib import admin
 from django.contrib import messages
 from unfold.admin import ModelAdmin
@@ -262,3 +263,92 @@ class ReturnAdmin(ModelAdmin):
             request, queryset, order_services.start_inspection,
             order_services.ReturnTransitionError, "Started inspection on",
         )
+
+
+class ReturnItemInspectionForm(forms.ModelForm):
+    """A normal-looking ModelForm bound to real ReturnItem fields — but
+    ReturnItemAdmin.save_model() below never calls form.save()/obj.save().
+    The only way these fields are ever persisted is through
+    finalize_return_item(), which performs the inventory mutation and the
+    field write in one atomic operation. This form exists purely to render
+    editable widgets and produce cleaned_data for that call."""
+
+    # The model allows these null (before inspection); the form requires
+    # them, since inspection is meaningless without a real answer for each.
+    received_quantity = forms.IntegerField(min_value=0)
+    disposition = forms.ChoiceField(choices=ReturnItem.DISPOSITION_CHOICES)
+    resolution = forms.ChoiceField(choices=ReturnItem.RESOLUTION_CHOICES)
+
+    class Meta:
+        model = ReturnItem
+        fields = ["received_quantity", "disposition", "resolution", "remaining_quantity_ml", "inspection_notes"]
+
+    def clean(self):
+        cleaned = super().clean()
+        disposition = cleaned.get("disposition")
+        remaining_ml = cleaned.get("remaining_quantity_ml")
+        if disposition == ReturnItem.DISPOSITION_RESTOCKED_PARTIAL and not remaining_ml:
+            self.add_error("remaining_quantity_ml", "Required when disposition is restocked_partial.")
+        if disposition != ReturnItem.DISPOSITION_RESTOCKED_PARTIAL and remaining_ml:
+            self.add_error("remaining_quantity_ml", "Only valid when disposition is restocked_partial.")
+        return cleaned
+
+
+@admin.register(ReturnItem)
+class ReturnItemAdmin(ModelAdmin):
+    list_display = (
+        "id", "return_request", "order_item", "reason",
+        "requested_quantity", "approved_quantity", "received_quantity",
+        "disposition", "resolution",
+    )
+    list_filter = ("disposition", "resolution", "reason")
+    search_fields = ("return_request__order__order_number",)
+    form = ReturnItemInspectionForm
+
+    def has_add_permission(self, request):
+        # ReturnItems are only ever created via create_return().
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def get_fields(self, request, obj=None):
+        return [
+            "return_request", "order_item", "reason", "reason_notes",
+            "requested_quantity", "approved_quantity",
+            "received_quantity", "disposition", "resolution",
+            "remaining_quantity_ml", "inspection_notes",
+            "inspected_by", "inspected_at",
+        ]
+
+    def get_readonly_fields(self, request, obj=None):
+        always_readonly = [
+            "return_request", "order_item", "reason", "reason_notes",
+            "requested_quantity", "approved_quantity", "inspected_by", "inspected_at",
+        ]
+        if obj is not None and obj.disposition is not None:
+            # Already finalized — nothing left to edit; finalize_return_item
+            # would reject a second attempt anyway, but there's no reason to
+            # invite one.
+            return always_readonly + [
+                "received_quantity", "disposition", "resolution",
+                "remaining_quantity_ml", "inspection_notes",
+            ]
+        return always_readonly
+
+    def save_model(self, request, obj, form, change):
+        try:
+            order_services.finalize_return_item(
+                obj,
+                received_quantity=form.cleaned_data["received_quantity"],
+                disposition=form.cleaned_data["disposition"],
+                resolution=form.cleaned_data["resolution"],
+                remaining_quantity_ml=form.cleaned_data.get("remaining_quantity_ml"),
+                inspection_notes=form.cleaned_data.get("inspection_notes", ""),
+                inspected_by=request.user,
+            )
+            self.message_user(request, "Return item inspected and finalized.", level=messages.SUCCESS)
+        except order_services.ReturnInspectionError as exc:
+            self.message_user(request, str(exc), level=messages.ERROR)
+
+

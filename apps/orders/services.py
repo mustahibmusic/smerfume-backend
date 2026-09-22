@@ -13,7 +13,15 @@ from decimal import Decimal
 from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
-
+from apps.inventory.models import (
+    DecantSource,
+    InventoryStock,
+    PartialBottleLot,
+    StockMovement,
+    StockReservation,
+    StockTransaction,
+    Warehouse,
+)
 from apps.inventory.models import StockReservation
 from apps.inventory.services import reservation as reservation_service
 
@@ -434,3 +442,212 @@ def start_inspection(return_request):
     return_request.save(update_fields=["status", "updated_at"])
     return return_request
 
+
+
+class ReturnInspectionError(Exception):
+    """Raised when a ReturnItem inspection/finalization request is invalid,
+    including an attempt to finalize an already-finalized item."""
+
+
+@transaction.atomic
+def finalize_return_item(
+    return_item,
+    *,
+    received_quantity,
+    disposition,
+    resolution,
+    inspected_by=None,
+    inspection_notes="",
+    remaining_quantity_ml=None,
+):
+    """Record inspection results for one ReturnItem and perform the
+    corresponding physical inventory mutation, atomically:
+    validate -> inspect -> create the inventory movement(s) -> finalize.
+
+    A returned item never becomes sellable inventory merely by arriving —
+    only a successful call here, with an explicit disposition, has any
+    inventory effect. `rejected` and a damaged decant both finalize the
+    ReturnItem with zero inventory movement, by design (see
+    _apply_return_disposition_inventory).
+
+    Idempotency/concurrency: select_for_update() locks the ReturnItem row
+    first; if disposition is already set, this raises immediately, before
+    any inventory mutation is attempted. A concurrent second call blocks on
+    that lock until the first transaction commits, then sees disposition
+    already set and is rejected the same way — the database transaction is
+    what enforces this, not the admin UI calling it at most once.
+
+    If every ReturnItem on the parent Return is now finalized, the Return
+    automatically advances inspection_pending -> completed in the same
+    transaction; it is never marked completed while any item is still
+    unfinalized.
+    """
+    from .models import Return, ReturnItem
+
+    return_item = ReturnItem.objects.select_for_update().get(pk=return_item.pk)
+
+    if return_item.disposition is not None:
+        raise ReturnInspectionError("This return item has already been finalized.")
+
+    return_request = return_item.return_request
+    if return_request.status != Return.STATUS_INSPECTION_PENDING:
+        raise ReturnInspectionError(
+            f"Cannot inspect a return item whose Return is in status={return_request.status}; "
+            "the Return must be in inspection_pending."
+        )
+
+    if return_item.approved_quantity is None:
+        raise ReturnInspectionError("This return item has no approved_quantity recorded.")
+
+    if received_quantity < 0:
+        raise ReturnInspectionError("received_quantity cannot be negative.")
+    if received_quantity > return_item.approved_quantity:
+        raise ReturnInspectionError(
+            f"received_quantity ({received_quantity}) cannot exceed "
+            f"approved_quantity ({return_item.approved_quantity})."
+        )
+
+    valid_dispositions = {choice[0] for choice in ReturnItem.DISPOSITION_CHOICES}
+    if disposition not in valid_dispositions:
+        raise ReturnInspectionError(f"'{disposition}' is not a valid disposition.")
+
+    valid_resolutions = {choice[0] for choice in ReturnItem.RESOLUTION_CHOICES}
+    if resolution not in valid_resolutions:
+        raise ReturnInspectionError(f"'{resolution}' is not a valid resolution.")
+
+    # A StockMovement is never created with quantity_delta=0 — rejected is
+    # the only disposition where zero physical inventory is genuinely
+    # expected, so it's the only one allowed to carry received_quantity=0.
+    if received_quantity == 0 and disposition != ReturnItem.DISPOSITION_REJECTED:
+        raise ReturnInspectionError(
+            f"received_quantity=0 is only valid for disposition=rejected, not {disposition!r}."
+        )
+
+    variant = return_item.order_item.variant
+    is_decant = DecantSource.objects.filter(decant_variant=variant).exists()
+
+    if disposition == ReturnItem.DISPOSITION_RESTOCKED_RETAIL and is_decant:
+        raise ReturnInspectionError(
+            "A decant has no independent retail stock pool — it cannot be disposed as restocked_retail."
+        )
+
+    if disposition == ReturnItem.DISPOSITION_RESTOCKED_PARTIAL:
+        if remaining_quantity_ml is None or remaining_quantity_ml <= 0:
+            raise ReturnInspectionError("restocked_partial requires a positive remaining_quantity_ml.")
+    elif remaining_quantity_ml is not None:
+        raise ReturnInspectionError("remaining_quantity_ml is only valid for disposition=restocked_partial.")
+
+    _apply_return_disposition_inventory(
+        return_item=return_item,
+        disposition=disposition,
+        received_quantity=received_quantity,
+        remaining_quantity_ml=remaining_quantity_ml,
+        is_decant=is_decant,
+        performed_by=inspected_by,
+    )
+
+    return_item.received_quantity = received_quantity
+    return_item.disposition = disposition
+    return_item.resolution = resolution
+    return_item.remaining_quantity_ml = remaining_quantity_ml
+    return_item.inspection_notes = inspection_notes
+    return_item.inspected_by = inspected_by
+    return_item.inspected_at = timezone.now()
+    return_item.save(update_fields=[
+        "received_quantity", "disposition", "resolution", "remaining_quantity_ml",
+        "inspection_notes", "inspected_by", "inspected_at", "updated_at",
+    ])
+
+    _complete_return_if_fully_inspected(return_request)
+
+    return return_item
+
+
+def _apply_return_disposition_inventory(*, return_item, disposition, received_quantity, remaining_quantity_ml, is_decant, performed_by):
+    """The only place a return's physical inventory impact is decided.
+    Reuses the existing inventory schema exactly — no second mutation
+    mechanism, no decant stock pool, no FIFO recalculation (FIFO belongs to
+    reservation/consumption, not to restocking)."""
+    from .models import ReturnItem
+
+    if disposition == ReturnItem.DISPOSITION_REJECTED:
+        return  # no inventory movement, no restoration — audit trail is the ReturnItem itself
+
+    variant = return_item.order_item.variant
+    warehouse = Warehouse.objects.get(is_default=True)
+
+    if disposition == ReturnItem.DISPOSITION_DAMAGED:
+        if is_decant:
+            # The liquid was already deducted from the source variant's
+            # inventory when the original order was packed — there is
+            # nothing left to move now. No fake zero-delta movement; the
+            # ReturnItem (disposition=damaged, inspection notes/by/at) is
+            # the entire audit trail for this case.
+            return
+
+        stock, _ = InventoryStock.objects.select_for_update().get_or_create(
+            variant=variant, warehouse=warehouse, stock_type=InventoryStock.STOCK_TYPE_DAMAGED,
+            defaults={"quantity": Decimal("0")},
+        )
+        stock.quantity += received_quantity
+        stock.save(update_fields=["quantity", "updated_at"])
+        StockMovement.objects.create(
+            variant=variant, warehouse=warehouse, stock_type=InventoryStock.STOCK_TYPE_DAMAGED,
+            movement_type=StockMovement.MOVEMENT_RETURN_DAMAGED,
+            quantity_delta=Decimal(received_quantity), reason=StockMovement.REASON_RETURN,
+            source_order_item=return_item.order_item, source_return_item=return_item,
+            performed_by=performed_by,
+        )
+        return
+
+    if disposition == ReturnItem.DISPOSITION_RESTOCKED_RETAIL:
+        # is_decant already rejected by the caller for this disposition.
+        stock, _ = InventoryStock.objects.select_for_update().get_or_create(
+            variant=variant, warehouse=warehouse, stock_type=InventoryStock.STOCK_TYPE_RETAIL,
+            defaults={"quantity": Decimal("0")},
+        )
+        stock.quantity += received_quantity
+        stock.save(update_fields=["quantity", "updated_at"])
+        StockMovement.objects.create(
+            variant=variant, warehouse=warehouse, stock_type=InventoryStock.STOCK_TYPE_RETAIL,
+            movement_type=StockMovement.MOVEMENT_RETURN_RESTOCKED_RETAIL,
+            quantity_delta=Decimal(received_quantity), reason=StockMovement.REASON_RETURN,
+            source_order_item=return_item.order_item, source_return_item=return_item,
+            performed_by=performed_by,
+        )
+        return
+
+    if disposition == ReturnItem.DISPOSITION_RESTOCKED_PARTIAL:
+        if is_decant:
+            source_variant = DecantSource.objects.get(decant_variant=variant).source_variant
+        else:
+            source_variant = variant
+
+        txn = StockTransaction.objects.create(
+            transaction_type=StockTransaction.TYPE_RETURN_DISPOSITION, performed_by=performed_by,
+        )
+        lot = PartialBottleLot.objects.create(
+            variant=source_variant, warehouse=warehouse,
+            remaining_ml=remaining_quantity_ml, reserved_ml=Decimal("0"),
+            opened_at=timezone.now(), source_transaction=txn,
+            source_return_item=return_item,
+        )
+        StockMovement.objects.create(
+            transaction_group=txn, variant=source_variant, warehouse=warehouse, stock_type="partial",
+            movement_type=StockMovement.MOVEMENT_RETURN_RESTOCKED_PARTIAL,
+            quantity_delta=remaining_quantity_ml, reason=StockMovement.REASON_RETURN,
+            partial_lot=lot, source_order_item=return_item.order_item, source_return_item=return_item,
+            performed_by=performed_by,
+        )
+        return
+
+
+def _complete_return_if_fully_inspected(return_request):
+    from .models import Return
+
+    if return_request.status != Return.STATUS_INSPECTION_PENDING:
+        return
+    if return_request.items.filter(disposition__isnull=True).exists():
+        return
+    return_request.status = Return.STATUS_COMPLETED
+    return_request.save(update_fields=["status", "updated_at"])

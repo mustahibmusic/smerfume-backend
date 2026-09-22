@@ -1524,3 +1524,513 @@ class ReturnAPITests(TestCase):
 
         resp = self.client.patch(_return_detail_url(return_request.public_id), {"status": "approved"}, format="json")
         self.assertEqual(resp.status_code, 405)  # RetrieveAPIView — GET only, no update mixin
+
+
+def _return_item_ready_for_inspection(client, user, staff, variant, quantity=1, reason=ReturnItem.REASON_WRONG_VARIANT):
+    """Drive one order+return through checkout -> delivered -> requested ->
+    approved -> in_transit -> received -> inspection_pending, and return the
+    single resulting ReturnItem, ready for finalize_return_item()."""
+    cart = Cart.objects.create(user=user)
+    CartItem.objects.create(cart=cart, variant=variant, quantity=quantity)
+    client.credentials(**_auth_header(user))
+    resp = client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+    order = Order.objects.get(order_number=resp.data["order_number"])
+    order_services.verify_cod_order(order, verified_by=staff)
+    order_services.pack_order(order, performed_by=staff)
+    order_services.mark_order_shipped(order)
+    order_services.mark_order_delivered(order)
+    order.refresh_from_db()
+    order_item = order.items.get()
+
+    return_request = order_services.create_return(order, items=[
+        {"order_item": order_item, "reason": reason, "requested_quantity": quantity},
+    ])
+    order_services.approve_return(return_request)
+    order_services.mark_return_in_transit(return_request)
+    item = return_request.items.get()
+    item.received_quantity = quantity
+    item.save(update_fields=["received_quantity"])
+    order_services.mark_return_received(return_request)
+    order_services.start_inspection(return_request)
+    return return_request.items.get()
+
+
+class ReturnInspectionRetailTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user(mobile="+919700000102")
+        self.staff = _make_user(mobile="+919700000103", username="inspectstaff1")
+        self.variant = _make_variant()
+        self.warehouse = Warehouse.objects.get(is_default=True)
+
+    def test_restocked_retail_creates_positive_movement(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=3)
+        stock_before = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+
+        finalized = order_services.finalize_return_item(
+            item, received_quantity=2, disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+            resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+        )
+
+        self.assertEqual(finalized.disposition, ReturnItem.DISPOSITION_RESTOCKED_RETAIL)
+        self.assertEqual(finalized.inspected_by, self.staff)
+        self.assertIsNotNone(finalized.inspected_at)
+
+        stock_after = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+        self.assertEqual(stock_after, stock_before + 2)
+
+        movement = StockMovement.objects.get(source_return_item=item)
+        self.assertEqual(movement.movement_type, StockMovement.MOVEMENT_RETURN_RESTOCKED_RETAIL)
+        self.assertEqual(movement.quantity_delta, Decimal("2"))
+        self.assertEqual(movement.reason, StockMovement.REASON_RETURN)
+        self.assertEqual(movement.source_order_item, item.order_item)
+
+    def test_damaged_creates_damaged_stock_movement(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=2)
+
+        order_services.finalize_return_item(
+            item, received_quantity=1, disposition=ReturnItem.DISPOSITION_DAMAGED,
+            resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+        )
+
+        damaged_stock = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="damaged"
+        )
+        self.assertEqual(damaged_stock.quantity, Decimal("1"))
+
+        movement = StockMovement.objects.get(source_return_item=item)
+        self.assertEqual(movement.movement_type, StockMovement.MOVEMENT_RETURN_DAMAGED)
+        self.assertEqual(movement.quantity_delta, Decimal("1"))
+
+    def test_rejected_creates_no_movement(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=1)
+        stock_before = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+        movement_count_before = StockMovement.objects.count()
+
+        order_services.finalize_return_item(
+            item, received_quantity=1, disposition=ReturnItem.DISPOSITION_REJECTED,
+            resolution=ReturnItem.RESOLUTION_NOT_APPLICABLE, inspected_by=self.staff,
+        )
+
+        stock_after = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+        self.assertEqual(stock_after, stock_before)
+        self.assertEqual(StockMovement.objects.count(), movement_count_before)
+        self.assertFalse(StockMovement.objects.filter(source_return_item=item).exists())
+
+    def test_return_completes_after_its_only_item_is_finalized(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=1)
+        # Fetch fresh rather than via item.return_request — the reverse-then-
+        # forward relation traversal inside the helper leaves Django's FK
+        # cache pointing at the stale, pre-lifecycle Return instance.
+        return_request = Return.objects.get(pk=item.return_request_id)
+        self.assertEqual(return_request.status, Return.STATUS_INSPECTION_PENDING)
+
+        order_services.finalize_return_item(
+            item, received_quantity=1, disposition=ReturnItem.DISPOSITION_REJECTED,
+            resolution=ReturnItem.RESOLUTION_NOT_APPLICABLE, inspected_by=self.staff,
+        )
+        return_request.refresh_from_db()
+        self.assertEqual(return_request.status, Return.STATUS_COMPLETED)
+
+
+class ReturnInspectionPartialTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user(mobile="+919700000104")
+        self.staff = _make_user(mobile="+919700000105", username="inspectstaff2")
+        self.variant = _make_variant(size_ml=100)
+        self.warehouse = Warehouse.objects.get(is_default=True)
+
+    def test_restocked_partial_creates_correct_lot(self):
+        before = timezone.now()
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=1)
+
+        order_services.finalize_return_item(
+            item, received_quantity=1, disposition=ReturnItem.DISPOSITION_RESTOCKED_PARTIAL,
+            resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+            remaining_quantity_ml=Decimal("35.00"),
+        )
+
+        lot = PartialBottleLot.objects.get(source_return_item=item)
+        self.assertEqual(lot.variant, self.variant)
+        self.assertEqual(lot.warehouse, self.warehouse)
+        self.assertEqual(lot.remaining_ml, Decimal("35.00"))
+        self.assertEqual(lot.reserved_ml, Decimal("0.00"))
+        self.assertFalse(lot.is_depleted)
+        self.assertGreaterEqual(lot.opened_at, before)  # inspection time, not the original packing time
+
+        movement = StockMovement.objects.get(source_return_item=item, partial_lot=lot)
+        self.assertEqual(movement.movement_type, StockMovement.MOVEMENT_RETURN_RESTOCKED_PARTIAL)
+        self.assertEqual(movement.quantity_delta, Decimal("35.00"))
+
+    def test_restocked_partial_does_not_restore_full_bottle_to_retail(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=1)
+        stock_before = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+
+        order_services.finalize_return_item(
+            item, received_quantity=1, disposition=ReturnItem.DISPOSITION_RESTOCKED_PARTIAL,
+            resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+            remaining_quantity_ml=Decimal("40.00"),
+        )
+
+        stock_after = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        ).quantity
+        self.assertEqual(stock_after, stock_before)  # unchanged — no retail pcs restoration
+
+
+class ReturnInspectionDecantTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user(mobile="+919700000106")
+        self.staff = _make_user(mobile="+919700000107", username="inspectstaff3")
+        self.warehouse = Warehouse.objects.get(is_default=True)
+        self.source, self.decant = _make_decant_pair(
+            source_size_ml=100, decant_volume_ml=10, source_retail_quantity=10
+        )
+
+    def test_damaged_decant_creates_no_inventory_movement(self):
+        item = _return_item_ready_for_inspection(
+            self.client, self.user, self.staff, self.decant, quantity=1,
+            reason=ReturnItem.REASON_MANUFACTURING_DEFECT,
+        )
+        movement_count_before = StockMovement.objects.count()
+
+        finalized = order_services.finalize_return_item(
+            item, received_quantity=1, disposition=ReturnItem.DISPOSITION_DAMAGED,
+            resolution=ReturnItem.RESOLUTION_NOT_APPLICABLE, inspected_by=self.staff,
+        )
+
+        self.assertEqual(finalized.disposition, ReturnItem.DISPOSITION_DAMAGED)
+        self.assertEqual(StockMovement.objects.count(), movement_count_before)  # no new movement at all
+        self.assertFalse(InventoryStock.objects.filter(variant=self.decant).exists())  # no decant stock pool, ever
+
+    def test_decant_cannot_be_restocked_retail(self):
+        item = _return_item_ready_for_inspection(
+            self.client, self.user, self.staff, self.decant, quantity=1,
+            reason=ReturnItem.REASON_WRONG_VARIANT,
+        )
+        with self.assertRaises(order_services.ReturnInspectionError):
+            order_services.finalize_return_item(
+                item, received_quantity=1, disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+                resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+            )
+        item.refresh_from_db()
+        self.assertIsNone(item.disposition)
+
+    def test_decant_restocked_partial_merges_into_source_variant_pool(self):
+        item = _return_item_ready_for_inspection(
+            self.client, self.user, self.staff, self.decant, quantity=1,
+            reason=ReturnItem.REASON_TRANSIT_DAMAGE,
+        )
+
+        order_services.finalize_return_item(
+            item, received_quantity=1, disposition=ReturnItem.DISPOSITION_RESTOCKED_PARTIAL,
+            resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+            remaining_quantity_ml=Decimal("6.00"),
+        )
+
+        lot = PartialBottleLot.objects.get(source_return_item=item)
+        self.assertEqual(lot.variant, self.source)  # merged into the SOURCE variant, not the decant
+        self.assertEqual(lot.remaining_ml, Decimal("6.00"))
+        self.assertFalse(InventoryStock.objects.filter(variant=self.decant).exists())
+
+
+class ReturnInspectionIntegrityTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user(mobile="+919700000108")
+        self.staff = _make_user(mobile="+919700000109", username="inspectstaff4")
+        self.variant = _make_variant()
+        self.warehouse = Warehouse.objects.get(is_default=True)
+
+    def test_received_quantity_exceeding_approved_quantity_rejected(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=2)
+        with self.assertRaises(order_services.ReturnInspectionError):
+            order_services.finalize_return_item(
+                item, received_quantity=3, disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+                resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+            )
+        item.refresh_from_db()
+        self.assertIsNone(item.disposition)
+
+    def test_negative_received_quantity_rejected(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=1)
+        with self.assertRaises(order_services.ReturnInspectionError):
+            order_services.finalize_return_item(
+                item, received_quantity=-1, disposition=ReturnItem.DISPOSITION_DAMAGED,
+                resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+            )
+
+    def test_zero_received_quantity_allowed_for_rejected(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=1)
+        finalized = order_services.finalize_return_item(
+            item, received_quantity=0, disposition=ReturnItem.DISPOSITION_REJECTED,
+            resolution=ReturnItem.RESOLUTION_NOT_APPLICABLE, inspected_by=self.staff,
+        )
+        self.assertEqual(finalized.disposition, ReturnItem.DISPOSITION_REJECTED)
+        self.assertFalse(StockMovement.objects.filter(source_return_item=item).exists())
+
+    def test_zero_received_quantity_rejected_for_restocked_retail(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=1)
+        with self.assertRaises(order_services.ReturnInspectionError):
+            order_services.finalize_return_item(
+                item, received_quantity=0, disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+                resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+            )
+        item.refresh_from_db()
+        self.assertIsNone(item.disposition)
+        self.assertFalse(StockMovement.objects.filter(source_return_item=item).exists())
+
+    def test_zero_received_quantity_rejected_for_damaged(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=1)
+        with self.assertRaises(order_services.ReturnInspectionError):
+            order_services.finalize_return_item(
+                item, received_quantity=0, disposition=ReturnItem.DISPOSITION_DAMAGED,
+                resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+            )
+        self.assertFalse(StockMovement.objects.filter(source_return_item=item).exists())
+
+    def test_zero_received_quantity_rejected_for_restocked_partial(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=1)
+        with self.assertRaises(order_services.ReturnInspectionError):
+            order_services.finalize_return_item(
+                item, received_quantity=0, disposition=ReturnItem.DISPOSITION_RESTOCKED_PARTIAL,
+                resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+                remaining_quantity_ml=Decimal("10.00"),
+            )
+        self.assertFalse(PartialBottleLot.objects.filter(source_return_item=item).exists())
+
+    def test_restocked_partial_requires_positive_remaining_ml(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=1)
+        with self.assertRaises(order_services.ReturnInspectionError):
+            order_services.finalize_return_item(
+                item, received_quantity=1, disposition=ReturnItem.DISPOSITION_RESTOCKED_PARTIAL,
+                resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+                remaining_quantity_ml=None,
+            )
+
+    def test_remaining_ml_rejected_for_non_partial_disposition(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=1)
+        with self.assertRaises(order_services.ReturnInspectionError):
+            order_services.finalize_return_item(
+                item, received_quantity=1, disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+                resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+                remaining_quantity_ml=Decimal("10.00"),
+            )
+
+    def test_cannot_finalize_same_return_item_twice(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=1)
+        order_services.finalize_return_item(
+            item, received_quantity=1, disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+            resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+        )
+        with self.assertRaises(order_services.ReturnInspectionError):
+            order_services.finalize_return_item(
+                item, received_quantity=1, disposition=ReturnItem.DISPOSITION_DAMAGED,
+                resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+            )
+        # Only the first disposition's movement exists — never double-counted.
+        movements = StockMovement.objects.filter(source_return_item=item)
+        self.assertEqual(movements.count(), 1)
+
+    def test_failed_inventory_mutation_rolls_back_finalization(self):
+        item = _return_item_ready_for_inspection(self.client, self.user, self.staff, self.variant, quantity=1)
+
+        with patch(
+            "apps.orders.services._apply_return_disposition_inventory",
+            side_effect=RuntimeError("simulated inventory failure"),
+        ):
+            with self.assertRaises(RuntimeError):
+                order_services.finalize_return_item(
+                    item, received_quantity=1, disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+                    resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+                )
+
+        item.refresh_from_db()
+        self.assertIsNone(item.disposition)  # rolled back completely
+        self.assertIsNone(item.inspected_at)
+        self.assertFalse(StockMovement.objects.filter(source_return_item=item).exists())
+
+    def test_return_does_not_complete_until_all_items_finalized(self):
+        variant_b = _make_variant()
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=1)
+        CartItem.objects.create(cart=cart, variant=variant_b, quantity=1)
+        self.client.credentials(**_auth_header(self.user))
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        order_services.verify_cod_order(order, verified_by=self.staff)
+        order_services.pack_order(order, performed_by=self.staff)
+        order_services.mark_order_shipped(order)
+        order_services.mark_order_delivered(order)
+        order.refresh_from_db()
+        items = list(order.items.all())
+
+        return_request = order_services.create_return(order, items=[
+            {"order_item": items[0], "reason": ReturnItem.REASON_WRONG_VARIANT, "requested_quantity": 1},
+            {"order_item": items[1], "reason": ReturnItem.REASON_TRANSIT_DAMAGE, "requested_quantity": 1},
+        ])
+        order_services.approve_return(return_request)
+        order_services.mark_return_in_transit(return_request)
+        for ri in return_request.items.all():
+            ri.received_quantity = 1
+            ri.save(update_fields=["received_quantity"])
+        order_services.mark_return_received(return_request)
+        order_services.start_inspection(return_request)
+
+        return_items = list(return_request.items.all())
+        order_services.finalize_return_item(
+            return_items[0], received_quantity=1, disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+            resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+        )
+        return_request.refresh_from_db()
+        self.assertEqual(return_request.status, Return.STATUS_INSPECTION_PENDING)  # one item still pending
+
+        order_services.finalize_return_item(
+            return_items[1], received_quantity=1, disposition=ReturnItem.DISPOSITION_DAMAGED,
+            resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+        )
+        return_request.refresh_from_db()
+        self.assertEqual(return_request.status, Return.STATUS_COMPLETED)  # now both are done
+
+
+class ReturnInspectionConcurrencyTests(TransactionTestCase):
+    def setUp(self):
+        Warehouse.objects.filter(is_default=True).delete()
+        self.warehouse = Warehouse.objects.create(name="Smerfume Default", is_default=True)
+        self.client = APIClient()
+        self.user = User.objects.create(
+            username="inspectconcuser", mobile_number="+919700000110", role="customer",
+        )
+        self.user.set_unusable_password()
+        self.user.save()
+        self.staff = User.objects.create(
+            username="inspectconcstaff", mobile_number="+919700000111", role="staff",
+        )
+        self.client.credentials(**_auth_header(self.user))
+
+        brand = Brand.objects.get_or_create(name="OrderBrand", slug="orderbrand")[0]
+        category = Category.objects.get_or_create(name="OrderCat", slug="ordercat")[0]
+        product = Product.objects.get_or_create(
+            name="OrderProduct", slug="orderproduct",
+            defaults={"brand": brand, "category": category},
+        )[0]
+        edition = ProductEdition.objects.get_or_create(
+            product=product, slug="orderproduct-edp",
+            defaults={"name": "EDP", "concentration": "edp", "gender": "unisex"},
+        )[0]
+        self.variant = ProductVariant.objects.create(
+            edition=edition, size_ml=10, selling_price="500.00", mrp="600.00",
+            sku=f"TEST-{uuid.uuid4().hex[:10]}",
+        )
+        InventoryStock.objects.create(
+            variant=self.variant, warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal("50"),
+        )
+
+        self.return_item = _return_item_ready_for_inspection(
+            self.client, self.user, self.staff, self.variant, quantity=1,
+        )
+
+    def test_concurrent_finalization_cannot_create_duplicate_inventory(self):
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def _run(key, disposition):
+            barrier.wait()
+            try:
+                order_services.finalize_return_item(
+                    self.return_item, received_quantity=1, disposition=disposition,
+                    resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+                )
+                results[key] = "ok"
+            except order_services.ReturnInspectionError:
+                results[key] = "rejected"
+            finally:
+                connection.close()
+
+        t1 = threading.Thread(target=_run, args=("a", ReturnItem.DISPOSITION_RESTOCKED_RETAIL))
+        t2 = threading.Thread(target=_run, args=("b", ReturnItem.DISPOSITION_DAMAGED))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        self.assertEqual(sorted(results.values()), ["ok", "rejected"])
+        movements = StockMovement.objects.filter(source_return_item=self.return_item)
+        self.assertEqual(movements.count(), 1)  # exactly one, regardless of which disposition won
+
+
+class ReturnItemAdminInspectionTests(TestCase):
+    def setUp(self):
+        User.objects.create_superuser(
+            username="returnitemadminstaff", email="returnitemadminstaff@example.com", password="testpass123",
+        )
+        self.client_api = APIClient()
+        self.user = _make_user(mobile="+919700000112")
+        self.staff = _make_user(mobile="+919700000113", username="inspectstaff5")
+        self.variant = _make_variant()
+        self.warehouse = Warehouse.objects.get(is_default=True)
+        self.return_item = _return_item_ready_for_inspection(
+            self.client_api, self.user, self.staff, self.variant, quantity=1,
+        )
+
+    def test_inspecting_through_admin_change_form_creates_real_inventory_movement(self):
+        self.client.login(username="returnitemadminstaff@example.com", password="testpass123")
+        url = f"/admin/orders/returnitem/{self.return_item.pk}/change/"
+
+        self.client.post(url, data={
+            "received_quantity": 1,
+            "disposition": ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+            "resolution": ReturnItem.RESOLUTION_REFUND,
+            "remaining_quantity_ml": "",
+            "inspection_notes": "checked via admin",
+            "_save": "Save",
+        })
+
+        self.return_item.refresh_from_db()
+        self.assertEqual(self.return_item.disposition, ReturnItem.DISPOSITION_RESTOCKED_RETAIL)
+        self.assertIsNotNone(self.return_item.inspected_at)
+
+        movement = StockMovement.objects.get(source_return_item=self.return_item)
+        self.assertEqual(movement.movement_type, StockMovement.MOVEMENT_RETURN_RESTOCKED_RETAIL)
+
+    def test_inspection_fields_become_readonly_after_finalization(self):
+        order_services.finalize_return_item(
+            self.return_item, received_quantity=1, disposition=ReturnItem.DISPOSITION_RESTOCKED_RETAIL,
+            resolution=ReturnItem.RESOLUTION_REFUND, inspected_by=self.staff,
+        )
+        self.client.login(username="returnitemadminstaff@example.com", password="testpass123")
+        url = f"/admin/orders/returnitem/{self.return_item.pk}/change/"
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotContains(resp, 'name="disposition"')  # readonly now, not a select widget
+
+
+# ── Phase 5.3: refund calculation and financial records ───────────────────────
+
+def _finalize_one_item_return(
+    client, user, staff, variant, quantity, reason, disposition, resolution,
+    received_quantity=None, remaining_quantity_ml=None,
+):
+    """Drive one order+return all the way through finalize_return_item()
+    and return the resulting ReturnItem. Fetch the parent Return fresh via
+    Return.objects.get(pk=item.return_request_id) afterward — item.return_request
+    can carry Django's stale FK cache from the reverse-relation traversal
+    inside _return_item_ready_for_inspection (see the note further up)."""
+    item = _return_item_ready_for_inspection(client, user, staff, variant, quantity=quantity, reason=reason)
+    if received_quantity is None:
+        received_quantity = quantity
+    return order_services.finalize_return_item(
+        item, received_quantity=received_quantity, disposition=disposition, resolution=resolution,
+        inspected_by=staff, remaining_quantity_ml=remaining_quantity_ml,
+    )

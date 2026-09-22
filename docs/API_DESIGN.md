@@ -716,6 +716,8 @@ All order endpoints require authentication.
   "public_id": "uuid",
   "order_number": "SMR-20260819-A3F2B1",
   "status": "pending",
+  "channel": "online",
+  "payment_method": "cod",
   "subtotal": "29500.00",
   "discount_amount": "0.00",
   "total": "29500.00",
@@ -759,6 +761,8 @@ All order endpoints require authentication.
 Filters automatically to the current user — no ability to view other users' orders.
 
 **Response 200:** Paginated list of order objects (same structure as checkout response).
+In-store purchases made with the customer's mobile number appear here too,
+with `channel: "in_store"` and `shipping_address: null`.
 
 ---
 
@@ -778,11 +782,77 @@ Filtered to current user — returns 404 if the order number belongs to a differ
 
 ---
 
+### `POST /api/orders/in-store/`
+
+**Purpose:** Record a walk-in sale made at the shop or warehouse counter (DEC-008).
+
+**Auth required:** Yes
+**Permission:** `IsStaffMember` (`role` = `staff` or `admin`)
+**Serializer:** `InStoreSaleSerializer` (request), `OrderSerializer` (response)
+**Service:** `apps.orders.services.create_in_store_order`
+**Transaction:** Atomic. Nothing is created if any line fails.
+
+**Request Body:**
+```json
+{
+  "customer_mobile": "9876543210",
+  "customer_name": "Rahul Sharma",
+  "items": [
+    { "sku": "AAM-AHL-EDP-60", "quantity": 1 },
+    { "sku": "AAM-KAAF-DEC-10", "quantity": 2 }
+  ],
+  "payment_method": "upi",
+  "payment_reference": "412345678901",
+  "discount_amount": "200.00",
+  "warehouse": null,
+  "notes": "Gift wrapped at counter."
+}
+```
+
+| Field | Required | Validation / behaviour |
+|---|---|---|
+| `customer_mobile` | Yes | 10–15 digits, optional leading `+`. Finds the customer, or creates one silently (same as guest checkout). |
+| `customer_name` | No | Used only when a new customer is created. Existing users are never modified. |
+| `items` | Yes | At least one `{sku, quantity}`. `quantity` 1–1000. Unknown SKU → 400. Inactive variant → 400. Repeated SKUs are merged. |
+| `payment_method` | Yes | `cash`, `upi`, `card` or `netbanking`. `cod`/`prepaid` are rejected. |
+| `payment_reference` | No | UPI/netbanking UTR or card slip number. Max 100 chars. |
+| `discount_amount` | No | Order-level discount, default `0`. Must be between 0 and the subtotal. Spread across lines proportionally. |
+| `warehouse` | No | Warehouse `public_id`. Defaults to the default warehouse. |
+| `notes` | No | Stored as `customer_notes`. |
+
+**Process (atomic):**
+1. Resolve or create the customer from `customer_mobile`.
+2. Price each line at the variant's current `selling_price`; allocate the discount.
+3. Create the `Order` (`channel=in_store`, `created_by` = staff user) and its `OrderItem`s.
+   No shipping address, shipping surcharge or fees.
+4. Reserve and immediately consume stock per line through the inventory reservation
+   service (retail bottles, or FIFO partial lots / bottle opening for decants).
+5. Mark the order `delivered` with `delivered_at` = now.
+
+**Response 201:** Order object (same structure as checkout), with `"channel": "in_store"`,
+`"status": "delivered"` and `"shipping_address": null`.
+**Response 400:** Validation error, unknown/inactive SKU, invalid discount, or insufficient stock
+(`{"error": "Only 0 unit(s) of ... available at ..., needed 1."}`).
+**Response 401:** Access token missing or expired.
+**Response 403:** Authenticated user is not staff.
+
+**Returns:** in-store orders cannot be returned through
+`POST /api/orders/{order_number}/returns/` (400). Issues are handled at the counter.
+
+The same sale can be recorded in the admin: **Orders → New in-store sale**.
+
+---
+
 ## Admin Interface
 
 `/admin/` — Django Admin with Unfold theme. Session-authenticated (not JWT). Available to `is_staff=True` users. Not an API endpoint — browser UI only.
 
 All catalogue management (creating products, editions, variants, brands, etc.) is done through the admin interface.
+
+The generic "Add order" form is disabled. Walk-in counter sales are recorded on
+**Orders → New in-store sale** (`/admin/orders/order/in-store-sale/`, requires the
+`orders.add_order` permission), which calls the same service as
+`POST /api/orders/in-store/`.
 
 ---
 
@@ -865,4 +935,5 @@ The following APIs are mentioned in project requirements but **do not yet exist*
 | DELETE | `/api/cart/clear/` | Yes | Clear all cart items |
 | GET | `/api/orders/` | Yes | List own orders |
 | POST | `/api/orders/checkout/` | Yes | Checkout (cart → order) |
+| POST | `/api/orders/in-store/` | Staff | Record a walk-in counter sale |
 | GET | `/api/orders/{order_number}/` | Yes | Order detail |

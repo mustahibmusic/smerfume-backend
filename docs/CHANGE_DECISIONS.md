@@ -200,6 +200,65 @@ Not recorded.
 
 ---
 
+## DEC-008 — In-store (Walk-in) Sales Channel
+
+### Original Product Bible Requirement
+The Product Bible describes online ordering only. It does not cover sales made in person at
+Smerfume's shop or warehouse, and `docs/ARCHITECTURE.md` notes the business also sells through
+Instagram and WhatsApp.
+
+### Updated Decision
+Staff can record a walk-in sale as a normal `Order` with `channel=in_store`:
+- Recorded through **both** the Django admin (Orders → New in-store sale) and a staff-only API
+  (`POST /api/orders/in-store/`), which share one service, `create_in_store_order`.
+- **Customer mobile is required.** The customer is found or silently created from it, as in
+  guest checkout (DEC-004), so every order still links to a User and the customer can later
+  log in via OTP to see the purchase.
+- Payment methods at the counter: **cash, UPI, card, netbanking**, with an optional manual
+  reference (UTR or card slip). No gateway is involved (DEC-006).
+- Unit price is always the variant's `selling_price`. Staff may apply one **order-level
+  discount**, spread across lines with the existing `allocate_discount()`. Per-line price
+  overrides are not supported.
+- Stock is reserved and consumed immediately through the existing inventory reservation
+  service (including decants), and the order is marked `delivered` at the moment of sale.
+  No shipping address, shipping surcharge or fees.
+- **Returns for in-store orders are handled at the counter only.** They are blocked from the
+  online returns flow.
+
+### Reason
+Counter sales otherwise leave stock and revenue unrecorded, or need a manual stock adjustment
+with no order behind it. Reusing `Order` and the reservation ledger keeps one stock and sales
+history for all channels.
+
+### Impact
+- `apps/orders/models.py` — `Order.channel`, `Order.created_by`, `Order.payment_reference`;
+  new payment choices `cash`, `upi`, `card`, `netbanking` (migration `0010`).
+- `apps/orders/services.py` — `create_in_store_order`; shared `generate_order_number` and
+  `resolve_customer_by_mobile`; `create_return` rejects in-store orders.
+- `apps/orders/views.py`, `serializers.py`, `urls.py` — staff endpoint; `channel` and
+  `payment_method` exposed on order responses.
+- `apps/orders/admin.py` — "New in-store sale" page; generic "Add order" form disabled.
+- Out of scope: GST invoice/Zoho sync, receipts, split payments, counter returns workflow.
+
+### Future Requirement (recorded, not implemented)
+Staff will need an admin/staff workflow to record an in-store return/refund against an
+in-store order. It must reuse the existing `Return`/`ReturnItem`/`Refund` models and the
+inventory ledger (return dispositions and `StockMovement`), exactly as online returns do.
+**Do not build a separate refund system for in-store sales.** The customer-facing online
+return endpoint stays blocked for in-store orders.
+
+### Status
+**APPROVED** — implemented (in-store returns workflow pending, see above).
+
+### Date
+2026-09-23
+
+### Related Documentation
+- `docs/API_DESIGN.md` — `POST /api/orders/in-store/`
+- `docs/DATABASE_DESIGN.md` — `Order` fields
+
+---
+
 ## Self-Consistency Check
 
 The following issues were reviewed after drafting this file:

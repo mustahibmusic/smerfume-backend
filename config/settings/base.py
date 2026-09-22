@@ -231,6 +231,16 @@ MSG91_TEMPLATE_ID = os.getenv("MSG91_TEMPLATE_ID", "")
 MSG91_SENDER_ID = os.getenv("MSG91_SENDER_ID", "SMRFME")
 
 
+# ── Parfumly catalogue import ──────────────────────────────────────────────────
+# Public, unauthenticated fragrance metadata API used only by the
+# `import_parfumly_brand` management command (apps.catalog.parfumly).
+# No API key exists or is required. The delay throttles consecutive requests
+# because Parfumly rate-limits clients.
+PARFUMLY_API_BASE_URL = os.getenv("PARFUMLY_API_BASE_URL", "https://api.parfumly.in")
+PARFUMLY_REQUEST_DELAY_SECONDS = float(os.getenv("PARFUMLY_REQUEST_DELAY_SECONDS", "0.5"))
+PARFUMLY_TIMEOUT_SECONDS = float(os.getenv("PARFUMLY_TIMEOUT_SECONDS", "20"))
+
+
 UNFOLD = {
     "SITE_TITLE": "Smerfume Admin",
     "SITE_HEADER": "Smerfume Backend",

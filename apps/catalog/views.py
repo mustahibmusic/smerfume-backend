@@ -66,7 +66,7 @@ def _not_found_response(resource, model_name):
             "- `brand` — brand slug\n"
             "- `category` — category slug\n"
             "- `gender` — `men` | `women` | `unisex`\n"
-            "- `concentration` — `edc` | `edt` | `edp` | `extrait`\n"
+            "- `concentration` — `edc` | `edt` | `edp` | `extrait` | `attar`\n"
             "- `note` — comma-separated note names, AND logic, max 5\n"
             "- `is_best_seller` — `true` | `false`\n"
             "- `is_new_arrival` — `true` | `false`\n"
@@ -77,7 +77,7 @@ def _not_found_response(resource, model_name):
             OpenApiParameter("brand", str, description="Filter by brand slug"),
             OpenApiParameter("category", str, description="Filter by category slug"),
             OpenApiParameter("gender", str, description="men | women | unisex"),
-            OpenApiParameter("concentration", str, description="edc | edt | edp | extrait"),
+            OpenApiParameter("concentration", str, description="edc | edt | edp | extrait | attar"),
             OpenApiParameter("note", str, description="Comma-separated note names (AND logic, max 5)"),
             OpenApiParameter("is_best_seller", str, description="true | false"),
             OpenApiParameter("is_new_arrival", str, description="true | false"),

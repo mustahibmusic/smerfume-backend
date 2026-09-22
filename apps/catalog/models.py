@@ -105,6 +105,7 @@ class ProductEdition(BaseModel):
         ("edt", "Eau de Toilette"),
         ("edp", "Eau de Parfum"),
         ("extrait", "Extrait de Parfum"),
+        ("attar", "Attar"),
     ]
 
     product = models.ForeignKey(
@@ -138,6 +139,8 @@ class ProductEdition(BaseModel):
     )
 
     image = models.ImageField(upload_to="catalog/editions/", null=True, blank=True)
+
+    release_year = models.PositiveSmallIntegerField(null=True, blank=True)
 
     is_best_seller = models.BooleanField(default=False)
     is_new_arrival = models.BooleanField(default=False)

@@ -341,7 +341,7 @@ All catalog endpoints are public (`AllowAny`). No authentication required.
 | `brand` | string | Filter by brand slug |
 | `category` | string | Filter by category slug |
 | `gender` | string | `men` \| `women` \| `unisex` |
-| `concentration` | string | `edc` \| `edt` \| `edp` \| `extrait` |
+| `concentration` | string | `edc` | `edt` | `edp` | `extrait` | `attar` |\| `edt` \| `edp` \| `extrait` |
 | `note` | string | Comma-separated note names, AND logic (all notes must appear in the same edition). Max 5 notes. |
 | `is_best_seller` | string | `true` \| `false` |
 | `is_new_arrival` | string | `true` \| `false` |

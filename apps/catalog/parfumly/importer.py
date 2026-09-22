@@ -15,8 +15,14 @@ yet), seller offers/prices/stock/availability, descriptions, images.
 Idempotency / matching rules:
     Brand        existing slug, then case-insensitive name.
     Product      exact case-insensitive, whitespace-normalized name within
-                 the brand. Near-duplicates are skipped and reported, never
-                 created or merged.
+                 the brand matches an existing product. Otherwise:
+                   exact same name in this import -> skipped (duplicate)
+                   strong alias evidence          -> skipped (duplicate):
+                     name equal ignoring spaces/punctuation, or the
+                     Parfumly slug already used by a product of the brand
+                   fuzzy name similarity only     -> created, and reported
+                     as a possible duplicate for review
+                 Nothing is ever merged.
     Edition      (product, concentration) — see match_edition().
     PerfumeNote  exact case-insensitive, whitespace-trimmed name. Look-alike
                  names ("Oak Moss" / "Oakmoss") are NOT merged; the new note
@@ -25,6 +31,12 @@ Idempotency / matching rules:
                  links are never deleted or moved.
     Existing values are never overwritten; release_year is only filled
     where it is currently NULL.
+
+Category routing (new products only; an existing product's category is
+never changed): ATTAR-only products go to the attar category, perfume
+concentrations (EDC/EDT/EDP/EXTRAIT) to the perfume category. A product
+with both ATTAR and perfume concentrations is skipped for manual review,
+because one Product has one Category.
 """
 
 import logging
@@ -36,7 +48,13 @@ from django.utils.text import slugify
 from apps.catalog.models import Brand, EditionNote, PerfumeNote, Product, ProductEdition
 
 from .client import ParfumlyError
-from .normalize import clean_name, is_possible_duplicate, match_key, normalize_product
+from .normalize import (
+    clean_name,
+    is_possible_duplicate,
+    is_strong_duplicate,
+    match_key,
+    normalize_product,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,10 +87,14 @@ class ImportReport:
     note_links_to_create: int = 0
     existing_note_links: int = 0
     retail_sizes: dict = field(default_factory=dict)
+    perfumes: list = field(default_factory=list)
     attars: list = field(default_factory=list)
+    mixed_concentration_category: list = field(default_factory=list)
     skipped: list = field(default_factory=list)
+    duplicates_skipped: list = field(default_factory=list)
     possible_duplicates: list = field(default_factory=list)
     possible_note_duplicates: list = field(default_factory=list)
+    note_position_conflicts: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     errors: list = field(default_factory=list)
 
@@ -91,6 +113,7 @@ class EditionPlan:
 class ProductPlan:
     source: object  # NormalizedProduct
     product: Product | None  # None -> create
+    category: object = None  # Category for a new product
     editions: list = field(default_factory=list)
 
 
@@ -118,9 +141,10 @@ def match_edition(product, concentration):
 
 
 class ParfumlyBrandImporter:
-    def __init__(self, client, category, limit=None):
+    def __init__(self, client, category, attar_category=None, limit=None):
         self.client = client
         self.category = category
+        self.attar_category = attar_category
         self.limit = limit
         self.report = ImportReport()
 
@@ -181,6 +205,14 @@ class ParfumlyBrandImporter:
             source = normalize_product(detail)
             for warning in source.warnings:
                 report.warnings.append(f"{source.external_slug}: {warning}")
+            for conflict in source.note_position_conflicts:
+                report.note_position_conflicts.append({
+                    "product": source.name,
+                    "parfumly_slug": source.external_slug,
+                    "note": conflict.name,
+                    "positions": list(conflict.positions),
+                    "kept": conflict.kept,
+                })
 
             reason = self._invalid_reason(source, brand_slug)
             if reason:
@@ -188,31 +220,39 @@ class ParfumlyBrandImporter:
                 continue
             report.valid_products += 1
 
+            if self._is_mixed(source):
+                report.mixed_concentration_category.append({
+                    "name": source.name,
+                    "parfumly_slug": source.external_slug,
+                    "concentrations": list(source.concentrations),
+                })
+                report.skipped.append(self._skip(
+                    source.name, source.external_slug,
+                    "mixed ATTAR and perfume concentrations; manual review",
+                ))
+                continue
+            is_attar = source.concentrations == ["attar"]
+            routed = self.attar_category if is_attar else self.category
+
             key = match_key(source.name)
             product = existing_products.get(key)
             if product is None:
-                if key in accepted:
+                if not self._check_new_product(source, key, accepted, brand):
+                    continue
+                if routed is None:
                     report.skipped.append(self._skip(
                         source.name, source.external_slug,
-                        f"same name as {accepted[key][1]!r} already in this import",
+                        "ATTAR-only product needs --attar-category",
                     ))
                     continue
-                duplicate = self._find_duplicate(source, accepted)
-                if duplicate:
-                    report.possible_duplicates.append(duplicate)
-                    report.skipped.append(self._skip(
-                        source.name, source.external_slug,
-                        f"possible duplicate of {duplicate['matched_name']!r}",
-                    ))
-                    continue
-                if Product.objects.filter(slug=source.external_slug).exists():
-                    report.skipped.append(self._skip(
-                        source.name, source.external_slug,
-                        "product slug already used by another product",
-                    ))
-                    continue
+            elif routed is not None and product.category_id != routed.pk:
+                report.warnings.append(
+                    f"{product.name}: existing category kept; routing would give "
+                    f"{routed.slug!r}"
+                )
 
             product_plan = self._plan_product(source, product, notes_by_key, plan)
+            product_plan.category = routed if product is None else None
             if not product_plan.editions:
                 report.skipped.append(self._skip(
                     source.name, source.external_slug, "no edition can be created or matched",
@@ -226,8 +266,7 @@ class ParfumlyBrandImporter:
                 report.existing_products.append(f"{product.name} ({product.slug})")
             if source.retail_sizes:
                 report.retail_sizes[source.name] = [str(s) for s in source.retail_sizes]
-            if "attar" in source.concentrations:
-                report.attars.append(source.name)
+            (report.attars if is_attar else report.perfumes).append(source.name)
             plan.products.append(product_plan)
 
         report.notes_to_create = sorted(plan.new_notes.values())
@@ -264,17 +303,61 @@ class ParfumlyBrandImporter:
             return "no supported bottle/tester concentration"
         return None
 
-    def _find_duplicate(self, source, accepted):
-        for key, (name, reference, origin) in accepted.items():
+    @staticmethod
+    def _is_mixed(source):
+        concentrations = set(source.concentrations)
+        return "attar" in concentrations and len(concentrations) > 1
+
+    def _check_new_product(self, source, key, accepted, brand):
+        """
+        Duplicate policy for a product that does not exist yet.
+
+        Returns False (and reports) when the product must not be created:
+        an exact or strongly aliased duplicate, or a slug conflict. Fuzzy
+        similarity alone is reported but never blocks creation.
+        """
+        report = self.report
+
+        def skip_duplicate(rule, name, reference, origin):
+            report.duplicates_skipped.append({
+                "name": source.name,
+                "parfumly_slug": source.external_slug,
+                "rule": rule,
+                "matched_name": name,
+                "matched_slug": reference,
+                "matched_source": origin,
+            })
+            report.skipped.append(self._skip(
+                source.name, source.external_slug, f"{rule} duplicate of {name!r}",
+            ))
+            return False
+
+        if key in accepted:
+            return skip_duplicate("exact", *accepted[key])
+        for name, reference, origin in accepted.values():
+            if is_strong_duplicate(source.name, name):
+                return skip_duplicate("strong", name, reference, origin)
+
+        slug_owner = Product.objects.filter(slug=source.external_slug).first()
+        if slug_owner is not None:
+            if brand is not None and slug_owner.brand_id == brand.pk:
+                return skip_duplicate("same slug", slug_owner.name, slug_owner.slug, "smerfume")
+            report.skipped.append(self._skip(
+                source.name, source.external_slug,
+                "product slug already used by a product of another brand",
+            ))
+            return False
+
+        for name, reference, origin in accepted.values():
             if is_possible_duplicate(source.name, name):
-                return {
-                    "skipped_name": source.name,
-                    "skipped_parfumly_slug": source.external_slug,
-                    "matched_name": name,
-                    "matched_slug": reference,
-                    "matched_source": origin,
-                }
-        return None
+                report.possible_duplicates.append({
+                    "name": source.name,
+                    "parfumly_slug": source.external_slug,
+                    "similar_name": name,
+                    "similar_slug": reference,
+                    "similar_source": origin,
+                })
+        return True
 
     def _plan_product(self, source, product, notes_by_key, plan):
         report = self.report
@@ -318,16 +401,23 @@ class ParfumlyBrandImporter:
                 report.editions_to_create.append(f"{label} [{edition_plan.concentration}]")
 
         for edition_plan in product_plan.editions:
-            linked = set()
+            linked = {}
             if edition_plan.edition is not None:
                 linked = {
-                    match_key(name)
-                    for name in edition_plan.edition.notes.values_list("name", flat=True)
+                    match_key(name): position
+                    for name, position in edition_plan.edition.edition_notes.values_list(
+                        "note__name", "position"
+                    )
                 }
             for note in source.notes:
                 key = match_key(note.name)
                 if key in linked:
                     report.existing_note_links += 1
+                    if linked[key] != note.position:
+                        report.warnings.append(
+                            f"{label} [{edition_plan.concentration}]: existing note "
+                            f"{note.name!r} kept as {linked[key]}; Parfumly lists {note.position}"
+                        )
                     continue
                 if key not in notes_by_key and key not in plan.new_notes:
                     self._report_note_duplicates(note.name, notes_by_key, plan.new_notes)
@@ -336,17 +426,33 @@ class ParfumlyBrandImporter:
                 report.note_links_to_create += 1
         return product_plan
 
-    def _load_notes(self):
+    def _load_notes(self, report_anomalies=True):
+        """
+        Map note key -> existing PerfumeNote.
+
+        When several stored notes share a key (e.g. an accidental trailing
+        space), the one whose stored name is already clean is canonical,
+        else the oldest. Stored notes are never modified; the anomaly is
+        reported instead.
+        """
         notes_by_key = {}
+        groups = {}
         for note in PerfumeNote.objects.order_by("id"):
             key = match_key(note.name)
-            if key in notes_by_key:
-                self.report.warnings.append(
-                    f"notes {notes_by_key[key].name!r} and {note.name!r} differ only by "
-                    f"case/whitespace; using {notes_by_key[key].name!r}"
-                )
+            current = notes_by_key.get(key)
+            if current is None:
+                notes_by_key[key] = note
                 continue
-            notes_by_key[key] = note
+            groups.setdefault(key, [current]).append(note)
+            if current.name != clean_name(current.name) and note.name == clean_name(note.name):
+                notes_by_key[key] = note
+        if report_anomalies:
+            for key, group in groups.items():
+                names = ", ".join(repr(n.name) for n in group)
+                self.report.warnings.append(
+                    f"stored notes {names} differ only by case/whitespace; using "
+                    f"{notes_by_key[key].name!r} (stored data not modified)"
+                )
         return notes_by_key
 
     def _report_note_duplicates(self, name, notes_by_key, new_notes):
@@ -368,7 +474,7 @@ class ParfumlyBrandImporter:
         if brand is None:
             brand = Brand.objects.create(**plan.brand_values)
 
-        notes_by_key = self._load_notes()
+        notes_by_key = self._load_notes(report_anomalies=False)
         for product_plan in plan.products:
             source = product_plan.source
             try:
@@ -378,7 +484,7 @@ class ParfumlyBrandImporter:
                 logger.exception("Parfumly import failed for %s", source.external_slug)
                 self.report.errors.append(f"{source.external_slug}: {type(exc).__name__}")
                 # Notes created inside the rolled-back transaction no longer exist.
-                notes_by_key = self._load_notes()
+                notes_by_key = self._load_notes(report_anomalies=False)
         return brand
 
     def _apply_product(self, brand, product_plan, new_notes, notes_by_key):
@@ -389,7 +495,7 @@ class ParfumlyBrandImporter:
                 name=source.name,
                 slug=source.external_slug,
                 brand=brand,
-                category=self.category,
+                category=product_plan.category,
             )
 
         for edition_plan in product_plan.editions:

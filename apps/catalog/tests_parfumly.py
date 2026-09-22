@@ -32,6 +32,7 @@ from apps.catalog.parfumly.client import ParfumlyClient, ParfumlyError
 from apps.catalog.parfumly.importer import ImportAbort, ParfumlyBrandImporter
 from apps.catalog.parfumly.normalize import (
     is_possible_duplicate,
+    is_strong_duplicate,
     normalize_product,
     normalize_release_year,
 )
@@ -175,16 +176,27 @@ class NormalizeTests(SimpleTestCase):
 
     def test_notes_keep_positions_and_first_position_wins(self):
         source = normalize_product(make_detail("N", notes={
-            "top": [{"name": " Bergamot "}],
-            "heart": [{"name": "bergamot"}, {"name": "Rose"}],
-            "base": [{"name": "Musk"}],
+            "top": [{"name": " Bergamot "}, {"name": "Rose"}],
+            "heart": [{"name": "bergamot"}, {"name": "Iris"}],
+            "base": [{"name": "Musk"}, {"name": "BERGAMOT"}, {"name": "Iris"}],
             "general": [{"name": "Oud"}],
         }))
         self.assertEqual(
             [(n.name, n.position) for n in source.notes],
-            [("Bergamot", "top"), ("Rose", "heart"), ("Musk", "base")],
+            [("Bergamot", "top"), ("Rose", "top"), ("Iris", "heart"), ("Musk", "base")],
         )
         self.assertTrue(any("general" in w for w in source.warnings))
+        # Every conflict is reported with all source positions.
+        self.assertEqual(
+            [(c.name, c.positions, c.kept) for c in source.note_position_conflicts],
+            [("Bergamot", ("top", "heart", "base"), "top"), ("Iris", ("heart", "base"), "heart")],
+        )
+
+    def test_repeated_note_in_same_position_is_not_a_conflict(self):
+        source = normalize_product(make_detail("N", notes={
+            "top": [{"name": "Rose"}, {"name": "rose"}],
+        }))
+        self.assertEqual(source.note_position_conflicts, [])
 
     def test_normalized_product_carries_no_commercial_or_description_data(self):
         source = normalize_product(make_detail("Aqua Oud"))
@@ -204,6 +216,21 @@ class NormalizeTests(SimpleTestCase):
             self.assertTrue(is_possible_duplicate(a, b), (a, b))
         for a, b in [("Blu", "Blu Oud"), ("Aqua Oud", "Azure Royal"), ("Rose", "rose ")]:
             self.assertFalse(is_possible_duplicate(a, b), (a, b))
+
+    def test_strong_duplicate_requires_same_name_ignoring_punctuation(self):
+        for a, b in [("Oak Moss", "Oakmoss"), ("Oud Rose", "Oud-Rose"), ("Lily of the Valley",
+                                                                          "Lily-of-the-Valley")]:
+            self.assertTrue(is_strong_duplicate(a, b), (a, b))
+        for a, b in [
+            ("Blu", "Blue"),
+            ("Ghawi Attar", "Ghali Attar"),
+            ("Lush Noir", "Blush Noir"),
+            ("Musk Kashmiri", "Musk Amiri"),
+            ("Nehayah CPO", "Enayah CPO"),
+            ("Rose", "rose "),  # exact identity, not an alias
+            ("--", "__"),
+        ]:
+            self.assertFalse(is_strong_duplicate(a, b), (a, b))
 
 
 # ── HTTP client ──────────────────────────────────────────────────────────
@@ -281,13 +308,21 @@ class ParfumlyClientTests(SimpleTestCase):
 # ── Importer ─────────────────────────────────────────────────────────────
 
 
+UNSET = object()
+
+
 class ImporterTestBase(TestCase):
     @classmethod
     def setUpTestData(cls):
         cls.category = Category.objects.create(name="Fragrance", slug="fragrance")
+        cls.attar_category = Category.objects.create(name="Attar", slug="attar")
 
-    def run_import(self, details, dry_run=False, **kwargs):
-        importer = ParfumlyBrandImporter(FakeClient(details, **kwargs), self.category)
+    def run_import(self, details, dry_run=False, attar_category=UNSET, **kwargs):
+        if attar_category is UNSET:
+            attar_category = self.attar_category
+        importer = ParfumlyBrandImporter(
+            FakeClient(details, **kwargs), self.category, attar_category=attar_category
+        )
         plan = importer.plan("Ahmed Al Maghribi")
         if not dry_run:
             importer.apply(plan)
@@ -328,6 +363,70 @@ class ImporterCreateTests(ImporterTestBase):
         )])
         self.assertEqual(ProductEdition.objects.get().concentration, "attar")
         self.assertEqual(report.attars, ["Aswad Attar"])
+
+
+class ImporterCategoryRoutingTests(ImporterTestBase):
+    def test_attar_only_product_goes_to_attar_category(self):
+        report = self.run_import([make_detail(
+            "Aswad Attar", variants=[variant("ATTAR", 12, "BOTTLE"), variant("ATTAR", 6, "TESTER")],
+        )])
+        self.assertEqual(Product.objects.get().category, self.attar_category)
+        self.assertEqual((report.attars, report.perfumes), (["Aswad Attar"], []))
+
+    def test_perfume_concentrations_go_to_perfume_category(self):
+        report = self.run_import([
+            make_detail("Aqua Oud", variants=[variant("EDP", 100)]),
+            make_detail("Azure Royal", variants=[variant("EDT", 100), variant("EXTRAIT", 50)]),
+            make_detail("Citrus", variants=[variant("EDC", 100, "TESTER")]),
+        ])
+        self.assertEqual(
+            set(Product.objects.values_list("category__slug", flat=True)), {"fragrance"}
+        )
+        self.assertEqual(report.perfumes, ["Aqua Oud", "Azure Royal", "Citrus"])
+        self.assertEqual(report.attars, [])
+
+    def test_mixed_attar_and_perfume_product_is_skipped_and_reported(self):
+        report = self.run_import([make_detail(
+            "Ahl", variants=[variant("EDP", 60), variant("ATTAR", 12)],
+        )])
+        self.assertEqual(self.counts()["Product"], 0)
+        self.assertEqual(self.counts()["ProductEdition"], 0)
+        self.assertEqual(self.counts()["PerfumeNote"], 0)
+        self.assertEqual(report.mixed_concentration_category, [{
+            "name": "Ahl",
+            "parfumly_slug": "ahmed-al-maghribi-ahl",
+            "concentrations": ["edp", "attar"],
+        }])
+        self.assertIn("mixed", report.skipped[0]["reason"])
+        self.assertEqual((report.perfumes, report.attars), ([], []))
+
+    def test_mixed_product_skipped_even_when_it_exists(self):
+        brand = Brand.objects.create(name="Ahmed Al Maghribi", slug="ahmed-al-maghribi")
+        Product.objects.create(name="Ahl", slug="ahl", brand=brand, category=self.category)
+        before = self.counts()
+        report = self.run_import([make_detail(
+            "Ahl", variants=[variant("EDP", 60), variant("ATTAR", 12)],
+        )])
+        self.assertEqual(self.counts(), before)
+        self.assertEqual(len(report.mixed_concentration_category), 1)
+
+    def test_attar_only_product_skipped_without_attar_category(self):
+        report = self.run_import(
+            [make_detail("Aswad Attar", variants=[variant("ATTAR", 12)])], attar_category=None,
+        )
+        self.assertEqual(Product.objects.count(), 0)
+        self.assertIn("--attar-category", report.skipped[0]["reason"])
+
+    def test_existing_product_category_never_changed(self):
+        brand = Brand.objects.create(name="Ahmed Al Maghribi", slug="ahmed-al-maghribi")
+        product = Product.objects.create(
+            name="Aswad Attar", slug="aswad-attar", brand=brand, category=self.category
+        )
+        report = self.run_import([make_detail("Aswad Attar", variants=[variant("ATTAR", 12)])])
+        product.refresh_from_db()
+        self.assertEqual(product.category, self.category)
+        self.assertEqual(product.editions.get().concentration, "attar")
+        self.assertTrue(any("existing category kept" in w for w in report.warnings))
 
     def test_multiple_concentrations_get_named_editions(self):
         self.run_import([make_detail(
@@ -437,6 +536,8 @@ class ImporterIdempotencyTests(ImporterTestBase):
         )
         bergamot = PerfumeNote.objects.create(name="Bergamot")
         EditionNote.objects.create(edition=dated, note=bergamot, position="base")
+        manual_note = PerfumeNote.objects.create(name="Saffron")
+        EditionNote.objects.create(edition=dated, note=manual_note, position="heart")
 
         report = self.run_import([
             make_detail("Aqua Oud", gender="UNISEX", year=2015),
@@ -448,18 +549,37 @@ class ImporterIdempotencyTests(ImporterTestBase):
         self.assertEqual((dated.gender, dated.release_year), ("men", 2010))
         self.assertEqual((undated.gender, undated.release_year), ("women", 2018))
         self.assertEqual(report.release_years_to_fill, ["Azure Royal [edp]"])
-        # Existing link keeps its position and is not duplicated.
+        # Existing links keep their position, are not duplicated or removed.
         self.assertEqual(
             list(dated.edition_notes.filter(note=bergamot).values_list("position", flat=True)),
             ["base"],
         )
-        self.assertEqual(dated.edition_notes.count(), 3)
+        self.assertTrue(dated.edition_notes.filter(note=manual_note, position="heart").exists())
+        self.assertEqual(dated.edition_notes.count(), 4)
+        self.assertTrue(any(
+            "'Bergamot' kept as base; Parfumly lists top" in w for w in report.warnings
+        ))
+        self.assertEqual((Brand.objects.count(), Product.objects.count()), (1, 2))
+        product.refresh_from_db()
+        self.assertEqual((product.name, product.slug), ("Aqua Oud", "aqua-oud"))
 
     def test_note_matched_case_insensitively_with_trimmed_whitespace(self):
         existing = PerfumeNote.objects.create(name="bergamot")
         self.run_import([make_detail("Aqua Oud", notes={"top": [{"name": "  Bergamot "}]})])
         self.assertEqual(PerfumeNote.objects.count(), 1)
         self.assertEqual(EditionNote.objects.get().note, existing)
+
+    def test_whitespace_variant_notes_use_clean_canonical_and_stay_untouched(self):
+        dirty = PerfumeNote.objects.create(name="Apple liquor ")
+        clean = PerfumeNote.objects.create(name="Apple liquor")
+        report = self.run_import([make_detail("Aqua Oud", notes={"top": [{"name": "Apple Liquor"}]})])
+        self.assertEqual(EditionNote.objects.get().note, clean)
+        dirty.refresh_from_db()
+        self.assertEqual(dirty.name, "Apple liquor ")
+        self.assertEqual(PerfumeNote.objects.count(), 2)
+        self.assertTrue(any(
+            "differ only by case/whitespace; using 'Apple liquor'" in w for w in report.warnings
+        ))
 
     def test_ambiguous_existing_editions_are_skipped(self):
         brand = Brand.objects.create(name="Ahmed Al Maghribi", slug="ahmed-al-maghribi")
@@ -475,28 +595,76 @@ class ImporterIdempotencyTests(ImporterTestBase):
 
 
 class ImporterDuplicateTests(ImporterTestBase):
-    def test_near_duplicate_in_same_import_is_not_created(self):
-        report = self.run_import([make_detail("Blu"), make_detail("Blue")])
-        self.assertEqual(list(Product.objects.values_list("name", flat=True)), ["Blu"])
-        self.assertEqual(report.possible_duplicates, [{
-            "skipped_name": "Blue",
-            "skipped_parfumly_slug": "ahmed-al-maghribi-blue",
-            "matched_name": "Blu",
-            "matched_slug": "ahmed-al-maghribi-blu",
-            "matched_source": "parfumly",
-        }])
+    def test_fuzzy_similarity_does_not_block_creation(self):
+        pairs = [
+            ("Blu", "Blue"),
+            ("Ghali Attar", "Ghawi Attar"),
+            ("Blush Noir", "Lush Noir"),
+            ("Musk Amiri", "Musk Kashmiri"),
+            ("Enayah CPO", "Nehayah CPO"),
+        ]
+        details = []
+        for first, second in pairs:
+            variants = [variant("ATTAR", 12)] if "Attar" in first or "CPO" in first else None
+            details += [make_detail(first, variants=variants), make_detail(second, variants=variants)]
+        report = self.run_import(details)
 
-    def test_near_duplicate_of_existing_product_is_not_created(self):
+        self.assertEqual(Product.objects.count(), 10)
+        self.assertEqual(report.duplicates_skipped, [])
+        reported = {(d["name"], d["similar_name"]) for d in report.possible_duplicates}
+        for first, second in pairs:
+            self.assertIn((second, first), reported)
+        blue = next(d for d in report.possible_duplicates if d["name"] == "Blue")
+        self.assertEqual(blue, {
+            "name": "Blue",
+            "parfumly_slug": "ahmed-al-maghribi-blue",
+            "similar_name": "Blu",
+            "similar_slug": "ahmed-al-maghribi-blu",
+            "similar_source": "parfumly",
+        })
+
+    def test_fuzzy_match_with_existing_product_is_created_and_reported(self):
         brand = Brand.objects.create(name="Ahmed Al Maghribi", slug="ahmed-al-maghribi")
         Product.objects.create(
             name="Blush Noir", slug="blush-noir", brand=brand, category=self.category
         )
         report = self.run_import([make_detail("Blush Noire")])
+        self.assertEqual(Product.objects.count(), 2)
+        self.assertEqual(report.possible_duplicates[0]["similar_source"], "smerfume")
+        self.assertEqual(report.possible_duplicates[0]["similar_slug"], "blush-noir")
+
+    def test_exact_duplicate_blocks_creation(self):
+        report = self.run_import([
+            make_detail("Aqua Oud", slug="ahmed-al-maghribi-aqua-oud"),
+            make_detail("AQUA  oud", slug="ahmed-al-maghribi-aqua-oud-2"),
+        ])
         self.assertEqual(Product.objects.count(), 1)
-        self.assertEqual(report.possible_duplicates[0]["matched_source"], "smerfume")
-        self.assertEqual(report.possible_duplicates[0]["matched_slug"], "blush-noir")
-        self.assertEqual(report.possible_duplicates[0]["skipped_parfumly_slug"],
-                         "ahmed-al-maghribi-blush-noire")
+        self.assertEqual(report.duplicates_skipped, [{
+            "name": "AQUA oud",
+            "parfumly_slug": "ahmed-al-maghribi-aqua-oud-2",
+            "rule": "exact",
+            "matched_name": "Aqua Oud",
+            "matched_slug": "ahmed-al-maghribi-aqua-oud",
+            "matched_source": "parfumly",
+        }])
+        self.assertEqual(report.possible_duplicates, [])
+
+    def test_strong_alias_blocks_creation(self):
+        brand = Brand.objects.create(name="Ahmed Al Maghribi", slug="ahmed-al-maghribi")
+        Product.objects.create(name="Oud Rose", slug="oud-rose", brand=brand, category=self.category)
+        report = self.run_import([make_detail("Oud-Rose", slug="ahmed-al-maghribi-oud-rose-x")])
+        self.assertEqual(Product.objects.count(), 1)
+        self.assertEqual(report.duplicates_skipped[0]["rule"], "strong")
+        self.assertEqual(report.duplicates_skipped[0]["matched_source"], "smerfume")
+
+    def test_same_slug_in_brand_blocks_creation(self):
+        brand = Brand.objects.create(name="Ahmed Al Maghribi", slug="ahmed-al-maghribi")
+        Product.objects.create(
+            name="Renamed", slug="ahmed-al-maghribi-aqua-oud", brand=brand, category=self.category
+        )
+        report = self.run_import([make_detail("Aqua Oud")])
+        self.assertEqual(Product.objects.count(), 1)
+        self.assertEqual(report.duplicates_skipped[0]["rule"], "same slug")
 
     def test_near_duplicate_note_is_reported_not_merged(self):
         oak_moss = PerfumeNote.objects.create(name="Oak Moss")
@@ -509,6 +677,26 @@ class ImporterDuplicateTests(ImporterTestBase):
                          [{"new_note": "Oakmoss", "similar_to": "Oak Moss"}])
 
 
+class ImporterNoteConflictTests(ImporterTestBase):
+    def test_note_position_conflicts_are_reported_first_position_kept(self):
+        report = self.run_import([make_detail("Aqua Oud", notes={
+            "top": [{"name": "Saffron"}, {"name": "Rose"}],
+            "heart": [{"name": "saffron"}],
+            "base": [{"name": "Rose"}, {"name": "Musk"}],
+        })])
+        self.assertEqual(report.note_position_conflicts, [
+            {"product": "Aqua Oud", "parfumly_slug": "ahmed-al-maghribi-aqua-oud",
+             "note": "Saffron", "positions": ["top", "heart"], "kept": "top"},
+            {"product": "Aqua Oud", "parfumly_slug": "ahmed-al-maghribi-aqua-oud",
+             "note": "Rose", "positions": ["top", "base"], "kept": "top"},
+        ])
+        self.assertEqual(
+            sorted(EditionNote.objects.values_list("note__name", "position")),
+            [("Musk", "base"), ("Rose", "top"), ("Saffron", "top")],
+        )
+        self.assertFalse(any("Saffron" in w for w in report.warnings))
+
+
 class ImporterDryRunTests(ImporterTestBase):
     def test_dry_run_performs_no_writes(self):
         PerfumeNote.objects.create(name="Oak Moss")
@@ -518,6 +706,7 @@ class ImporterDryRunTests(ImporterTestBase):
             make_detail("Aqua Ouds"),
             make_detail("Aswad Attar", variants=[variant("ATTAR", 12)]),
             make_detail("Odd", variants=[variant("PERFUME_OIL", 30)]),
+            make_detail("Mixed", variants=[variant("EDP", 50), variant("ATTAR", 12)]),
         ]
         with CaptureQueriesContext(connection) as queries:
             report = self.run_import(details, dry_run=True)
@@ -528,12 +717,14 @@ class ImporterDryRunTests(ImporterTestBase):
             self.assertTrue(sql.startswith("SELECT"), sql)
 
         self.assertEqual(report.brand_action, "create")
-        self.assertEqual(report.fetched, 4)
-        self.assertEqual(report.valid_products, 3)
-        self.assertEqual(len(report.products_to_create), 2)
-        self.assertEqual(len(report.editions_to_create), 2)
+        self.assertEqual(report.fetched, 5)
+        self.assertEqual(report.valid_products, 4)
+        self.assertEqual(len(report.products_to_create), 3)
+        self.assertEqual(len(report.editions_to_create), 3)
         self.assertEqual(report.notes_to_create, ["Bergamot", "Musk", "Oakmoss", "Rose"])
+        self.assertEqual(report.perfumes, ["Aqua Oud", "Aqua Ouds"])
         self.assertEqual(report.attars, ["Aswad Attar"])
+        self.assertEqual(len(report.mixed_concentration_category), 1)
         self.assertEqual(len(report.possible_duplicates), 1)
         self.assertEqual(len(report.possible_note_duplicates), 1)
         self.assertEqual(len(report.skipped), 2)
@@ -562,12 +753,26 @@ class ImportCommandTests(ImporterTestBase):
             self.call("--category", "nope")
         self.assertEqual(Product.objects.count(), 0)
 
+    def test_unknown_attar_category_is_rejected(self):
+        with self.assertRaises(CommandError):
+            self.call("--category", "fragrance", "--attar-category", "nope")
+
     def test_dry_run_reports_and_writes_nothing(self):
-        output = self.call("--category", "fragrance", "--dry-run")
+        output = self.call("--category", "fragrance", "--attar-category", "attar", "--dry-run")
         self.assertIn("DRY RUN", output)
         self.assertIn("EDP 100ml BOTTLE", output)
         self.assertEqual(Product.objects.count(), 0)
         self.assertEqual(Brand.objects.count(), 0)
+
+    def test_attar_category_routing_via_command(self):
+        self.call("--category", "fragrance", "--attar-category", "attar", details=[
+            make_detail("Aqua Oud"),
+            make_detail("Aswad Attar", variants=[variant("ATTAR", 12)]),
+        ])
+        self.assertEqual(
+            dict(Product.objects.values_list("name", "category__slug")),
+            {"Aqua Oud": "fragrance", "Aswad Attar": "attar"},
+        )
 
     def test_import_writes(self):
         output = self.call("--category", "fragrance")

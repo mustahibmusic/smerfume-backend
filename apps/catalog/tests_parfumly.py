@@ -9,6 +9,7 @@ descriptions, so the tests can prove none of that is ever persisted.
 """
 
 import datetime
+import http.client
 import io
 import json
 import urllib.error
@@ -286,6 +287,16 @@ class ParfumlyClientTests(SimpleTestCase):
             self.assertEqual(client.get_product("aqua"), {"slug": "aqua"})
         self.assertEqual(len(self.urls), 2)
         self.assertTrue(self.sleeps)
+
+    def test_retries_connection_reset_and_truncated_response(self):
+        client = self.make_client([
+            ConnectionResetError(10054, "forcibly closed"),
+            http.client.IncompleteRead(b""),
+            {"slug": "aqua"},
+        ])
+        with self.assertLogs("apps.catalog.parfumly.client", "WARNING"):
+            self.assertEqual(client.get_product("aqua"), {"slug": "aqua"})
+        self.assertEqual(len(self.urls), 3)
 
     def test_client_error_is_not_retried(self):
         client = self.make_client([self.http_error(404)])

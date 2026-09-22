@@ -16,6 +16,7 @@ returned 404 at implementation time):
 No authentication is required.
 """
 
+import http.client
 import json
 import logging
 import time
@@ -95,7 +96,9 @@ class ParfumlyClient:
             except urllib.error.HTTPError as exc:
                 retryable = exc.code in RETRYABLE_STATUS_CODES
                 reason = f"HTTP {exc.code}"
-            except (urllib.error.URLError, TimeoutError) as exc:
+            except (OSError, http.client.HTTPException) as exc:
+                # URLError, timeouts, connection resets and truncated responses
+                # are transient network failures.
                 retryable = True
                 reason = f"{type(exc).__name__}: {exc}"
             except ValueError as exc:

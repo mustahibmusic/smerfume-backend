@@ -32,6 +32,9 @@ Test groups:
     RefundImmutabilityTests        — Phase 5.3: completed refunds + RefundAdjustment
     RefundTaxHandlingTests         — Phase 5.3: historical tax_amount flow-through
     OrdersAdminDeletePermissionTests — stabilization: Order/Return/Refund/RefundAdjustment undeletable
+    InStoreSaleServiceTests       — DEC-008: create_in_store_order stock/financial/customer rules
+    InStoreSaleAPITests           — DEC-008: staff POST /api/orders/in-store/
+    InStoreSaleAdminTests         — DEC-008: admin 'New in-store sale' page
 """
 
 import threading
@@ -2934,3 +2937,323 @@ class CartRowLockDeterministicTests(TransactionTestCase):
         # Now that A released (committed), B must acquire it promptly.
         self.assertTrue(b_locked.wait(timeout=5), "Thread B never acquired the lock after A released it")
         t_b.join(timeout=5)
+
+
+# ── DEC-008: in-store (walk-in) sales ─────────────────────────────────────────
+
+IN_STORE_URL = "/api/orders/in-store/"
+ADMIN_IN_STORE_URL = "/admin/orders/order/in-store-sale/"
+
+
+def _make_staff(mobile="+919700000301", username="counterstaff"):
+    return _make_user(mobile=mobile, username=username, role="staff")
+
+
+class InStoreSaleServiceTests(TestCase):
+    def setUp(self):
+        self.staff = _make_staff()
+        self.warehouse = Warehouse.objects.get(is_default=True)
+        self.variant = _make_variant(selling_price="1000.00")
+
+    def _stock(self, variant):
+        return InventoryStock.objects.get(variant=variant, warehouse=self.warehouse, stock_type="retail")
+
+    def _sell(self, lines, **kwargs):
+        kwargs.setdefault("customer_mobile", "9811100001")
+        kwargs.setdefault("payment_method", Order.PAYMENT_METHOD_CASH)
+        return order_services.create_in_store_order(lines=lines, staff_user=self.staff, **kwargs)
+
+    def test_creates_delivered_in_store_order_without_shipping(self):
+        order = self._sell([(self.variant, 2)], payment_method=Order.PAYMENT_METHOD_UPI,
+                           payment_reference=" 4123 ", notes="counter")
+
+        order.refresh_from_db()
+        self.assertEqual(order.channel, Order.CHANNEL_IN_STORE)
+        self.assertEqual(order.status, Order.STATUS_DELIVERED)
+        self.assertIsNotNone(order.delivered_at)
+        self.assertEqual(order.created_by, self.staff)
+        self.assertEqual((order.payment_method, order.payment_reference), ("upi", "4123"))
+        self.assertEqual(order.customer_notes, "counter")
+        self.assertTrue(order.order_number.startswith("SMR-"))
+        self.assertEqual((order.subtotal, order.total), (Decimal("2000.00"), Decimal("2000.00")))
+        self.assertEqual(order.shipping_charge, Decimal("0.00"))
+        self.assertFalse(hasattr(order, "shipping_address"))
+        item = order.items.get()
+        self.assertEqual((item.quantity, item.unit_price, item.shipping_surcharge),
+                         (2, Decimal("1000.00"), Decimal("0.00")))
+
+    def test_shipping_surcharge_never_applied(self):
+        self.variant.shipping_surcharge = Decimal("50.00")
+        self.variant.save()
+        order = self._sell([(self.variant, 1)])
+        self.assertEqual(order.items.get().shipping_surcharge, Decimal("0.00"))
+        self.assertEqual(order.total, Decimal("1000.00"))
+
+    def test_stock_consumed_through_ledger(self):
+        order = self._sell([(self.variant, 3)])
+
+        stock = self._stock(self.variant)
+        self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("97"), Decimal("0")))
+        item = order.items.get()
+        reservation = StockReservation.objects.get(order_item=item)
+        self.assertEqual(reservation.status, StockReservation.STATUS_CONSUMED)
+        movement = StockMovement.objects.get(source_order_item=item)
+        self.assertEqual((movement.movement_type, movement.quantity_delta, movement.performed_by),
+                         (StockMovement.MOVEMENT_SALE_OUT, Decimal("-3"), self.staff))
+
+    def test_decant_line_opens_bottle_and_keeps_leftover(self):
+        source, decant = _make_decant_pair(source_size_ml=100, decant_volume_ml=10, source_retail_quantity=5)
+        self._sell([(decant, 2)])
+
+        self.assertEqual(self._stock(source).quantity, Decimal("4"))
+        lot = PartialBottleLot.objects.get(variant=source, warehouse=self.warehouse)
+        self.assertEqual(lot.remaining_ml, Decimal("80.00"))
+        self.assertFalse(InventoryStock.objects.filter(variant=decant).exists())
+
+    def test_repeated_variant_lines_are_merged(self):
+        order = self._sell([(self.variant, 1), (self.variant, 2)])
+        self.assertEqual(order.items.get().quantity, 3)
+
+    def test_insufficient_stock_rolls_back_everything(self):
+        other = _make_variant()
+        stock = self._stock(other)
+        stock.quantity = Decimal("1")
+        stock.save()
+        before = (Order.objects.count(), User.objects.count(), StockMovement.objects.count())
+
+        with self.assertRaises(reservation_service.InsufficientStockError):
+            self._sell([(self.variant, 1), (other, 2)], customer_mobile="9811100099")
+
+        self.assertEqual(
+            (Order.objects.count(), User.objects.count(), StockMovement.objects.count()), before
+        )
+        self.assertEqual(self._stock(self.variant).quantity, Decimal("100"))
+        self.assertEqual(self._stock(self.variant).quantity_reserved, Decimal("0"))
+
+    def test_discount_allocated_across_lines(self):
+        cheap = _make_variant(selling_price="500.00")
+        order = self._sell([(self.variant, 1), (cheap, 2)], discount_amount=Decimal("300.00"))
+
+        self.assertEqual((order.subtotal, order.discount_amount, order.total),
+                         (Decimal("2000.00"), Decimal("300.00"), Decimal("1700.00")))
+        allocated = sorted(order.items.values_list("discount_allocated", "final_paid_line_amount"))
+        self.assertEqual(allocated, [(Decimal("150.00"), Decimal("850.00")),
+                                     (Decimal("150.00"), Decimal("850.00"))])
+
+    def test_invalid_input_is_rejected_and_creates_nothing(self):
+        inactive = _make_variant()
+        inactive.is_active = False
+        inactive.save()
+        cases = [
+            dict(lines=[(self.variant, 1)], discount_amount=Decimal("1000.01")),
+            dict(lines=[(self.variant, 1)], discount_amount=Decimal("-1")),
+            dict(lines=[(self.variant, 1)], payment_method=Order.PAYMENT_METHOD_COD),
+            dict(lines=[(self.variant, 0)]),
+            dict(lines=[]),
+            dict(lines=[(inactive, 1)]),
+            dict(lines=[(self.variant, 1)], customer_mobile="  "),
+        ]
+        for case in cases:
+            with self.subTest(case=case), self.assertRaises(order_services.InStoreSaleError):
+                self._sell(**case)
+        self.assertEqual(Order.objects.count(), 0)
+        self.assertEqual(self._stock(self.variant).quantity, Decimal("100"))
+
+    def test_new_mobile_creates_customer_with_name(self):
+        order = self._sell([(self.variant, 1)], customer_mobile="9811100002", customer_name="Asha")
+        customer = order.user
+        self.assertEqual((customer.mobile_number, customer.first_name, customer.role),
+                         ("9811100002", "Asha", "customer"))
+        self.assertFalse(customer.has_usable_password())
+
+    def test_existing_customer_reused_and_not_modified(self):
+        existing = _make_user(mobile="9811100003", email="keep@example.com", first_name="Original")
+        order = self._sell([(self.variant, 1)], customer_mobile="9811100003", customer_name="Changed")
+        existing.refresh_from_db()
+        self.assertEqual(order.user, existing)
+        self.assertEqual((existing.first_name, existing.email), ("Original", "keep@example.com"))
+
+    def test_online_return_rejected_for_in_store_order(self):
+        order = self._sell([(self.variant, 1)])
+        with self.assertRaisesMessage(order_services.ReturnEligibilityError, "counter"):
+            order_services.create_return(order, [{
+                "order_item": order.items.get(),
+                "reason": ReturnItem.REASON_MANUFACTURING_DEFECT,
+                "requested_quantity": 1,
+            }])
+        self.assertEqual(Return.objects.count(), 0)
+
+
+class InStoreSaleAPITests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.staff = _make_staff()
+        self.variant = _make_variant(selling_price="1000.00")
+        self.payload = {
+            "customer_mobile": "9811100010",
+            "customer_name": "Ravi",
+            "items": [{"sku": self.variant.sku, "quantity": 2}],
+            "payment_method": "netbanking",
+            "payment_reference": "UTR123",
+            "discount_amount": "100.00",
+        }
+
+    def _post(self, payload=None, user=None):
+        client = APIClient()
+        if user is not None:
+            client.credentials(**_auth_header(user))
+        return client.post(IN_STORE_URL, payload or self.payload, format="json")
+
+    def test_staff_can_record_sale(self):
+        resp = self._post(user=self.staff)
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(resp.data["channel"], "in_store")
+        self.assertEqual(resp.data["status"], "delivered")
+        self.assertEqual(resp.data["payment_method"], "netbanking")
+        self.assertEqual(resp.data["total"], "1900.00")
+        self.assertIsNone(resp.data["shipping_address"])
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        self.assertEqual(order.created_by, self.staff)
+
+    def test_admin_role_can_record_sale(self):
+        admin_user = _make_user(mobile="+919700000302", username="counteradmin", role="admin")
+        self.assertEqual(self._post(user=admin_user).status_code, 201)
+
+    def test_customer_forbidden_and_anonymous_unauthorized(self):
+        customer = _make_user(mobile="+919700000303", username="counterbuyer")
+        self.assertEqual(self._post(user=customer).status_code, 403)
+        self.assertEqual(self._post().status_code, 401)
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_unknown_sku_returns_400(self):
+        payload = {**self.payload, "items": [{"sku": "NOPE-1", "quantity": 1}]}
+        resp = self._post(payload, user=self.staff)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("NOPE-1", str(resp.data))
+
+    def test_payment_method_validation(self):
+        for method in ("cod", "prepaid", "cheque"):
+            with self.subTest(method=method):
+                resp = self._post({**self.payload, "payment_method": method}, user=self.staff)
+                self.assertEqual(resp.status_code, 400)
+        for method in ("cash", "upi", "card", "netbanking"):
+            with self.subTest(method=method):
+                resp = self._post({**self.payload, "payment_method": method}, user=self.staff)
+                self.assertEqual(resp.status_code, 201)
+
+    def test_invalid_mobile_and_empty_items_return_400(self):
+        self.assertEqual(self._post({**self.payload, "customer_mobile": "12ab"}, user=self.staff).status_code, 400)
+        self.assertEqual(self._post({**self.payload, "items": []}, user=self.staff).status_code, 400)
+
+    def test_insufficient_stock_returns_400(self):
+        payload = {**self.payload, "items": [{"sku": self.variant.sku, "quantity": 101}]}
+        resp = self._post(payload, user=self.staff)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("error", resp.data)
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_discount_above_subtotal_returns_400(self):
+        resp = self._post({**self.payload, "discount_amount": "5000.00"}, user=self.staff)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_unknown_warehouse_returns_400(self):
+        resp = self._post({**self.payload, "warehouse": str(uuid.uuid4())}, user=self.staff)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_customer_sees_in_store_order_but_cannot_return_it(self):
+        resp = self._post(user=self.staff)
+        customer = User.objects.get(mobile_number="9811100010")
+        client = APIClient()
+        client.credentials(**_auth_header(customer))
+
+        orders = client.get("/api/orders/")
+        self.assertEqual(orders.status_code, 200)
+        results = orders.data.get("results", orders.data)
+        self.assertEqual([o["order_number"] for o in results], [resp.data["order_number"]])
+        self.assertIsNone(results[0]["shipping_address"])
+
+        item_id = resp.data["items"][0]["public_id"]
+        ret = client.post(
+            _order_return_create_url(resp.data["order_number"]),
+            {"items": [{"order_item": item_id, "reason": "manufacturing_defect", "requested_quantity": 1}]},
+            format="json",
+        )
+        self.assertEqual(ret.status_code, 400)
+        self.assertEqual(Return.objects.count(), 0)
+
+
+class InStoreSaleAdminTests(TestCase):
+    def setUp(self):
+        self.admin_user = User.objects.create_superuser(
+            username="counteradminui", email="counteradminui@example.com", password="testpass123",
+        )
+        self.client.login(username="counteradminui@example.com", password="testpass123")
+        self.variant = _make_variant(selling_price="1000.00")
+        self.warehouse = Warehouse.objects.get(is_default=True)
+
+    def _post_data(self, sku=None, quantity=1, **overrides):
+        data = {
+            "customer_mobile": "9811100020",
+            "customer_name": "",
+            "payment_method": "card",
+            "payment_reference": "SLIP-9",
+            "discount_amount": "0",
+            "warehouse": str(self.warehouse.pk),
+            "notes": "",
+            "lines-TOTAL_FORMS": "2",
+            "lines-INITIAL_FORMS": "0",
+            "lines-MIN_NUM_FORMS": "0",
+            "lines-MAX_NUM_FORMS": "50",
+            "lines-0-sku": sku or self.variant.sku,
+            "lines-0-quantity": str(quantity),
+            "lines-1-sku": "",
+            "lines-1-quantity": "",
+        }
+        data.update(overrides)
+        return data
+
+    def test_default_add_form_is_disabled(self):
+        self.assertFalse(OrderAdmin(Order, django_admin.site).has_add_permission(RequestFactory().get("/")))
+        self.assertEqual(self.client.get("/admin/orders/order/add/").status_code, 403)
+
+    def test_changelist_links_to_in_store_sale(self):
+        resp = self.client.get("/admin/orders/order/")
+        self.assertContains(resp, "in-store-sale")
+
+    def test_form_renders(self):
+        resp = self.client.get(ADMIN_IN_STORE_URL)
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, 'name="customer_mobile"')
+        self.assertContains(resp, 'name="lines-0-sku"')
+
+    def test_post_creates_order_and_redirects(self):
+        resp = self.client.post(ADMIN_IN_STORE_URL, self._post_data(quantity=2))
+        order = Order.objects.get()
+        self.assertRedirects(resp, f"/admin/orders/order/{order.pk}/change/", fetch_redirect_response=False)
+        self.assertEqual((order.channel, order.status, order.payment_method, order.created_by),
+                         ("in_store", "delivered", "card", self.admin_user))
+        self.assertEqual(order.items.get().quantity, 2)
+
+    def test_stock_error_rerenders_form_and_creates_nothing(self):
+        resp = self.client.post(ADMIN_IN_STORE_URL, self._post_data(quantity=101))
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "available")
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_unknown_sku_and_no_items_are_form_errors(self):
+        resp = self.client.post(ADMIN_IN_STORE_URL, self._post_data(sku="NOPE-2"))
+        self.assertContains(resp, "Unknown SKU")
+        resp = self.client.post(ADMIN_IN_STORE_URL, self._post_data(**{"lines-0-sku": "", "lines-0-quantity": ""}))
+        self.assertContains(resp, "Add at least one item")
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_staff_without_add_permission_is_denied(self):
+        staff = User.objects.create_user(
+            username="viewonly", email="viewonly@example.com", password="testpass123",
+            is_staff=True, role="staff", mobile_number="+919700000304",
+        )
+        client = self.client_class()
+        client.login(username="viewonly@example.com", password="testpass123")
+        resp = client.post(ADMIN_IN_STORE_URL, self._post_data())
+        self.assertIn(resp.status_code, (302, 403))
+        self.assertEqual(Order.objects.count(), 0)

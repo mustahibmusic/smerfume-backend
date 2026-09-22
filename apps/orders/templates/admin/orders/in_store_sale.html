@@ -1,0 +1,58 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block breadcrumbs %}{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl">
+    <p class="mb-6 text-sm">
+        Record a walk-in sale made at the counter. Prices are the current selling prices.
+        Stock is deducted immediately and the order is marked delivered.
+        In-store orders cannot be returned online.
+    </p>
+
+    <form method="post" novalidate>
+        {% csrf_token %}
+
+        {% if form.non_field_errors %}
+            <div class="mb-6">
+                {% include "unfold/helpers/form_errors.html" with errors=form.non_field_errors %}
+            </div>
+        {% endif %}
+
+        <h2 class="font-semibold mb-4">Customer & payment</h2>
+        <div class="grid gap-x-6 md:grid-cols-2">
+            {% for field in form %}
+                {% include "unfold/helpers/field.html" with field=field %}
+            {% endfor %}
+        </div>
+
+        <h2 class="font-semibold mb-4 mt-4">Items</h2>
+        {{ formset.management_form }}
+        {% if formset.non_form_errors %}
+            <div class="mb-4">
+                {% include "unfold/helpers/form_errors.html" with errors=formset.non_form_errors %}
+            </div>
+        {% endif %}
+        {% for line in formset %}
+            <div class="grid gap-x-6 md:grid-cols-3">
+                <div class="md:col-span-2">
+                    {% include "unfold/helpers/field.html" with field=line.sku %}
+                </div>
+                {% include "unfold/helpers/field.html" with field=line.quantity %}
+            </div>
+        {% endfor %}
+
+        <div class="flex gap-4 mt-4">
+            <button type="submit"
+                    class="bg-primary-600 border border-transparent font-medium px-3 py-2 rounded-default text-sm text-white">
+                Record sale
+            </button>
+            <a href="{% url 'admin:orders_order_changelist' %}"
+               class="border border-base-200 font-medium px-3 py-2 rounded-default text-sm">
+                Cancel
+            </a>
+        </div>
+    </form>
+</div>
+{% endblock %}

@@ -27,10 +27,33 @@ class Order(BaseModel):
 
     PAYMENT_METHOD_COD = "cod"
     PAYMENT_METHOD_PREPAID = "prepaid"
+    # In-store (counter) payment methods — see DEC-008.
+    PAYMENT_METHOD_CASH = "cash"
+    PAYMENT_METHOD_UPI = "upi"
+    PAYMENT_METHOD_CARD = "card"
+    PAYMENT_METHOD_NETBANKING = "netbanking"
 
     PAYMENT_METHOD_CHOICES = [
         (PAYMENT_METHOD_COD, "Cash on Delivery"),
         (PAYMENT_METHOD_PREPAID, "Prepaid"),
+        (PAYMENT_METHOD_CASH, "Cash"),
+        (PAYMENT_METHOD_UPI, "UPI"),
+        (PAYMENT_METHOD_CARD, "Card"),
+        (PAYMENT_METHOD_NETBANKING, "Net Banking"),
+    ]
+    IN_STORE_PAYMENT_METHODS = (
+        PAYMENT_METHOD_CASH,
+        PAYMENT_METHOD_UPI,
+        PAYMENT_METHOD_CARD,
+        PAYMENT_METHOD_NETBANKING,
+    )
+
+    CHANNEL_ONLINE = "online"
+    CHANNEL_IN_STORE = "in_store"
+
+    CHANNEL_CHOICES = [
+        (CHANNEL_ONLINE, "Online"),
+        (CHANNEL_IN_STORE, "In-store"),
     ]
 
     user = models.ForeignKey(
@@ -51,10 +74,30 @@ class Order(BaseModel):
     customer_notes = models.TextField(blank=True)
     guest_email = models.EmailField(null=True, blank=True)
 
+    # ── Sales channel ────────────────────────────────────────────────────
+    # in_store orders are recorded by staff at the counter via
+    # services.create_in_store_order(): stock is consumed and the order is
+    # delivered at the moment of sale, there is no ShippingAddress, and
+    # online returns are not available (handled at the counter).
+    channel = models.CharField(
+        max_length=20, choices=CHANNEL_CHOICES, default=CHANNEL_ONLINE, db_index=True
+    )
+    # Staff member who recorded an in-store sale. Null for online orders.
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+
     # ── Payment / COD verification ───────────────────────────────────────
     payment_method = models.CharField(
         max_length=10, choices=PAYMENT_METHOD_CHOICES, default=PAYMENT_METHOD_COD
     )
+    # UPI/netbanking UTR or card slip number for in-store payments. Entered
+    # manually; there is no payment gateway integration (DEC-006).
+    payment_reference = models.CharField(max_length=100, blank=True)
     cod_verified_at = models.DateTimeField(null=True, blank=True)
     cod_verified_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,

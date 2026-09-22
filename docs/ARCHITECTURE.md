@@ -265,6 +265,53 @@ Products can be filtered by brand slug, category slug, gender, concentration, pe
 
 ---
 
+## Catalogue SEO, Search & SEM Architecture (CURRENT)
+
+### Canonical page
+
+**`ProductEdition` is the canonical, indexable customer-facing product page** — not `Product` (too broad; groups unrelated scents like Hawas Ice/Fire/Viper/For Him under one brand+name) and not `ProductVariant` (too narrow; a size/decant option is a near-duplicate of its sibling sizes, not distinct content). Notes, gender, and concentration — the content that actually differentiates one fragrance from another for search intent — live on Edition. See DEC-008.
+
+Recommended URL shape (not yet built by any frontend in this repo): `/perfumes/<product.slug>/<edition.slug>/`, with size/decant selected on that same page. `ProductEdition.slug` is unique **per product** (`unique_edition_slug_per_product`), not globally, so the URL must be product-scoped.
+
+### SEO metadata
+
+`ProductEdition` carries optional overrides, exposed via `ProductEditionDetailSerializer`'s `seo` block (detail endpoint only — kept off the list/search payload):
+
+| Field | Fallback when blank |
+|---|---|
+| `seo_title` | `edition.display_name()` (always includes brand) |
+| `meta_description` | none — left `null` (no generated-copy engine exists) |
+| `og_title` | `seo_title` → `display_name()` |
+| `og_description` | `meta_description` → `null` |
+| `is_indexable` | defaults `True`; lets staff noindex a thin/duplicate edition without deactivating it |
+
+### Images
+
+`ProductVariantImage` (FK → `ProductVariant`, max 10 per variant, enforced in `clean()` and via `TabularInline(max_num=10, validate_max=True)`):
+- `role`: `primary` (canonical — product page, structured data, OG, Google Images, feeds), `secondary` (product-card hover only, never treated as canonical), `gallery` (unlimited within the 10-image cap).
+- At most one `primary` and one `secondary` per variant — enforced by conditional `UniqueConstraint`s, so it holds even outside the admin.
+- Deleting the primary/secondary never auto-promotes another image — a human chooses the replacement.
+- `alt_text`, deterministic `sort_order`.
+- The legacy single `ProductVariant.image`/`ProductEdition.image` fields are unchanged and still served; new work should use `ProductVariantImage`.
+
+### Search
+
+DRF `SearchFilter` (`icontains`) across `Product.name`, `Brand.name`, `ProductEdition.name` — unchanged behavior. Backed by PostgreSQL trigram GIN indexes (`pg_trgm`, via `django.contrib.postgres`) on `Product.name`, `Brand.name`, `ProductEdition.name`, `PerfumeNote.name`, so `ILIKE '%term%'` queries use an index instead of a sequential scan at scale. See DEC-009. No dedicated search engine (Elasticsearch/Algolia/etc.) — not justified at current scale, and the catalogue models carry no provider-specific coupling if one is added later.
+
+### Availability
+
+`ProductVariantSerializer.is_available` — `True` when any single retail-type `InventoryStock` row has positive available stock (`quantity - quantity_reserved`). Mirrors what `apps.inventory.services.reservation` actually reserves against (retail stock; decants open retail bottles on demand). It is a simple "sellable right now" signal, not a simulation of full decant-fulfillment logic — the authoritative check remains at reservation time during checkout.
+
+### SEM / product-feed readiness
+
+Currently available per variant via the catalogue API: title (edition display name / seo_title), brand, SKU, canonical slug pair (product+edition), primary/gallery images, price (`mrp`)/sale price (`selling_price`), `is_available`. **Gaps** (not fabricated — see the SEO/SEM foundation report for full detail): no long-form product description field, no explicit currency field (system is implicitly INR-only), no GTIN/EAN/UPC/MPN (not applicable — not invented).
+
+### CDN / storage
+
+`ProductVariantImage.image` uses the same storage backend as every other `ImageField` (see [File / Media Storage](#file--media-storage-current) below) — S3 + `AWS_S3_CUSTOM_DOMAIN` in production, which can point at a CDN distribution without any catalogue/media model change.
+
+---
+
 ## Order / Checkout Architecture (CURRENT)
 
 Checkout is a single atomic transaction:

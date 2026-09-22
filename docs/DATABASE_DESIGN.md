@@ -143,6 +143,8 @@ These tables are not custom models; they are managed by the simplejwt app.
 | `brand_category` | CharField(100) | indexed | Choices: `designer` / `middle eastern` / `niche`. Default: `designer` |
 | `slug` | SlugField | unique, indexed | |
 
+**Index:** trigram GIN index on `name` (`brand_name_trgm_idx`) — backs `?search=`.
+
 ---
 
 ### `catalog_category`
@@ -171,6 +173,8 @@ These tables are not custom models; they are managed by the simplejwt app.
 | `name` | CharField(100) | unique, indexed | |
 | `notes_category` | CharField(100) | indexed, blank | Choices: fresh / citrus / fruity / floral / sweet / spicy / woody / ambery / musky / leathery / smoky / aquatic / aromatic |
 
+**Index:** trigram GIN index on `name` (`perfumenote_name_trgm_idx`) — backs `?search=` and `?note=` icontains matching.
+
 ---
 
 ### `catalog_product`
@@ -189,6 +193,8 @@ These tables are not custom models; they are managed by the simplejwt app.
 
 **Computed methods (not DB columns):**
 - `display_name()` → `"{brand.name} {name}"`
+
+**Index:** trigram GIN index on `name` (`product_name_trgm_idx`) — backs `?search=`.
 
 ---
 
@@ -212,6 +218,17 @@ Represents a specific version of a product (concentration + gender combination).
 | `is_best_seller` | BooleanField | default False | |
 | `is_new_arrival` | BooleanField | default False | |
 | `notes` | M2M → catalog_perfumenote | through `EditionNote` | |
+| `seo_title` | CharField(70) | blank | SEO `<title>` override. Falls back to `display_name()` |
+| `meta_description` | CharField(300) | blank | No fallback — `null` in the API when unset |
+| `og_title` | CharField(95) | blank | Falls back to `seo_title` → `display_name()` |
+| `og_description` | CharField(300) | blank | Falls back to `meta_description` |
+| `is_indexable` | BooleanField | default True | SEO robots signal only — does not affect reachability |
+
+**Constraint:** `unique_edition_slug_per_product` — `(product, slug)` unique where `slug IS NOT NULL`. Edition slugs are scoped per product, not global.
+
+**Index:** trigram GIN index on `name` (`edition_name_trgm_idx`) — backs `?search=` and `?note=` icontains matching.
+
+**Canonical page:** `ProductEdition` is the canonical indexable customer-facing product page — see `docs/ARCHITECTURE.md` § Catalogue SEO, Search & SEM Architecture and `.claude/DECISIONS.md` DEC-008.
 
 ---
 
@@ -227,13 +244,39 @@ A purchasable SKU (specific size or decant).
 | `created_at` | DateTimeField | | |
 | `updated_at` | DateTimeField | | |
 | `edition` | FK → catalog_productedition | CASCADE | |
-| `image` | ImageField | nullable | Upload path: `catalog/variants/` |
+| `image` | ImageField | nullable | Upload path: `catalog/variants/`. Legacy single-image field — retained for backward compatibility; new work uses `ProductVariantImage` |
+| `sku` | CharField(64) | unique, indexed | Now exposed in the catalogue API (was previously write-only via admin) |
 | `size_ml` | PositiveIntegerField | | Volume in millilitres |
 | `is_decant` | BooleanField | default False | True for decant/split |
 | `mrp` | DecimalField(10,2) | | Maximum retail price |
 | `selling_price` | DecimalField(10,2) | | Price used at checkout |
 
-**Note:** `mrp` is exposed in the API alongside `selling_price` so the frontend can display original price and savings.
+**Note:** `mrp` is exposed in the API alongside `selling_price` so the frontend can display original price and savings. `is_available` and `primary_image`/`images` are computed API fields (see `catalog_productvariantimage` below and `apps/inventory` for stock), not database columns.
+
+---
+
+### `catalog_productvariantimage`
+
+Gallery images for a variant. Max 10 per variant (enforced in `ProductVariantImage.clean()` and via the admin inline's `max_num=10, validate_max=True`).
+
+| Field | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | BigAutoField | PK | |
+| `public_id` | UUIDField | unique, indexed | |
+| `is_active` | BooleanField | | |
+| `created_at` | DateTimeField | | |
+| `updated_at` | DateTimeField | | |
+| `variant` | FK → catalog_productvariant | CASCADE | |
+| `image` | ImageField | required | Upload path: `catalog/variant_images/` |
+| `role` | CharField(10) | | Choices: `primary` / `secondary` / `gallery`. Default: `gallery` |
+| `alt_text` | CharField(255) | blank | Accessibility/SEO alt text |
+| `sort_order` | PositiveSmallIntegerField | default 0 | Deterministic gallery order |
+
+**Constraints:** `unique_primary_image_per_variant` and `unique_secondary_image_per_variant` — at most one `primary` and one `secondary` per variant (conditional `UniqueConstraint`s, hold at the DB level regardless of entry point). Gallery role has no per-role limit besides the shared 10-image cap.
+
+**Ordering:** `Meta.ordering = ["sort_order", "id"]`.
+
+**Note:** deleting the `primary` or `secondary` image never auto-promotes another image into that role — a human must choose the replacement explicitly.
 
 ---
 
@@ -411,6 +454,9 @@ catalog_perfumenote ─────────────────── ca
 | accounts | 0004_auth_hardening | User.public_id; rewrote OTPVerification (hashed OTP, security fields) |
 | catalog | 0001_initial | All catalog models |
 | catalog | 0002_productedition_image_productvariant_image | Image fields on Edition and Variant |
+| catalog | 0003–0005 | Variant SKU: added nullable, backfilled, enforced not-null |
+| catalog | 0006_enable_pg_trgm | Enables PostgreSQL `pg_trgm` extension (trigram search) |
+| catalog | 0007_productvariantimage_productedition_is_indexable_and_more | `ProductVariantImage` model; Edition SEO fields (`seo_title`, `meta_description`, `og_title`, `og_description`, `is_indexable`); `unique_edition_slug_per_product`; trigram GIN indexes on Brand/Product/Edition/PerfumeNote `name` |
 | cart | 0001_initial | Cart + CartItem |
 | orders | 0001_initial | Order + OrderItem + ShippingAddress |
 | orders | 0002_alter_shippingaddress_state | State field adjustment (untracked — present locally, not committed) |

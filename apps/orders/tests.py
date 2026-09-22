@@ -48,7 +48,7 @@ from apps.inventory.models import (
 from apps.inventory.services import reservation as reservation_service
 from apps.orders import services as order_services
 from apps.orders.admin import OrderAdmin
-from apps.orders.models import Order, OrderItem, Refund, RefundAdjustment, Return, ReturnItem
+from apps.orders.models import Order, OrderItem
 
 User = get_user_model()
 

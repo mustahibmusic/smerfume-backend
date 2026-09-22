@@ -23,6 +23,17 @@ db.sqlite3
 media/
 staticfiles/
 
+# ── Database dumps / backups / keys / archives ─────────────────────────────────
+# Never commit database exports, backups, private keys or certificates.
+*.sql
+*.dump
+*.backup
+*.bak
+*.pem
+*.key
+*.zip
+*.gz
+
 # ── IDEs / AI tooling ───────────────────────────────────────────────────────────
 .vscode/
 .idea/
@@ -30,6 +41,7 @@ staticfiles/
 *.swo
 .claude/*
 !.claude/CLAUDE.md
+.code-review-graph/
 
 # ── OS ──────────────────────────────────────────────────────────────────────────
 .DS_Store

@@ -213,8 +213,9 @@ Represents a specific version of a product (concentration + gender combination).
 | `name` | CharField(100) | nullable, blank | Optional edition name (e.g. "Intense") |
 | `slug` | SlugField | nullable, blank, indexed | |
 | `gender` | CharField(10) | indexed | Choices: `men` / `women` / `unisex`. Default: `unisex` |
-| `concentration` | CharField(20) | indexed | Choices: `edc` / `edt` / `edp` / `extrait`. Default: `edp` |
+| `concentration` | CharField(20) | indexed | Choices: `edc` / `edt` / `edp` / `extrait` / `attar`. Default: `edp` |
 | `image` | ImageField | nullable | Upload path: `catalog/editions/` |
+| `release_year` | PositiveSmallIntegerField | nullable, blank | Optional fragrance metadata. Not exposed in the public API |
 | `is_best_seller` | BooleanField | default False | |
 | `is_new_arrival` | BooleanField | default False | |
 | `notes` | M2M → catalog_perfumenote | through `EditionNote` | |

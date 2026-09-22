@@ -190,7 +190,7 @@ class ProductEditionAdmin(ModelAdmin):
         (None, {
             "fields": (
                 "product", "name", "slug", "image", "image_preview",
-                "gender", "concentration",
+                "gender", "concentration", "release_year",
                 "is_best_seller", "is_new_arrival",
             ),
         }),

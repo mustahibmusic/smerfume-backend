@@ -1,8 +1,21 @@
+import re
+from decimal import Decimal
+
 from rest_framework import serializers
 
+from apps.catalog.models import ProductVariant
 from apps.catalog.serializers import ProductVariantSerializer
+from apps.inventory.models import Warehouse
 
 from .models import Order, OrderItem, Return, ReturnItem, ShippingAddress
+
+
+def validate_mobile_number(value):
+    """Shared mobile-number rule for checkout and in-store sales."""
+    value = value.strip()
+    if not re.fullmatch(r"\+?[0-9]{10,15}", value):
+        raise serializers.ValidationError("Enter a valid mobile number.")
+    return value
 
 
 class ShippingAddressSerializer(serializers.ModelSerializer):
@@ -25,10 +38,7 @@ class ShippingAddressSerializer(serializers.ModelSerializer):
         return value
 
     def validate_mobile(self, value):
-        import re
-        if not re.fullmatch(r"\+?[0-9]{10,15}", value.strip()):
-            raise serializers.ValidationError("Enter a valid mobile number.")
-        return value.strip()
+        return validate_mobile_number(value)
 
 
 class OrderItemSerializer(serializers.ModelSerializer):
@@ -52,6 +62,8 @@ class OrderSerializer(serializers.ModelSerializer):
             "public_id",
             "order_number",
             "status",
+            "channel",
+            "payment_method",
             "subtotal",
             "discount_amount",
             "total",
@@ -67,6 +79,49 @@ class CheckoutSerializer(serializers.Serializer):
     shipping_address = ShippingAddressSerializer()
     customer_notes = serializers.CharField(allow_blank=True, required=False, default="")
     guest_email = serializers.EmailField(required=False, allow_null=True, default=None)
+
+
+class InStoreSaleItemSerializer(serializers.Serializer):
+    sku = serializers.SlugRelatedField(
+        slug_field="sku",
+        queryset=ProductVariant.objects.select_related("edition__product__brand"),
+        error_messages={"does_not_exist": "Unknown SKU '{value}'."},
+    )
+    quantity = serializers.IntegerField(min_value=1, max_value=1000)
+
+
+class InStoreSaleSerializer(serializers.Serializer):
+    """Staff input for a walk-in counter sale (DEC-008). Only these fields
+    are accepted; prices, totals and status are always computed server-side."""
+
+    customer_mobile = serializers.CharField(max_length=15)
+    customer_name = serializers.CharField(max_length=150, required=False, allow_blank=True, default="")
+    items = InStoreSaleItemSerializer(many=True)
+    payment_method = serializers.ChoiceField(
+        choices=[c for c in Order.PAYMENT_METHOD_CHOICES if c[0] in Order.IN_STORE_PAYMENT_METHODS]
+    )
+    payment_reference = serializers.CharField(max_length=100, required=False, allow_blank=True, default="")
+    discount_amount = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal("0.00"), required=False,
+        default=Decimal("0.00"),
+    )
+    warehouse = serializers.SlugRelatedField(
+        slug_field="public_id",
+        queryset=Warehouse.objects.all(),
+        required=False,
+        allow_null=True,
+        default=None,
+        help_text="Public ID of the stock location. Defaults to the default warehouse.",
+    )
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate_customer_mobile(self, value):
+        return validate_mobile_number(value)
+
+    def validate_items(self, value):
+        if not value:
+            raise serializers.ValidationError("At least one item is required.")
+        return value
 
 
 # ── Returns (read) ──────────────────────────────────────────────────────────

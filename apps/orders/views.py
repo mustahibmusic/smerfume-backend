@@ -12,12 +12,9 @@ Guest checkout flow:
 5. The guest can later log in with their mobile number to see their order.
 """
 
-import datetime
 import logging
-import secrets
 from decimal import Decimal
 
-from django.contrib.auth import get_user_model
 from django.db import transaction
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
@@ -32,6 +29,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.cart.models import Cart
+from apps.core.permissions import IsStaffMember
 from apps.inventory.models import Warehouse
 from apps.inventory.services import reservation as reservation_service
 from apps.inventory.services.reservation import InsufficientStockError
@@ -41,12 +39,12 @@ from .models import Order, OrderItem, Return, ShippingAddress
 from .serializers import (
     CheckoutSerializer,
     CreateReturnSerializer,
+    InStoreSaleSerializer,
     OrderSerializer,
     ReturnDetailSerializer,
 )
 
 logger = logging.getLogger(__name__)
-User = get_user_model()
 
 _CART_TOKEN_HEADER = OpenApiParameter(
     name="X-Cart-Token",
@@ -67,58 +65,6 @@ _RETURN_PUBLIC_ID_PATH = OpenApiParameter(
 class EmptyCartError(Exception):
     """Raised when a locked cart has no items — either it started empty,
     or a concurrent request already checked it out and cleared it."""
-
-
-def _generate_order_number():
-    """Generate a unique order number in the format SMR-YYYYMMDD-XXXXXX."""
-    today = datetime.date.today().strftime("%Y%m%d")
-    suffix = secrets.token_hex(3).upper()
-    return f"SMR-{today}-{suffix}"
-
-
-def _resolve_guest_user(mobile: str, guest_email: str):
-    """Find or silently create a User for a guest checkout.
-
-    Looks up by mobile number. If an existing account is found, email is set
-    on it only when it has none and the provided email is not already taken.
-    If a new account is created, it is set up with an unusable password so
-    the guest can log in via OTP at any time.
-
-    Args:
-        mobile: Mobile number string from the shipping address.
-        guest_email: Email address provided by the guest at checkout.
-
-    Returns:
-        User instance.
-    """
-    mobile_normalized = mobile.strip()
-
-    user, created = User.objects.get_or_create(
-        mobile_number=mobile_normalized,
-        defaults={
-            "username": f"user_{mobile_normalized[-4:]}_{secrets.token_hex(3)}",
-            "role": "customer",
-            "is_staff": False,
-        },
-    )
-
-    if created:
-        user.set_unusable_password()
-        user.save(update_fields=["password"])
-        logger.info(
-            "Guest checkout: created new user (pk=%s) for mobile %s",
-            user.pk,
-            mobile_normalized,
-        )
-
-    # Set email only if the user has none and the address is not already taken
-    if guest_email and not user.email:
-        email_taken = User.objects.filter(email=guest_email).exclude(pk=user.pk).exists()
-        if not email_taken:
-            user.email = guest_email
-            user.save(update_fields=["email"])
-
-    return user
 
 
 class CheckoutView(APIView):
@@ -263,7 +209,7 @@ class CheckoutView(APIView):
 
         order = Order.objects.create(
             user=user,
-            order_number=_generate_order_number(),
+            order_number=order_services.generate_order_number(),
             subtotal=subtotal,
             discount_amount=discount_amount,
             total=total,
@@ -325,9 +271,99 @@ class CheckoutView(APIView):
             )
 
         mobile = serializer.validated_data["shipping_address"]["mobile"]
-        user = _resolve_guest_user(mobile, guest_email)
+        user = order_services.resolve_customer_by_mobile(mobile, email=guest_email)
 
         return cart, user, guest_email
+
+
+class InStoreSaleView(APIView):
+    permission_classes = [IsStaffMember]
+
+    @extend_schema(
+        tags=["Orders"],
+        summary="Record an in-store sale (staff)",
+        description=(
+            "Record a walk-in sale made at the shop or warehouse counter "
+            "(DEC-008). **Staff only** (`role` = staff or admin).\n\n"
+            "- The customer is found by `customer_mobile`, or created silently "
+            "if new, so they can later log in via OTP and see the order. "
+            "`customer_name` is only used for a new customer.\n"
+            "- Items are referenced by variant `sku`. Unit price is always the "
+            "variant's current selling price; repeated SKUs are merged.\n"
+            "- `discount_amount` is an optional order-level discount, spread "
+            "across lines proportionally. It cannot exceed the subtotal.\n"
+            "- `payment_method`: `cash`, `upi`, `card` or `netbanking`. "
+            "`payment_reference` holds the UTR or card slip number.\n"
+            "- `warehouse` is the public ID of the stock location; defaults to "
+            "the default warehouse.\n\n"
+            "Stock is deducted immediately and the order is returned with "
+            "`channel=in_store` and `status=delivered`. There is no shipping "
+            "address or shipping charge. In-store orders cannot be returned "
+            "through the online returns API; issues are handled at the counter.\n\n"
+            "Nothing is created if any line fails (e.g. insufficient stock)."
+        ),
+        request=InStoreSaleSerializer,
+        responses={
+            201: OrderSerializer,
+            400: OpenApiResponse(
+                description="Invalid data, unknown/inactive SKU, bad discount, or insufficient stock.",
+                examples=[
+                    OpenApiExample(
+                        "Insufficient stock",
+                        value={"error": "Only 0 unit(s) of Aqua Oud 100ml available at Main, needed 1."},
+                    ),
+                    OpenApiExample(
+                        "Unknown SKU",
+                        value={"items": [{"sku": ["Unknown SKU 'AAM-XXX'."]}]},
+                    ),
+                ],
+            ),
+            401: OpenApiResponse(description="Access token missing or expired."),
+            403: OpenApiResponse(description="Authenticated user is not staff."),
+        },
+        examples=[
+            OpenApiExample(
+                "Counter sale paid by UPI",
+                request_only=True,
+                value={
+                    "customer_mobile": "9876543210",
+                    "customer_name": "Rahul Sharma",
+                    "items": [
+                        {"sku": "AAM-AHL-EDP-60", "quantity": 1},
+                        {"sku": "AAM-KAAF-DEC-10", "quantity": 2},
+                    ],
+                    "payment_method": "upi",
+                    "payment_reference": "412345678901",
+                    "discount_amount": "200.00",
+                    "notes": "Gift wrapped at counter.",
+                },
+            ),
+        ],
+    )
+    def post(self, request):
+        serializer = InStoreSaleSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            order = order_services.create_in_store_order(
+                customer_mobile=data["customer_mobile"],
+                customer_name=data.get("customer_name", ""),
+                lines=[(item["sku"], item["quantity"]) for item in data["items"]],
+                payment_method=data["payment_method"],
+                payment_reference=data.get("payment_reference", ""),
+                discount_amount=data.get("discount_amount", Decimal("0.00")),
+                warehouse=data.get("warehouse"),
+                notes=data.get("notes", ""),
+                staff_user=request.user,
+            )
+        except (order_services.InStoreSaleError, InsufficientStockError) as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        order = (
+            Order.objects.prefetch_related("items__variant").get(pk=order.pk)
+        )
+        return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
 
 
 class OrderListView(generics.ListAPIView):

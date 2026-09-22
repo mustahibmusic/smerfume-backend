@@ -4,6 +4,7 @@ from .views import (
     CancelReturnView,
     CheckoutView,
     CreateReturnView,
+    InStoreSaleView,
     OrderDetailView,
     OrderListView,
     ReturnDetailView,
@@ -13,6 +14,7 @@ from .views import (
 urlpatterns = [
     path("", OrderListView.as_view(), name="order-list"),
     path("checkout/", CheckoutView.as_view(), name="checkout"),
+    path("in-store/", InStoreSaleView.as_view(), name="in-store-sale"),
     # Literal "returns/..." patterns must precede <str:order_number>/ below —
     # otherwise Django would try to match "returns" itself as an order_number
     # first, since the str path converter matches any single non-slash segment.

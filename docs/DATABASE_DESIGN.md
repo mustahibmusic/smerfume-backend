@@ -357,7 +357,11 @@ Through-table for the M2M relationship between `ProductEdition` and `PerfumeNote
 | `subtotal` | DecimalField(10,2) | | Sum of line totals at checkout time |
 | `discount_amount` | DecimalField(10,2) | default 0 | Always 0 currently (offers not implemented) |
 | `total` | DecimalField(10,2) | | Currently equals `subtotal` |
-| `customer_notes` | TextField | blank | Optional notes from customer |
+| `customer_notes` | TextField | blank | Optional notes from customer (staff notes for in-store sales) |
+| `channel` | CharField(20) | indexed, default `online` | `online` / `in_store` (DEC-008). In-store orders are delivered at the moment of sale, have no shipping address and cannot be returned online |
+| `created_by` | FK → accounts_user | SET_NULL, nullable | Staff member who recorded an in-store sale; null for online orders |
+| `payment_method` | CharField(10) | default `cod` | Online: `cod` / `prepaid`. In-store: `cash` / `upi` / `card` / `netbanking` (`Order.IN_STORE_PAYMENT_METHODS`) |
+| `payment_reference` | CharField(100) | blank | UPI/netbanking UTR or card slip number, entered manually |
 
 **Default ordering:** `-created_at`
 
@@ -461,6 +465,7 @@ catalog_perfumenote ─────────────────── ca
 | cart | 0001_initial | Cart + CartItem |
 | orders | 0001_initial | Order + OrderItem + ShippingAddress |
 | orders | 0002_alter_shippingaddress_state | State field adjustment (untracked — present locally, not committed) |
+| orders | 0010_order_channel_in_store_payment | `Order.channel`, `created_by`, `payment_reference`; in-store payment choices (DEC-008) |
 
 ---
 

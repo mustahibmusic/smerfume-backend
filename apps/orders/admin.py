@@ -1,10 +1,99 @@
 from django import forms
 from django.contrib import admin
 from django.contrib import messages
+from django.shortcuts import redirect
+from django.template.response import TemplateResponse
+from django.urls import reverse
+from rest_framework import serializers as drf_serializers
 from unfold.admin import ModelAdmin
+from unfold.decorators import action
+from unfold.widgets import (
+    UnfoldAdminDecimalFieldWidget,
+    UnfoldAdminIntegerFieldWidget,
+    UnfoldAdminSelectWidget,
+    UnfoldAdminTextareaWidget,
+    UnfoldAdminTextInputWidget,
+)
+
+from apps.catalog.models import ProductVariant
+from apps.inventory.models import Warehouse
+from apps.inventory.services.reservation import InsufficientStockError
 
 from . import services as order_services
 from .models import Order, OrderItem, Refund, RefundAdjustment, Return, ReturnItem, ShippingAddress
+from .serializers import validate_mobile_number
+
+
+# ── In-store sale form (DEC-008) ─────────────────────────────────────────────
+
+class InStoreSaleForm(forms.Form):
+    customer_mobile = forms.CharField(
+        max_length=15, widget=UnfoldAdminTextInputWidget,
+        help_text="Required. Finds the customer, or creates one if new.",
+    )
+    customer_name = forms.CharField(
+        max_length=150, required=False, widget=UnfoldAdminTextInputWidget,
+        help_text="Only used when a new customer is created.",
+    )
+    payment_method = forms.ChoiceField(
+        choices=[c for c in Order.PAYMENT_METHOD_CHOICES if c[0] in Order.IN_STORE_PAYMENT_METHODS],
+        widget=UnfoldAdminSelectWidget,
+    )
+    payment_reference = forms.CharField(
+        max_length=100, required=False, widget=UnfoldAdminTextInputWidget,
+        help_text="UPI/netbanking UTR or card slip number.",
+    )
+    discount_amount = forms.DecimalField(
+        max_digits=10, decimal_places=2, min_value=0, initial=0, required=False,
+        widget=UnfoldAdminDecimalFieldWidget,
+        help_text="Order-level discount, spread across lines. Cannot exceed the subtotal.",
+    )
+    warehouse = forms.ModelChoiceField(
+        queryset=Warehouse.objects.order_by("name"), widget=UnfoldAdminSelectWidget,
+        help_text="Stock location the items leave from.",
+    )
+    notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["warehouse"].initial = Warehouse.objects.filter(is_default=True).first()
+
+    def clean_customer_mobile(self):
+        try:
+            return validate_mobile_number(self.cleaned_data["customer_mobile"])
+        except drf_serializers.ValidationError as exc:
+            raise forms.ValidationError([str(e) for e in exc.detail]) from exc
+
+
+class InStoreSaleLineForm(forms.Form):
+    sku = forms.CharField(max_length=64, widget=UnfoldAdminTextInputWidget)
+    # No initial value: blank extra rows must stay "unchanged" so the
+    # formset skips them instead of reporting required-field errors.
+    quantity = forms.IntegerField(
+        min_value=1, max_value=1000, widget=UnfoldAdminIntegerFieldWidget,
+    )
+
+    def clean_sku(self):
+        sku = self.cleaned_data["sku"].strip()
+        variant = ProductVariant.objects.filter(sku=sku).first()
+        if variant is None:
+            raise forms.ValidationError(f"Unknown SKU '{sku}'.")
+        self.cleaned_data["variant"] = variant
+        return sku
+
+
+class _BaseLineFormSet(forms.BaseFormSet):
+    def clean(self):
+        super().clean()
+        if any(self.errors):
+            return
+        if not any(form.cleaned_data.get("variant") for form in self.forms):
+            raise forms.ValidationError("Add at least one item.")
+
+
+InStoreSaleLineFormSet = forms.formset_factory(
+    InStoreSaleLineForm, formset=_BaseLineFormSet, extra=5, max_num=50
+)
 
 
 class OrderItemInline(admin.TabularInline):
@@ -31,15 +120,16 @@ class ShippingAddressInline(admin.StackedInline):
 @admin.register(Order)
 class OrderAdmin(ModelAdmin):
     list_display = (
-        "order_number", "user", "status", "payment_method", "total",
+        "order_number", "user", "channel", "status", "payment_method", "total",
         "is_guest_order_display", "guest_email", "created_at",
     )
-    list_filter = ("status", "payment_method", "created_at")
+    list_filter = ("channel", "status", "payment_method", "created_at")
     search_fields = ("order_number", "user__mobile_number", "user__email", "guest_email")
     readonly_fields = (
         "public_id", "order_number", "user", "subtotal",
         "discount_amount", "total", "guest_email", "is_guest_order_display", "created_at",
-        "payment_method", "cod_verified_at", "cod_verified_by",
+        "payment_method", "payment_reference", "cod_verified_at", "cod_verified_by",
+        "channel", "created_by",
         "base_shipping_charge", "free_shipping_applied", "shipping_charge",
         "cod_handling_charge", "convenience_fee",
         "delivered_at", "is_replacement", "original_order", "tracking_number",
@@ -51,6 +141,13 @@ class OrderAdmin(ModelAdmin):
     )
     inlines = [OrderItemInline, ShippingAddressInline]
     actions = ["verify_cod_orders", "pack_orders", "mark_shipped", "mark_delivered", "cancel_orders"]
+    actions_list = ["new_in_store_sale"]
+
+    def has_add_permission(self, request):
+        # The generic add form would create an Order with no items,
+        # reservations or totals. Online orders come from checkout; counter
+        # sales use the "New in-store sale" page (new_in_store_sale).
+        return False
 
     def has_delete_permission(self, request, obj=None):
         # An order anchors reservations/movements/returns/refunds — never
@@ -61,7 +158,7 @@ class OrderAdmin(ModelAdmin):
     fieldsets = (
         (None, {
             "fields": (
-                "public_id", "order_number", "user",
+                "public_id", "order_number", "user", "channel", "created_by",
                 "is_guest_order_display", "guest_email",
             ),
         }),
@@ -75,7 +172,7 @@ class OrderAdmin(ModelAdmin):
             ),
         }),
         ("Payment", {
-            "fields": ("payment_method", "cod_verified_at", "cod_verified_by"),
+            "fields": ("payment_method", "payment_reference", "cod_verified_at", "cod_verified_by"),
         }),
         ("Status & Notes", {
             "fields": ("status", "customer_notes"),
@@ -91,6 +188,60 @@ class OrderAdmin(ModelAdmin):
     @admin.display(description="Guest order", boolean=True)
     def is_guest_order_display(self, obj):
         return obj.is_guest_order
+
+    @action(
+        description="New in-store sale",
+        url_path="in-store-sale",
+        permissions=["orders.add_order"],
+        icon="point_of_sale",
+    )
+    def new_in_store_sale(self, request):
+        """Record a walk-in counter sale through
+        order_services.create_in_store_order() — the same service the staff
+        API uses. Any failure re-renders the form and creates nothing."""
+        if request.method == "POST":
+            form = InStoreSaleForm(request.POST)
+            formset = InStoreSaleLineFormSet(request.POST, prefix="lines")
+            if form.is_valid() and formset.is_valid():
+                data = form.cleaned_data
+                lines = [
+                    (line["variant"], line["quantity"])
+                    for line in formset.cleaned_data
+                    if line.get("variant")
+                ]
+                try:
+                    order = order_services.create_in_store_order(
+                        customer_mobile=data["customer_mobile"],
+                        customer_name=data["customer_name"],
+                        lines=lines,
+                        payment_method=data["payment_method"],
+                        payment_reference=data["payment_reference"],
+                        discount_amount=data["discount_amount"] or 0,
+                        warehouse=data["warehouse"],
+                        notes=data["notes"],
+                        staff_user=request.user,
+                    )
+                except (order_services.InStoreSaleError, InsufficientStockError) as exc:
+                    form.add_error(None, str(exc))
+                else:
+                    self.message_user(
+                        request,
+                        f"In-store sale {order.order_number} recorded (total {order.total}).",
+                        level=messages.SUCCESS,
+                    )
+                    return redirect(reverse("admin:orders_order_change", args=[order.pk]))
+        else:
+            form = InStoreSaleForm()
+            formset = InStoreSaleLineFormSet(prefix="lines")
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "New in-store sale",
+            "opts": self.model._meta,
+            "form": form,
+            "formset": formset,
+        }
+        return TemplateResponse(request, "admin/orders/in_store_sale.html", context)
 
     @admin.action(description="Verify selected COD orders (confirms reservation, advances to Confirmed)")
     def verify_cod_orders(self, request, queryset):

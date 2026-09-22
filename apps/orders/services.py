@@ -7,9 +7,14 @@ the HTTP layer. All values computed here are checkout-time snapshots,
 written once onto Order/OrderItem and never recalculated later.
 """
 
+import datetime
+import logging
+import secrets
+from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
 
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
@@ -25,7 +30,52 @@ from apps.inventory.models import (
 )
 from apps.inventory.services import reservation as reservation_service
 
+logger = logging.getLogger(__name__)
+
 RETURN_WINDOW_DAYS = 1
+
+
+def generate_order_number():
+    """Generate a unique order number in the format SMR-YYYYMMDD-XXXXXX."""
+    today = datetime.date.today().strftime("%Y%m%d")
+    suffix = secrets.token_hex(3).upper()
+    return f"SMR-{today}-{suffix}"
+
+
+def resolve_customer_by_mobile(mobile, email=None, name=""):
+    """Find or silently create the customer User for a mobile number.
+
+    Used by guest checkout (DEC-004) and in-store sales (DEC-008). A newly
+    created account has an unusable password so the customer can log in
+    via OTP at any time. For an existing account, email is set only when
+    it has none and the address is not already taken; nothing else on an
+    existing user is ever changed. `name` is applied to new accounts only.
+    """
+    User = get_user_model()
+    mobile_normalized = mobile.strip()
+
+    user, created = User.objects.get_or_create(
+        mobile_number=mobile_normalized,
+        defaults={
+            "username": f"user_{mobile_normalized[-4:]}_{secrets.token_hex(3)}",
+            "role": "customer",
+            "is_staff": False,
+            "first_name": (name or "").strip()[:150],
+        },
+    )
+
+    if created:
+        user.set_unusable_password()
+        user.save(update_fields=["password"])
+        logger.info("Created customer user (pk=%s) for mobile %s", user.pk, mobile_normalized)
+
+    if email and not user.email:
+        email_taken = User.objects.filter(email=email).exclude(pk=user.pk).exists()
+        if not email_taken:
+            user.email = email
+            user.save(update_fields=["email"])
+
+    return user
 
 
 def allocate_discount(cart_items, order_discount_amount):
@@ -61,18 +111,23 @@ def allocate_discount(cart_items, order_discount_amount):
     return allocations
 
 
-def build_order_item_financials(cart_item, discount_allocated):
+def build_order_item_financials(cart_item, discount_allocated, include_shipping_surcharge=True):
     """Compute the immutable financial snapshot for one order line.
 
     tax_amount is always 0.00 — Django does not yet compute GST anywhere in
     this codebase. This is a known prerequisite gap (see CURRENT_STATE.md),
     not an assumption that tax is genuinely zero.
+
+    include_shipping_surcharge is False for in-store sales, which are never
+    shipped.
     """
     gross_line_amount = cart_item.line_total
     net_line_amount = gross_line_amount - discount_allocated
     tax_amount = Decimal("0.00")
     final_paid_line_amount = net_line_amount + tax_amount
-    shipping_surcharge = (cart_item.variant.shipping_surcharge or Decimal("0.00")) * cart_item.quantity
+    shipping_surcharge = Decimal("0.00")
+    if include_shipping_surcharge:
+        shipping_surcharge = (cart_item.variant.shipping_surcharge or Decimal("0.00")) * cart_item.quantity
 
     return {
         "gross_line_amount": gross_line_amount,
@@ -250,6 +305,128 @@ def cancel_order(order):
     return order
 
 
+class InStoreSaleError(Exception):
+    """Raised when an in-store sale request is invalid. Nothing is created."""
+
+
+@dataclass
+class _SaleLine:
+    """Cart-item-shaped line so allocate_discount() and
+    build_order_item_financials() can be reused unchanged."""
+
+    id: int
+    variant: object
+    quantity: int
+
+    @property
+    def unit_price(self):
+        return Decimal(str(self.variant.selling_price))
+
+    @property
+    def line_total(self):
+        return self.unit_price * self.quantity
+
+
+@transaction.atomic
+def create_in_store_order(
+    *,
+    customer_mobile,
+    lines,
+    payment_method,
+    staff_user,
+    customer_name="",
+    payment_reference="",
+    discount_amount=Decimal("0.00"),
+    warehouse=None,
+    notes="",
+):
+    """Record a walk-in (counter) sale as a delivered Order — DEC-008.
+
+    lines: iterable of (ProductVariant, quantity). Repeated variants are
+    merged. Unit price is always the variant's selling_price; an optional
+    order-level discount is spread across lines with allocate_discount().
+
+    Stock goes through the same ledger as online orders: each line is
+    reserved with reservation_service.reserve_for_order_item() (direct
+    bottles and FIFO decants) and immediately consumed, which writes the
+    sale/decant StockMovement rows linked to the OrderItem. The order is
+    then delivered at the moment of sale. There is no ShippingAddress and
+    no shipping charge.
+
+    Everything runs in one transaction: InStoreSaleError or
+    InsufficientStockError leaves no order, customer, reservation or stock
+    change behind.
+    """
+    from .models import Order, OrderItem
+
+    if payment_method not in Order.IN_STORE_PAYMENT_METHODS:
+        raise InStoreSaleError(
+            f"Invalid payment method {payment_method!r}; use one of "
+            f"{', '.join(Order.IN_STORE_PAYMENT_METHODS)}."
+        )
+    if not (customer_mobile or "").strip():
+        raise InStoreSaleError("Customer mobile number is required.")
+
+    merged = {}
+    for variant, quantity in lines:
+        if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity < 1:
+            raise InStoreSaleError(f"Quantity for {variant.sku} must be a whole number of at least 1.")
+        if not variant.is_active:
+            raise InStoreSaleError(f"Variant {variant.sku} is not active.")
+        if variant.pk in merged:
+            merged[variant.pk].quantity += quantity
+        else:
+            merged[variant.pk] = _SaleLine(id=len(merged) + 1, variant=variant, quantity=quantity)
+    sale_lines = list(merged.values())
+    if not sale_lines:
+        raise InStoreSaleError("At least one item is required.")
+
+    subtotal = sum((line.line_total for line in sale_lines), Decimal("0.00"))
+    discount_amount = Decimal(discount_amount or 0).quantize(Decimal("0.01"))
+    if discount_amount < 0 or discount_amount > subtotal:
+        raise InStoreSaleError(f"Discount must be between 0 and the subtotal ({subtotal}).")
+
+    if warehouse is None:
+        warehouse = Warehouse.objects.get(is_default=True)
+
+    customer = resolve_customer_by_mobile(customer_mobile, name=customer_name)
+
+    allocations = allocate_discount(sale_lines, discount_amount)
+    order = Order.objects.create(
+        user=customer,
+        order_number=generate_order_number(),
+        channel=Order.CHANNEL_IN_STORE,
+        created_by=staff_user,
+        subtotal=subtotal,
+        discount_amount=discount_amount,
+        total=subtotal - discount_amount,
+        payment_method=payment_method,
+        payment_reference=(payment_reference or "").strip(),
+        customer_notes=notes or "",
+    )
+
+    reservations = []
+    for line in sale_lines:
+        order_item = OrderItem.objects.create(
+            order=order,
+            variant=line.variant,
+            quantity=line.quantity,
+            unit_price=line.unit_price,
+            **build_order_item_financials(
+                line, allocations[line.id], include_shipping_surcharge=False
+            ),
+        )
+        reservations.append(reservation_service.reserve_for_order_item(order_item, warehouse))
+
+    for reservation in reservations:
+        reservation_service.consume_reservation(reservation, performed_by=staff_user)
+
+    order.status = Order.STATUS_DELIVERED
+    order.delivered_at = timezone.now()
+    order.save(update_fields=["status", "delivered_at", "updated_at"])
+    return order
+
+
 class ReturnEligibilityError(Exception):
     """Raised when a return request fails eligibility checks."""
 
@@ -268,6 +445,7 @@ def create_return(order, items, requested_by=None):
         reason_notes (str, optional).
 
     Enforces, for the order and for each item:
+      - Order.channel is not in_store (counter sales are handled in person)
       - Order.status == delivered
       - now <= Order.delivered_at + RETURN_WINDOW_DAYS
       - reason is one of ReturnItem.REASON_CHOICES — customer-preference
@@ -285,6 +463,10 @@ def create_return(order, items, requested_by=None):
 
     order = Order.objects.select_for_update().get(pk=order.pk)
 
+    if order.channel == Order.CHANNEL_IN_STORE:
+        raise ReturnEligibilityError(
+            "In-store purchases are handled at the counter, not through online returns."
+        )
     if order.status != Order.STATUS_DELIVERED:
         raise ReturnEligibilityError(
             f"Cannot request a return for an order in status={order.status}; it must be delivered."

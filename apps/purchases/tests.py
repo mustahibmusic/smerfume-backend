@@ -21,6 +21,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, transaction
+from django.db.models import Sum
 from django.test import RequestFactory, TestCase, TransactionTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
@@ -2500,3 +2501,214 @@ class IncomingPOGuardTests(_BookingBase):
             response,
             reverse("admin:inventory_stockreservationallocation_reallocate", args=[allocation.pk]),
         )
+
+
+class BookedIncomingConcurrencyTests(TransactionTestCase):
+    """P2C real concurrent transactions (threads, separate connections).
+    After both sides finish: no deadlock, quantity_reserved equals the
+    active physical allocations, and no active incoming allocation sits on
+    a closed or cancelled PO."""
+
+    setUp = GoodsReceiptConcurrencyTests.setUp
+    _receipt_with = GoodsReceiptConcurrencyTests._receipt_with
+    _retail = GoodsReceiptConcurrencyTests._retail
+    _checkout_item = GoodsReceiptReversalConcurrencyTests._checkout_item
+
+    DOMAIN_ERRORS = (
+        services.GoodsReceiptError,
+        services.PurchaseOrderError,
+        services.BookedQuantityError,
+        reservation_service.InsufficientStockError,
+        reservation_service.InvalidReservationStateError,
+    )
+
+    def _run_parallel(self, *calls):
+        results = [None] * len(calls)
+        barrier = threading.Barrier(len(calls))
+
+        def _run(index, call):
+            barrier.wait()
+            try:
+                call()
+                results[index] = "ok"
+            except self.DOMAIN_ERRORS as exc:
+                results[index] = type(exc).__name__
+            except Exception as exc:  # deadlock/serialization: must roll back fully
+                results[index] = f"db:{type(exc).__name__}: {exc}"
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=_run, args=(i, c)) for i, c in enumerate(calls)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertFalse([r for r in results if str(r).startswith("db:")], results)
+        return results
+
+    def _book(self, quantity, line=None):
+        line = line or self.po_line
+        PurchaseOrderLine.objects.filter(pk=line.pk).update(confirmed_booked_quantity=quantity)
+
+    def _checkout(self, *pairs, number):
+        order = Order.objects.create(
+            user=self.user, order_number=number, subtotal=Decimal("0"), total=Decimal("0"),
+        )
+        items = [
+            OrderItem.objects.create(
+                order=order, variant=variant, quantity=quantity, unit_price=Decimal("4500"),
+            )
+            for variant, quantity in pairs
+        ]
+        return lambda: reservation_service.reserve_order_items(
+            items, self.warehouse, allow_incoming=True,
+        )
+
+    def _active_incoming(self, **filters):
+        return StockReservationAllocation.objects.filter(
+            allocation_type=StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
+            incoming_status=StockReservationAllocation.INCOMING_ACTIVE, **filters,
+        )
+
+    def _assert_consistent(self):
+        for stock in InventoryStock.objects.filter(stock_type="retail"):
+            held = StockReservationAllocation.objects.filter(
+                inventory_stock=stock,
+                allocation_type=StockReservationAllocation.ALLOCATION_RETAIL_UNIT,
+                reservation__status__in=[StockReservation.STATUS_HELD, StockReservation.STATUS_CONFIRMED],
+            ).aggregate(total=Sum("units"))["total"] or Decimal("0")
+            self.assertEqual(stock.quantity_reserved, held)
+            self.assertGreaterEqual(stock.quantity, stock.quantity_reserved)
+        self.assertFalse(
+            self._active_incoming(
+                purchase_order_line__purchase_order__status__in=[
+                    PurchaseOrder.STATUS_CLOSED, PurchaseOrder.STATUS_CANCELLED,
+                ]
+            ).exists()
+        )
+
+    def test_checkout_vs_grn_on_same_line(self):
+        self._book(10)
+        receipt = self._receipt_with(3)
+        results = self._run_parallel(
+            self._checkout((self.variant, 2), number="P2C-CONC-1"),
+            lambda: services.post_goods_receipt(receipt, self.user),
+        )
+        self.assertEqual(results, ["ok", "ok"])
+        stock = self._retail()
+        self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("3"), Decimal("2")))
+        self.assertFalse(self._active_incoming().exists())
+        self._assert_consistent()
+
+    def test_two_checkouts_for_last_incoming_unit(self):
+        self._book(1)
+        results = self._run_parallel(
+            self._checkout((self.variant, 1), number="P2C-CONC-2A"),
+            self._checkout((self.variant, 1), number="P2C-CONC-2B"),
+        )
+        self.assertEqual(sorted(results), ["InsufficientStockError", "ok"])
+        self.assertEqual(self._active_incoming().count(), 1)
+        self._assert_consistent()
+
+    def test_checkout_vs_lowering_confirmed_quantity(self):
+        self._book(3)
+        results = self._run_parallel(
+            self._checkout((self.variant, 2), number="P2C-CONC-3"),
+            lambda: services.set_confirmed_booked_quantity(self.po_line, 1, self.user, "Vendor cut"),
+        )
+        self.assertEqual(results.count("ok"), 1, results)
+        self.po_line.refresh_from_db()
+        active = self._active_incoming().aggregate(total=Sum("units"))["total"] or 0
+        self.assertLessEqual(active, self.po_line.confirmed_booked_quantity)
+        self._assert_consistent()
+
+    def test_multi_item_checkout_vs_multi_line_grn(self):
+        other = _variant("SKU-P2C-CONC-B")
+        other_line = PurchaseOrderLine.objects.create(
+            purchase_order=self.po, variant=other, quantity_ordered=10, unit_price=Decimal("100"),
+        )
+        self._book(5)
+        self._book(5, other_line)
+        receipt = self._receipt_with(3)
+        GoodsReceiptLine.objects.create(
+            receipt=receipt, po_line=other_line, stock_type="retail", quantity=3,
+        )
+        results = self._run_parallel(
+            self._checkout((other, 2), (self.variant, 2), number="P2C-CONC-4"),
+            lambda: services.post_goods_receipt(receipt, self.user),
+        )
+        self.assertEqual(results, ["ok", "ok"])
+        for variant in (self.variant, other):
+            stock = InventoryStock.objects.get(variant=variant, stock_type="retail")
+            self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("3"), Decimal("2")))
+        self.assertFalse(self._active_incoming().exists())
+        self._assert_consistent()
+
+    def test_checkout_vs_close_purchase_order(self):
+        services.post_goods_receipt(self._receipt_with(1), self.user)
+        self._book(5)
+        results = self._run_parallel(
+            self._checkout((self.variant, 3), number="P2C-CONC-5"),
+            lambda: services.close_purchase_order(self.po, self.user, "Stop waiting"),
+        )
+        self.assertIn(
+            sorted(results),
+            (["PurchaseOrderError", "ok"], ["InsufficientStockError", "ok"]),
+        )
+        self._assert_consistent()
+
+    def test_checkout_vs_cancel_purchase_order(self):
+        self._book(5)
+        results = self._run_parallel(
+            self._checkout((self.variant, 2), number="P2C-CONC-6"),
+            lambda: services.cancel_purchase_order(self.po, self.user, "Vendor withdrew"),
+        )
+        self.assertIn(
+            sorted(results),
+            (["PurchaseOrderError", "ok"], ["InsufficientStockError", "ok"]),
+        )
+        self._assert_consistent()
+
+    def test_grn_conversion_vs_order_release(self):
+        self._book(5)
+        [reservation] = self._checkout((self.variant, 2), number="P2C-CONC-7")()
+        receipt = self._receipt_with(2)
+        results = self._run_parallel(
+            lambda: services.post_goods_receipt(receipt, self.user),
+            lambda: reservation_service.release_reservation(reservation),
+        )
+        self.assertEqual(results, ["ok", "ok"])
+        original = reservation.allocations.get(split_from__isnull=True, allocation_type="incoming_po_line")
+        self.assertIn(original.incoming_status, ("converted", "released"))
+        stock = self._retail()
+        self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("2"), Decimal("0")))
+        self.assertFalse(self._active_incoming().exists())
+        self._assert_consistent()
+
+    def test_grn_conversion_vs_reallocation(self):
+        self._book(5)
+        [reservation] = self._checkout((self.variant, 2), number="P2C-CONC-8")()
+        allocation = reservation.allocations.get()
+        other_po = PurchaseOrder.objects.create(
+            supplier=self.supplier, warehouse=self.warehouse, status=PurchaseOrder.STATUS_ISSUED,
+        )
+        other_line = PurchaseOrderLine.objects.create(
+            purchase_order=other_po, variant=self.variant, quantity_ordered=5,
+            unit_price=Decimal("100"), confirmed_booked_quantity=2,
+        )
+        receipt = self._receipt_with(2)
+        results = self._run_parallel(
+            lambda: services.post_goods_receipt(receipt, self.user),
+            lambda: reservation_service.reallocate_incoming_allocation(allocation, self.user),
+        )
+        self.assertEqual(results[0], "ok")
+        allocation.refresh_from_db()
+        stock = self._retail()
+        if allocation.incoming_status == "converted":
+            self.assertEqual(results[1], "InvalidReservationStateError")
+            self.assertEqual(stock.quantity_reserved, Decimal("2"))
+        else:
+            self.assertEqual((allocation.incoming_status, results[1]), ("reallocated", "ok"))
+            self.assertEqual(allocation.replacement.purchase_order_line, other_line)
+            self.assertEqual(stock.quantity_reserved, Decimal("0"))
+        self._assert_consistent()

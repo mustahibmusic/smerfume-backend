@@ -2181,3 +2181,234 @@ class BookingQueryCountTests(_BookingBase):
         self._add_lines(2)
         four_lines = self._count(lambda: self.client.get(url))
         self.assertEqual(one_line, four_lines)
+
+
+# --- P2C: booked incoming conversion ---
+
+
+class IncomingConversionTests(_BookingBase):
+    """GRN posting converts active incoming allocations into physical
+    retail_unit allocations on the same reservation (spec §5.5)."""
+
+    def setUp(self):
+        super().setUp()
+        self._book(10)
+
+    def _retail_stock(self):
+        return InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail"
+        )
+
+    def _physical_rows(self, reservation):
+        return list(
+            reservation.allocations.filter(
+                allocation_type=StockReservationAllocation.ALLOCATION_RETAIL_UNIT
+            ).order_by("pk")
+        )
+
+    def _active_incoming(self, reservation):
+        return list(
+            reservation.allocations.filter(
+                allocation_type=StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
+                incoming_status=StockReservationAllocation.INCOMING_ACTIVE,
+            ).order_by("pk")
+        )
+
+    def test_full_conversion(self):
+        allocation = self._incoming_allocation(4)
+        _, lines = self._receive(retail=4)
+        allocation.refresh_from_db()
+        physical = self._physical_rows(allocation.reservation)
+        self.assertEqual(allocation.incoming_status, "converted")
+        self.assertEqual(allocation.converted_by_receipt_line, lines["retail"])
+        self.assertEqual(allocation.replacement, physical[0])
+        self.assertIsNotNone(allocation.incoming_resolved_at)
+        self.assertEqual(allocation.units, Decimal("4"))
+        self.assertEqual(physical[0].units, Decimal("4"))
+        self.assertEqual(physical[0].inventory_stock, self._retail_stock())
+        self.assertEqual(self._active_incoming(allocation.reservation), [])
+        stock = self._retail_stock()
+        self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("4"), Decimal("4")))
+
+    def test_partial_conversion_splits_remainder(self):
+        allocation = self._incoming_allocation(4)
+        self._receive(retail=3)
+        allocation.refresh_from_db()
+        [physical] = self._physical_rows(allocation.reservation)
+        [remainder] = self._active_incoming(allocation.reservation)
+        self.assertEqual(allocation.incoming_status, "converted")
+        self.assertEqual(allocation.units, Decimal("4"))
+        self.assertEqual(allocation.replacement, physical)
+        self.assertEqual(physical.units, Decimal("3"))
+        self.assertEqual(remainder.units, Decimal("1"))
+        self.assertEqual(remainder.split_from, allocation)
+        self.assertEqual(remainder.purchase_order_line, self.po_line)
+        self.assertEqual(selectors.active_incoming_allocated_quantities([self.po_line.pk]).get(self.po_line.pk), Decimal("1"))
+        self.assertEqual(self._retail_stock().quantity_reserved, Decimal("3"))
+
+    def test_surplus_stays_free_stock(self):
+        allocation = self._incoming_allocation(2)
+        self._receive(retail=5)
+        allocation.refresh_from_db()
+        self.assertEqual(allocation.incoming_status, "converted")
+        stock = self._retail_stock()
+        self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("5"), Decimal("2")))
+        self.assertEqual(stock.available, Decimal("3"))
+
+    def test_damaged_receipt_never_converts(self):
+        allocation = self._incoming_allocation(3)
+        self._receive(damaged=3)
+        allocation.refresh_from_db()
+        self.assertEqual(allocation.incoming_status, "active")
+        damaged = InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type="damaged"
+        )
+        self.assertEqual(damaged.quantity_reserved, Decimal("0"))
+        self.assertFalse(
+            InventoryStock.objects.filter(
+                variant=self.variant, warehouse=self.warehouse, stock_type="retail",
+                quantity_reserved__gt=0,
+            ).exists()
+        )
+
+    def test_mixed_retail_and_damaged_converts_retail_only(self):
+        allocation = self._incoming_allocation(3)
+        self._receive(retail=2, damaged=2)
+        allocation.refresh_from_db()
+        [physical] = self._physical_rows(allocation.reservation)
+        [remainder] = self._active_incoming(allocation.reservation)
+        self.assertEqual((physical.units, remainder.units), (Decimal("2"), Decimal("1")))
+        self.assertEqual(self._retail_stock().quantity_reserved, Decimal("2"))
+
+    def test_fifo_across_reservations(self):
+        first = self._incoming_allocation(2, number="BK-1")
+        second = self._incoming_allocation(2, number="BK-2")
+        self._receive(retail=3)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.incoming_status, "converted")
+        self.assertEqual(first.replacement.units, Decimal("2"))
+        self.assertEqual(second.incoming_status, "converted")
+        self.assertEqual(second.replacement.units, Decimal("1"))
+        [remainder] = self._active_incoming(second.reservation)
+        self.assertEqual((remainder.units, remainder.split_from), (Decimal("1"), second))
+
+    def test_two_retail_lines_for_one_po_line_chain_the_split(self):
+        allocation = self._incoming_allocation(4)
+        receipt = self._receipt()
+        line_a = self._grn_line(receipt, 1)
+        line_b = self._grn_line(receipt, 2)
+        self._post(receipt)
+        allocation.refresh_from_db()
+        self.assertEqual(allocation.converted_by_receipt_line, line_a)
+        self.assertEqual(allocation.replacement.units, Decimal("1"))
+        middle = allocation.split_remainders.get()
+        self.assertEqual(middle.incoming_status, "converted")
+        self.assertEqual(middle.converted_by_receipt_line, line_b)
+        self.assertEqual(middle.replacement.units, Decimal("2"))
+        [last] = self._active_incoming(allocation.reservation)
+        self.assertEqual((last.units, last.split_from), (Decimal("1"), middle))
+        self.assertEqual(self._retail_stock().quantity_reserved, Decimal("3"))
+
+    def test_repeated_partial_receipts_chain_split_from(self):
+        allocation = self._incoming_allocation(4)
+        self._receive(retail=1)
+        self._receive(retail=2)
+        [last] = self._active_incoming(allocation.reservation)
+        chain, row = [], last
+        while row is not None:
+            chain.append(row.units)
+            row = row.split_from
+        self.assertEqual(chain, [Decimal("1"), Decimal("3"), Decimal("4")])
+        self.assertEqual(
+            sum(r.units for r in self._physical_rows(allocation.reservation)), Decimal("3")
+        )
+
+    @override_settings(BOOKED_INCOMING_SALES_ENABLED=True)
+    def test_no_double_count_after_conversion(self):
+        self._incoming_allocation(6)
+        self._receive(retail=4)
+        self.assertEqual(selectors.active_incoming_allocated_quantities([self.po_line.pk]).get(self.po_line.pk), Decimal("2"))
+        self.assertEqual(selectors.incoming_sellable(self.po_line), Decimal("4"))
+        self.assertEqual(
+            selectors.sellable_quantity(self.variant, self.warehouse), Decimal("4")
+        )
+
+    def test_released_allocations_are_ignored(self):
+        released = self._incoming_allocation(2, status="released")
+        self._receive(retail=2)
+        released.refresh_from_db()
+        self.assertEqual(released.incoming_status, "released")
+        self.assertEqual(self._retail_stock().quantity_reserved, Decimal("0"))
+
+    def test_other_po_line_allocations_untouched(self):
+        other_line = self._line(self.po, variant=_variant("SKU-P2C-OTHER"), quantity_ordered=5)
+        self._book(5, other_line)
+        other = self._incoming_allocation(2, line=other_line, number="BK-OTHER")
+        self._receive(retail=3)
+        other.refresh_from_db()
+        self.assertEqual(other.incoming_status, "active")
+
+    def test_invariant_failure_rolls_back_whole_receipt(self):
+        allocation = self._incoming_allocation(3)
+        InventoryStock.objects.create(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail",
+            quantity=Decimal("0"), quantity_reserved=Decimal("2"),
+        )
+        receipt = self._receipt()
+        self._grn_line(receipt, 3)
+        with self.assertRaises(services.GoodsReceiptError):
+            self._post(receipt)
+        receipt.refresh_from_db()
+        allocation.refresh_from_db()
+        stock = self._retail_stock()
+        self.assertEqual(receipt.status, GoodsReceipt.STATUS_DRAFT)
+        self.assertEqual(allocation.incoming_status, "active")
+        self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("0"), Decimal("2")))
+        self.assertEqual(StockMovement.objects.count(), 0)
+        self.assertEqual(StockReservationAllocation.objects.count(), 1)
+
+    def test_inactive_reservation_with_active_incoming_is_refused(self):
+        allocation = self._incoming_allocation(2)
+        StockReservation.objects.filter(pk=allocation.reservation_id).update(
+            status=StockReservation.STATUS_CONSUMED
+        )
+        receipt = self._receipt()
+        self._grn_line(receipt, 2)
+        with self.assertRaises(services.GoodsReceiptError):
+            self._post(receipt)
+        receipt.refresh_from_db()
+        self.assertEqual(receipt.status, GoodsReceipt.STATUS_DRAFT)
+
+    def test_consume_after_full_conversion(self):
+        allocation = self._incoming_allocation(3)
+        self._receive(retail=3)
+        reservation_service.consume_reservation(allocation.reservation, performed_by=self.user)
+        stock = self._retail_stock()
+        self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("0"), Decimal("0")))
+
+    def test_consume_refused_after_partial_conversion(self):
+        allocation = self._incoming_allocation(3)
+        self._receive(retail=2)
+        with self.assertRaises(reservation_service.InvalidReservationStateError):
+            reservation_service.consume_reservation(allocation.reservation)
+
+    def test_reversal_cannot_unconvert(self):
+        allocation = self._incoming_allocation(3)
+        receipt, lines = self._receive(retail=3)
+        with self.assertRaises(services.GoodsReceiptError):
+            services.reverse_goods_receipt(receipt, self.user, "Wrong count", {lines["retail"].pk: 1})
+        allocation.refresh_from_db()
+        self.assertEqual(allocation.incoming_status, "converted")
+        stock = self._retail_stock()
+        self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("3"), Decimal("3")))
+
+    def test_reversal_of_surplus_keeps_conversion(self):
+        allocation = self._incoming_allocation(2)
+        receipt, lines = self._receive(retail=5)
+        services.reverse_goods_receipt(receipt, self.user, "Wrong count", {lines["retail"].pk: 3})
+        allocation.refresh_from_db()
+        self.assertEqual(allocation.incoming_status, "converted")
+        self.assertEqual(allocation.converted_by_receipt_line, lines["retail"])
+        stock = self._retail_stock()
+        self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("2"), Decimal("2")))

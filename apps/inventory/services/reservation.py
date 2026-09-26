@@ -149,6 +149,140 @@ def _incoming_capacity(variant_ids, warehouse):
     return capacity
 
 
+_ACTIVE_RESERVATION_STATUSES = (
+    inv_models.StockReservation.STATUS_HELD,
+    inv_models.StockReservation.STATUS_CONFIRMED,
+)
+
+
+def _active_incoming_rows():
+    Allocation = inv_models.StockReservationAllocation
+    return Allocation.objects.filter(
+        allocation_type=Allocation.ALLOCATION_INCOMING_PO_LINE,
+        incoming_status=Allocation.INCOMING_ACTIVE,
+    )
+
+
+def _lock_reservations(reservation_ids):
+    """{id: StockReservation} locked by id; each must still be held or
+    confirmed (an active incoming row on a finished reservation is corrupt)."""
+    reservations = {
+        reservation.pk: reservation
+        for reservation in inv_models.StockReservation.objects.select_for_update()
+        .filter(pk__in=sorted(set(reservation_ids)))
+        .order_by("pk")
+    }
+    for reservation in reservations.values():
+        if reservation.status not in _ACTIVE_RESERVATION_STATUSES:
+            raise InvalidReservationStateError(
+                f"Reservation {reservation.pk} is {reservation.status} but still has active "
+                "incoming allocations."
+            )
+    return reservations
+
+
+def _split_remainder(allocation, units, purchase_order_line_id=None):
+    """New active incoming row carrying `units` of `allocation`, with
+    split_from lineage (spec §5.5.1). It may sit on another PO line
+    (multi-source reallocation)."""
+    Allocation = inv_models.StockReservationAllocation
+    return Allocation.objects.create(
+        reservation=allocation.reservation,
+        allocation_type=Allocation.ALLOCATION_INCOMING_PO_LINE,
+        purchase_order_line_id=purchase_order_line_id or allocation.purchase_order_line_id,
+        units=units,
+        incoming_status=Allocation.INCOMING_ACTIVE,
+        split_from=allocation,
+    )
+
+
+def _physical_replacement(reservation, stock, units):
+    stock.quantity_reserved += units
+    return inv_models.StockReservationAllocation.objects.create(
+        reservation=reservation,
+        allocation_type=inv_models.StockReservationAllocation.ALLOCATION_RETAIL_UNIT,
+        inventory_stock=stock,
+        units=units,
+    )
+
+
+def _check_reserved_fits(stock):
+    if stock.quantity_reserved > stock.quantity:
+        raise InsufficientStockError(
+            f"{stock.variant} at {stock.warehouse}: reserving {stock.quantity_reserved} "
+            f"would exceed the {stock.quantity} unit(s) in stock."
+        )
+
+
+def lock_active_incoming_for_lines(po_line_ids):
+    """GRN conversion, lock phase (spec §5.5, §8). The caller already holds
+    the PurchaseOrderLine locks, so no new active row can appear on these
+    lines. Locks the owning reservations by id, then the active incoming
+    allocations by id, before any stock row is locked.
+
+    Returns the allocations in conversion (FIFO) order: reservation
+    created_at, reservation id, allocation id."""
+    po_line_ids = list(po_line_ids)
+    if not po_line_ids:
+        return []
+    rows = _active_incoming_rows().filter(purchase_order_line_id__in=po_line_ids)
+    reservations = _lock_reservations(rows.values_list("reservation_id", flat=True))
+    allocations = list(
+        rows.filter(reservation_id__in=list(reservations)).select_for_update().order_by("pk")
+    )
+    for allocation in allocations:
+        allocation.reservation = reservations[allocation.reservation_id]
+    allocations.sort(
+        key=lambda a: (a.reservation.created_at, a.reservation_id, a.pk)
+    )
+    return allocations
+
+
+def convert_incoming_allocations(allocations, receipt_lines, warehouse):
+    """GRN conversion, convert phase. `allocations` come from
+    lock_active_incoming_for_lines; `receipt_lines` are the posted retail
+    GoodsReceiptLines, whose units are already in stock.
+
+    Per receipt line (pk order), up to its quantity, each allocation in
+    FIFO order becomes a retail_unit row on the same reservation. A part
+    conversion leaves an active remainder (split_from = original) that a
+    later line may convert. Surplus stays free stock. Raises
+    InsufficientStockError if quantity_reserved would exceed quantity; the
+    caller's transaction then rolls back."""
+    Allocation = inv_models.StockReservationAllocation
+    queues = {}
+    for allocation in allocations:
+        queues.setdefault(allocation.purchase_order_line_id, []).append(allocation)
+    stocks = {}
+    now = timezone.now()
+    for line in sorted(receipt_lines, key=lambda line: line.pk):
+        queue = queues.get(line.po_line_id)
+        if not queue:
+            continue
+        stock = stocks.get(line.variant_id)
+        if stock is None:
+            stock = stocks[line.variant_id] = _lock_retail_stock(line.variant_id, warehouse)
+        budget = Decimal(line.quantity)
+        while budget > 0 and queue:
+            allocation = queue.pop(0)
+            take = min(allocation.units, budget)
+            physical = _physical_replacement(allocation.reservation, stock, take)
+            if take < allocation.units:
+                queue.insert(0, _split_remainder(allocation, allocation.units - take))
+            allocation.incoming_status = Allocation.INCOMING_CONVERTED
+            allocation.converted_by_receipt_line = line
+            allocation.replacement = physical
+            allocation.incoming_resolved_at = now
+            allocation.save(update_fields=[
+                "incoming_status", "converted_by_receipt_line", "replacement",
+                "incoming_resolved_at", "updated_at",
+            ])
+            budget -= take
+    for stock in stocks.values():
+        _check_reserved_fits(stock)
+        stock.save(update_fields=["quantity_reserved", "updated_at"])
+
+
 @transaction.atomic
 def reserve_for_order_item(order_item, warehouse):
     """Reserve physical inventory for one OrderItem (in-store sales). Returns

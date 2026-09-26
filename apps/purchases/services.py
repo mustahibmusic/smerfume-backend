@@ -16,6 +16,8 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
 
+from apps.inventory.models import InventoryStock
+from apps.inventory.services import reservation as reservation_service
 from apps.inventory.services.receipt import (
     PurchaseReversalStockError,
     receive_purchased_stock,
@@ -304,6 +306,17 @@ def post_goods_receipt(receipt, user):
         line.updated_at = now
     GoodsReceiptLine.objects.bulk_update(lines, ["variant", "unit_cost", "tax_rate", "updated_at"])
 
+    # Booked incoming conversion (spec §5.5). Reservations and allocations
+    # are locked before receive_purchased_stock locks stock (global lock
+    # order). Damaged units never convert.
+    retail_lines = [line for line in lines if line.stock_type == InventoryStock.STOCK_TYPE_RETAIL]
+    try:
+        incoming = reservation_service.lock_active_incoming_for_lines(
+            sorted({line.po_line_id for line in retail_lines})
+        )
+    except reservation_service.InvalidReservationStateError as exc:
+        raise GoodsReceiptError(str(exc)) from exc
+
     stock_transaction = receive_purchased_stock(
         warehouse=receipt.warehouse,
         supplier=receipt.supplier,
@@ -311,6 +324,10 @@ def post_goods_receipt(receipt, user):
         performed_by=user,
         notes=f"Goods receipt {receipt.grn_number} for {po.po_number}",
     )
+    try:
+        reservation_service.convert_incoming_allocations(incoming, retail_lines, receipt.warehouse)
+    except reservation_service.InsufficientStockError as exc:
+        raise GoodsReceiptError(str(exc)) from exc
 
     receipt.status = GoodsReceipt.STATUS_POSTED
     receipt.stock_transaction = stock_transaction

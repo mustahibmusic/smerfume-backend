@@ -1,14 +1,11 @@
 """
-Read-only purchase queries. Received quantities are always derived from
-POSTED STANDARD goods receipt lines, never stored. A short (missing) unit
-is never on a receipt line, so it never counts as received; damaged units
-that physically arrived do.
-
-Reversal receipts are not posted yet. When they are, received_quantity
-must subtract posted reversal lines.
+Read-only purchase queries. Received quantities are always derived, never
+stored: POSTED STANDARD goods receipt lines minus POSTED REVERSAL lines. A
+short (missing) unit is never on a receipt line, so it never counts as
+received; damaged units that physically arrived do.
 """
 
-from django.db.models import Sum
+from django.db.models import Case, F, IntegerField, Sum, When
 
 from .models import GoodsReceipt, GoodsReceiptLine, PurchaseOrder, ReceiptDiscrepancy
 
@@ -21,15 +18,50 @@ def _posted_standard_lines():
 
 
 def received_quantities(po_line_ids):
-    """{po_line_id: physically received units} for many PO lines in one
-    query. Lines with nothing received are omitted."""
+    """{po_line_id: net physically received units} for many PO lines in
+    one query. Lines with nothing received are omitted."""
+    signed = Case(
+        When(receipt__receipt_type=GoodsReceipt.TYPE_REVERSAL, then=-F("quantity")),
+        default=F("quantity"),
+        output_field=IntegerField(),
+    )
     rows = (
-        _posted_standard_lines()
-        .filter(po_line_id__in=list(po_line_ids))
+        GoodsReceiptLine.objects.filter(
+            receipt__status=GoodsReceipt.STATUS_POSTED,
+            receipt__receipt_type__in=(GoodsReceipt.TYPE_STANDARD, GoodsReceipt.TYPE_REVERSAL),
+            po_line_id__in=list(po_line_ids),
+        )
         .values("po_line_id")
+        .annotate(total=Sum(signed))
+    )
+    return {row["po_line_id"]: row["total"] for row in rows if row["total"]}
+
+
+def reversed_quantities(line_ids):
+    """{original_line_id: units already reversed by posted reversals}."""
+    rows = (
+        GoodsReceiptLine.objects.filter(
+            receipt__status=GoodsReceipt.STATUS_POSTED,
+            receipt__receipt_type=GoodsReceipt.TYPE_REVERSAL,
+            reverses_line_id__in=list(line_ids),
+        )
+        .values("reverses_line_id")
         .annotate(total=Sum("quantity"))
     )
-    return {row["po_line_id"]: row["total"] for row in rows}
+    return {row["reverses_line_id"]: row["total"] for row in rows}
+
+
+def reversible_quantities(receipt):
+    """{original_line_id: units still reversible} for a posted standard
+    receipt; empty for any other receipt."""
+    if (
+        receipt.status != GoodsReceipt.STATUS_POSTED
+        or receipt.receipt_type != GoodsReceipt.TYPE_STANDARD
+    ):
+        return {}
+    lines = list(receipt.lines.all())
+    reversed_ = reversed_quantities(line.pk for line in lines)
+    return {line.pk: line.quantity - reversed_.get(line.pk, 0) for line in lines}
 
 
 def received_quantity(po_line):

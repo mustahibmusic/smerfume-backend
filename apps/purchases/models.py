@@ -50,6 +50,13 @@ class PurchaseOrder(BaseModel):
         STATUS_ISSUED: {STATUS_CANCELLED, STATUS_PARTIALLY_RECEIVED, STATUS_RECEIVED},
         STATUS_PARTIALLY_RECEIVED: {STATUS_RECEIVED, STATUS_CLOSED},
     }
+    # Backward moves caused by a goods receipt reversal. Used only by
+    # services.refresh_po_receipt_status(); never offered to staff and not
+    # part of can_transition_to(). A closed PO is never reopened.
+    RECALCULATION_TRANSITIONS = {
+        STATUS_RECEIVED: {STATUS_PARTIALLY_RECEIVED, STATUS_ISSUED},
+        STATUS_PARTIALLY_RECEIVED: {STATUS_ISSUED},
+    }
     RECEIVABLE_STATUSES = (STATUS_ISSUED, STATUS_PARTIALLY_RECEIVED)
 
     # Header fields staff may edit in each status. Lines are editable only
@@ -283,8 +290,9 @@ class GoodsReceipt(BaseModel):
 
     Posting a receipt is the only normal procurement path that increases
     inventory (apps.purchases.services.post_goods_receipt). A receipt is not
-    a vendor bill. Posted receipts are immutable; corrections will be linked
-    reversal receipts."""
+    a vendor bill. Posted receipts are immutable; corrections are linked
+    reversal receipts (services.reverse_goods_receipt), then a new standard
+    receipt with the right values."""
 
     TYPE_STANDARD = "standard"
     TYPE_OPENING = "opening"
@@ -330,10 +338,11 @@ class GoodsReceipt(BaseModel):
     purchase_order = models.ForeignKey(
         PurchaseOrder, on_delete=models.PROTECT, null=True, blank=True, related_name="receipts"
     )
-    # Reserved for reversal receipts (not created yet).
+    # The posted standard receipt a reversal receipt corrects.
     reverses = models.ForeignKey(
         "self", on_delete=models.PROTECT, null=True, blank=True, related_name="reversals"
     )
+    reversal_reason = models.TextField(blank=True)
     received_date = models.DateField(default=timezone.localdate)
     vendor_document_reference = models.CharField(
         max_length=100, blank=True,
@@ -364,6 +373,7 @@ class GoodsReceipt(BaseModel):
         permissions = [
             ("post_goodsreceipt", "Can post goods receipt"),
             ("cancel_goodsreceipt", "Can cancel goods receipt"),
+            ("reverse_goodsreceipt", "Can reverse goods receipt"),
         ]
         constraints = [
             models.CheckConstraint(
@@ -378,6 +388,14 @@ class GoodsReceipt(BaseModel):
             models.CheckConstraint(
                 condition=~Q(receipt_type="reversal") | Q(reverses__isnull=False),
                 name="grn_reversal_has_original",
+            ),
+            models.CheckConstraint(
+                condition=Q(receipt_type="reversal") | Q(reverses__isnull=True),
+                name="grn_reverses_only_on_reversal",
+            ),
+            models.CheckConstraint(
+                condition=~Q(receipt_type="reversal", status="posted") | ~Q(reversal_reason=""),
+                name="grn_reversal_has_reason",
             ),
             models.CheckConstraint(
                 condition=~Q(status="posted")
@@ -432,7 +450,7 @@ class GoodsReceiptLine(BaseModel):
         max_digits=5, decimal_places=2, null=True, blank=True,
         validators=[MinValueValidator(0), MaxValueValidator(100)],
     )
-    # Reserved for reversal receipts (not created yet).
+    # On a reversal receipt: the original posted line this line reverses.
     reverses_line = models.ForeignKey(
         "self", on_delete=models.PROTECT, null=True, blank=True, related_name="reversal_lines"
     )
@@ -471,7 +489,8 @@ class GoodsReceiptLine(BaseModel):
         self.apply_po_line_snapshot()
 
     def save(self, *args, **kwargs):
-        if self.receipt.is_draft:
+        # Reversal lines keep the values copied from the original line.
+        if self.receipt.is_draft and self.receipt.receipt_type == GoodsReceipt.TYPE_STANDARD:
             self.apply_po_line_snapshot()
         super().save(*args, **kwargs)
 

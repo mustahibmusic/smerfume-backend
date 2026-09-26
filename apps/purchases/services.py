@@ -5,7 +5,8 @@ its rows, checks the move and stamps who/when.
 
 Lock order, always: PurchaseOrder -> GoodsReceipt -> ReceiptDiscrepancy
 -> PurchaseOrderLine (by id) -> InventoryStock (by variant, stock type).
-Only posting a goods receipt changes inventory; discrepancies never do.
+Only posting a goods receipt (or its reversal) changes inventory;
+discrepancies never do.
 """
 
 from collections import defaultdict
@@ -14,7 +15,11 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
 
-from apps.inventory.services.receipt import receive_purchased_stock
+from apps.inventory.services.receipt import (
+    PurchaseReversalStockError,
+    receive_purchased_stock,
+    reverse_purchased_stock,
+)
 
 from . import selectors
 from .models import (
@@ -117,10 +122,11 @@ class GoodsReceiptAlreadyPosted(GoodsReceiptError):
 
 
 def refresh_po_receipt_status(po):
-    """Set issued / partially_received / received from posted receipts.
-    The caller must hold the PO lock. Closed and cancelled POs are left
-    alone. A missing (short) unit never counts as received."""
-    if po.status not in PurchaseOrder.RECEIVABLE_STATUSES:
+    """Set issued / partially_received / received from posted receipts
+    (net of reversals). The caller must hold the PO lock. Closed and
+    cancelled POs are left alone; a closed PO is never reopened. A missing
+    (short) unit never counts as received."""
+    if po.status not in (*PurchaseOrder.RECEIVABLE_STATUSES, PurchaseOrder.STATUS_RECEIVED):
         return po
     lines = list(po.lines.all())
     received = selectors.received_quantities(line.pk for line in lines)
@@ -132,7 +138,9 @@ def refresh_po_receipt_status(po):
     else:
         new_status = PurchaseOrder.STATUS_ISSUED
     if new_status != po.status:
-        _check_transition(po, new_status)
+        # Backward moves after a reversal are allowed only here.
+        if new_status not in PurchaseOrder.RECALCULATION_TRANSITIONS.get(po.status, set()):
+            _check_transition(po, new_status)
         po.status = new_status
         po.save(update_fields=["status", "updated_at"])
     return po
@@ -364,6 +372,116 @@ def close_purchase_order(po, user, reason):
     po.close_reason = reason
     po.save(update_fields=["status", "closed_by", "closed_at", "close_reason", "updated_at"])
     return po
+
+
+# --- Goods receipt reversals ---
+
+
+@transaction.atomic
+def reverse_goods_receipt(receipt, user, reason, quantities):
+    """Correct a posted standard receipt: create an already-posted
+    reversal receipt that removes the given units from stock.
+
+    `quantities` is {original_line_id: units to reverse}. Variant, stock
+    type, cost and tax are copied from the original lines, never taken from
+    input. The original receipt and its movements are never changed.
+    Several partial reversals are allowed; together they can never exceed
+    what the original line received. Only available stock can be removed;
+    customer reservations are never touched. A closed PO stays closed."""
+    reason = (reason or "").strip()
+    if not reason:
+        raise GoodsReceiptError("A reversal reason is required.")
+    po_id = GoodsReceipt.objects.values_list("purchase_order_id", flat=True).get(pk=receipt.pk)
+    if po_id is None:
+        raise GoodsReceiptError("Only purchase order receipts can be reversed.")
+    po = PurchaseOrder.objects.select_for_update().get(pk=po_id)
+    original = GoodsReceipt.objects.select_for_update().get(pk=receipt.pk)
+    if (
+        original.status != GoodsReceipt.STATUS_POSTED
+        or original.receipt_type != GoodsReceipt.TYPE_STANDARD
+    ):
+        raise GoodsReceiptError(
+            f"{original.grn_number}: only a posted standard goods receipt can be reversed."
+        )
+
+    wanted = {}
+    for line_id, quantity in (quantities or {}).items():
+        quantity = int(quantity or 0)
+        if quantity < 0:
+            raise GoodsReceiptError("Reversal quantities cannot be negative.")
+        if quantity:
+            wanted[int(line_id)] = quantity
+    if not wanted:
+        raise GoodsReceiptError("Enter a quantity to reverse on at least one line.")
+
+    # The original receipt lock serialises reversals of the same receipt,
+    # so the cumulative check below cannot race.
+    lines = {line.pk: line for line in original.lines.order_by("pk")}
+    unknown = set(wanted) - set(lines)
+    if unknown:
+        raise GoodsReceiptError(f"Lines do not belong to {original.grn_number}.")
+    list(
+        PurchaseOrderLine.objects.select_for_update()
+        .filter(pk__in=sorted({lines[pk].po_line_id for pk in wanted}))
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
+
+    already = selectors.reversed_quantities(wanted)
+    problems = []
+    for line_id, quantity in wanted.items():
+        line = lines[line_id]
+        remaining = line.quantity - already.get(line_id, 0)
+        if quantity > remaining:
+            problems.append(
+                f"{line.variant.sku} [{line.stock_type}]: received {line.quantity}, "
+                f"already reversed {already.get(line_id, 0)}, cannot reverse {quantity} more."
+            )
+    if problems:
+        raise GoodsReceiptError(" ".join(problems))
+
+    reversal = GoodsReceipt.objects.create(
+        receipt_type=GoodsReceipt.TYPE_REVERSAL,
+        supplier_id=original.supplier_id,
+        warehouse_id=original.warehouse_id,
+        purchase_order=po,
+        reverses=original,
+        reversal_reason=reason,
+        created_by=user,
+    )
+    reversal_lines = GoodsReceiptLine.objects.bulk_create([
+        GoodsReceiptLine(
+            receipt=reversal,
+            po_line_id=lines[line_id].po_line_id,
+            variant_id=lines[line_id].variant_id,
+            stock_type=lines[line_id].stock_type,
+            quantity=quantity,
+            unit_cost=lines[line_id].unit_cost,
+            tax_rate=lines[line_id].tax_rate,
+            reverses_line=lines[line_id],
+        )
+        for line_id, quantity in sorted(wanted.items())
+    ])
+
+    try:
+        stock_transaction = reverse_purchased_stock(
+            warehouse=original.warehouse,
+            supplier=original.supplier,
+            lines=reversal_lines,
+            performed_by=user,
+            notes=f"Reversal {reversal.grn_number} of {original.grn_number} for {po.po_number}: {reason}",
+        )
+    except PurchaseReversalStockError as exc:
+        raise GoodsReceiptError(str(exc)) from exc
+
+    reversal.status = GoodsReceipt.STATUS_POSTED
+    reversal.stock_transaction = stock_transaction
+    reversal.posted_by = user
+    reversal.posted_at = timezone.now()
+    reversal.save(update_fields=["status", "stock_transaction", "posted_by", "posted_at", "updated_at"])
+
+    refresh_po_receipt_status(po)
+    return reversal
 
 
 # --- Receipt discrepancies ---

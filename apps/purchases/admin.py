@@ -97,6 +97,36 @@ class ClosePurchaseOrderForm(forms.Form):
     reason = forms.CharField(widget=UnfoldAdminTextareaWidget, label="Reason for closing")
 
 
+class ReverseGoodsReceiptForm(forms.Form):
+    """One quantity field per reversible line plus a required reason."""
+
+    def __init__(self, *args, lines=(), reversible=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        reversible = reversible or {}
+        for line in lines:
+            remaining = reversible.get(line.pk, 0)
+            if remaining <= 0:
+                continue
+            self.fields[f"line_{line.pk}"] = forms.IntegerField(
+                required=False, min_value=0, max_value=remaining,
+                label=(
+                    f"{line.variant.sku} [{line.get_stock_type_display().lower()}]: "
+                    f"received {line.quantity}, reversible {remaining}"
+                ),
+                widget=UnfoldAdminTextInputWidget,
+            )
+        self.fields["reason"] = forms.CharField(
+            widget=UnfoldAdminTextareaWidget, label="Reason for reversal"
+        )
+
+    def quantities(self):
+        return {
+            int(name.removeprefix("line_")): value
+            for name, value in self.cleaned_data.items()
+            if name.startswith("line_") and value
+        }
+
+
 class ResolveDiscrepancyForm(forms.Form):
     resolution = forms.ChoiceField(
         choices=ReceiptDiscrepancy.RESOLUTION_CHOICES, widget=UnfoldAdminSelectWidget
@@ -378,6 +408,7 @@ GRN_AUDIT_FIELDS = (
     "created_by", "created_at", "posted_by", "posted_at",
     "cancelled_by", "cancelled_at", "cancel_reason",
 )
+GRN_REVERSAL_FIELDS = ("reverses_link", "reversal_reason", "reversal_links")
 
 
 class GoodsReceiptLineInline(TabularInline):
@@ -513,7 +544,7 @@ class GoodsReceiptAdmin(ModelAdmin):
         "supplier__vendor_code", "vendor_document_reference", "lines__variant__sku",
     )
     list_select_related = ("supplier", "warehouse", "purchase_order")
-    actions_detail = ["post_grn", "cancel_grn"]
+    actions_detail = ["post_grn", "reverse_grn", "cancel_grn"]
     EDITABLE_DRAFT_FIELDS = ("received_date", "vendor_document_reference", "notes")
     fieldsets = (
         ("Goods receipt", {"fields": (
@@ -522,6 +553,7 @@ class GoodsReceiptAdmin(ModelAdmin):
         ("Delivery", {"fields": ("received_date", "vendor_document_reference", "notes")}),
         ("Purchase order lines", {"fields": ("po_summary",)}),
         ("Stock", {"fields": ("stock_transaction",)}),
+        ("Reversal", {"fields": GRN_REVERSAL_FIELDS}),
         ("Audit", {"fields": GRN_AUDIT_FIELDS, "classes": ("collapse",)}),
     )
 
@@ -540,7 +572,7 @@ class GoodsReceiptAdmin(ModelAdmin):
     def get_readonly_fields(self, request, obj=None):
         fields = (
             "number", "receipt_type", "status", "purchase_order", "supplier", "warehouse",
-            "po_summary", "stock_transaction", *GRN_AUDIT_FIELDS,
+            "po_summary", "stock_transaction", *GRN_REVERSAL_FIELDS, *GRN_AUDIT_FIELDS,
         )
         if obj is not None and obj.is_draft:
             return fields
@@ -610,6 +642,24 @@ class GoodsReceiptAdmin(ModelAdmin):
             rows,
         )
 
+    @admin.display(description="Reverses")
+    def reverses_link(self, obj):
+        if not obj.reverses_id:
+            return "-"
+        return format_html('<a href="{}">{}</a>', self._change_url(obj.reverses), obj.reverses.grn_number)
+
+    @admin.display(description="Reversed by")
+    def reversal_links(self, obj):
+        if not obj.pk:
+            return "-"
+        reversals = list(obj.reversals.filter(status=GoodsReceipt.STATUS_POSTED).order_by("pk"))
+        if not reversals:
+            return "-"
+        return format_html_join(
+            ", ", '<a href="{}">{}</a>',
+            ((self._change_url(reversal), reversal.grn_number) for reversal in reversals),
+        )
+
     # --- lifecycle actions ---
 
     def _receipt_in_status(self, object_id, status):
@@ -625,6 +675,16 @@ class GoodsReceiptAdmin(ModelAdmin):
     def has_cancel_permission(self, request, object_id=None):
         return request.user.has_perm("purchases.cancel_goodsreceipt") and self._receipt_in_status(
             object_id, GoodsReceipt.STATUS_DRAFT
+        )
+
+    def has_reverse_permission(self, request, object_id=None):
+        if not request.user.has_perm("purchases.reverse_goodsreceipt"):
+            return False
+        if object_id is None:
+            return True
+        receipt = GoodsReceipt.objects.filter(pk=object_id).first()
+        return receipt is not None and any(
+            remaining > 0 for remaining in selectors.reversible_quantities(receipt).values()
         )
 
     def _change_url(self, receipt):
@@ -674,6 +734,38 @@ class GoodsReceiptAdmin(ModelAdmin):
             f"Post goods receipt {receipt.grn_number} into {receipt.warehouse}. Stock increases "
             "immediately and the receipt can no longer be changed.",
             "Post receipt", "bg-primary-600", rows,
+        )
+
+    @action(description="Reverse receipt", url_path="reverse", permissions=["reverse"], icon="undo")
+    def reverse_grn(self, request, object_id):
+        """GET shows the reversible lines; only POST reverses. Creates a
+        posted reversal receipt; this receipt is never changed."""
+        receipt = get_object_or_404(GoodsReceipt, pk=object_id)
+        lines = list(receipt.lines.select_related("variant").order_by("pk"))
+        form = ReverseGoodsReceiptForm(
+            request.POST or None, lines=lines,
+            reversible=selectors.reversible_quantities(receipt),
+        )
+        if request.method == "POST" and form.is_valid():
+            try:
+                reversal = po_services.reverse_goods_receipt(
+                    receipt, request.user, form.cleaned_data["reason"], form.quantities()
+                )
+            except po_services.GoodsReceiptError as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+                return redirect(self._change_url(receipt))
+            self.message_user(
+                request, f"{reversal.grn_number} posted: reverses {receipt.grn_number}. Stock reduced.",
+                level=messages.SUCCESS,
+            )
+            return redirect(self._change_url(reversal))
+        return self._action_page(
+            request, receipt, f"Reverse {receipt.grn_number}", form,
+            f"Reverse units recorded on {receipt.grn_number} by mistake. A new reversal receipt "
+            "is posted and stock is reduced; this receipt is not changed. Only available stock "
+            "(not sold or reserved) can be reversed. To correct a receipt, reverse it and then "
+            "receive the right quantities on a new goods receipt.",
+            "Post reversal", "bg-red-600",
         )
 
     @action(description="Cancel", url_path="cancel", permissions=["cancel"], icon="cancel")

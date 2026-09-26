@@ -1,5 +1,8 @@
 from django.conf import settings
+from django.core.validators import RegexValidator
 from django.db import models
+from django.db.models import Value
+from django.db.models.functions import Cast, Concat, Greatest, Length, LPad
 
 from apps.core.models import BaseModel
 
@@ -29,15 +32,123 @@ class Warehouse(BaseModel):
         return self.name
 
 
-class Supplier(BaseModel):
-    """Vendor/supplier master data. Owned entirely in Django per DEC-006 —
-    not sourced from or dependent on Zoho."""
+gstin_validator = RegexValidator(
+    r"^\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]$",
+    "Enter a valid 15-character GSTIN.",
+)
+pan_validator = RegexValidator(
+    r"^[A-Z]{5}\d{4}[A-Z]$", "Enter a valid 10-character PAN."
+)
 
-    name = models.CharField(max_length=150)
+
+class Supplier(BaseModel):
+    """Vendor master data, shown to staff as "Vendor". Owned entirely in
+    Django per DEC-006 — not sourced from or dependent on Zoho.
+
+    The model keeps its original name so existing references
+    (StockMovement.supplier) are unaffected."""
+
+    GST_REGISTERED = "registered"
+    GST_UNREGISTERED = "unregistered"
+    GST_COMPOSITION = "composition"
+    GST_OVERSEAS = "overseas"
+
+    GST_TREATMENT_CHOICES = (
+        (GST_REGISTERED, "Registered business"),
+        (GST_UNREGISTERED, "Unregistered business"),
+        (GST_COMPOSITION, "Composition scheme"),
+        (GST_OVERSEAS, "Overseas"),
+    )
+
+    # Stable code derived by the database from the primary key, so it is
+    # always present, never changes and cannot collide. Padded to at least
+    # 5 digits; LPAD would truncate longer IDs, hence GREATEST.
+    vendor_code = models.GeneratedField(
+        expression=Concat(
+            Value("VEN-"),
+            LPad(
+                Cast("id", models.CharField()),
+                Greatest(Length(Cast("id", models.CharField())), 5),
+                Value("0"),
+            ),
+        ),
+        output_field=models.CharField(max_length=20),
+        db_persist=True,
+        unique=True,
+    )
+    name = models.CharField(max_length=150, help_text="Display name used across the admin.")
+    legal_name = models.CharField(max_length=200, blank=True)
     contact_person = models.CharField(max_length=150, blank=True)
     phone = models.CharField(max_length=15, blank=True)
     email = models.EmailField(blank=True)
-    address = models.TextField(blank=True)
+
+    # Legacy free-text address, kept as-is. New data uses the structured
+    # fields below.
+    address = models.TextField("legacy address", blank=True)
+    address_line1 = models.CharField(max_length=255, blank=True)
+    address_line2 = models.CharField(max_length=255, blank=True)
+    city = models.CharField(max_length=100, blank=True)
+    state = models.CharField(max_length=100, blank=True)
+    state_code = models.CharField(
+        max_length=2, blank=True,
+        validators=[RegexValidator(r"^\d{2}$", "Enter the 2-digit GST state code.")],
+    )
+    pincode = models.CharField(
+        max_length=6, blank=True,
+        validators=[RegexValidator(r"^\d{6}$", "Enter a 6-digit PIN code.")],
+    )
+    country = models.CharField(max_length=2, default="IN")
+
+    gstin = models.CharField(max_length=15, blank=True, validators=[gstin_validator])
+    pan = models.CharField(max_length=10, blank=True, validators=[pan_validator])
+    gst_treatment = models.CharField(max_length=20, choices=GST_TREATMENT_CHOICES, blank=True)
+
+    payment_terms_days = models.PositiveIntegerField(
+        default=0, help_text="Days allowed for payment. 0 means due on receipt."
+    )
+    notes = models.TextField(blank=True)
+
+    external_accounting_id = models.CharField(
+        max_length=100, blank=True,
+        help_text="Contact ID in the accounting system (Zoho Books). Set by the sync.",
+    )
+
+    class Meta:
+        verbose_name = "vendor"
+        verbose_name_plural = "vendors"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["gstin"],
+                condition=~models.Q(gstin=""),
+                name="unique_supplier_gstin_when_set",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(payment_terms_days__gte=0),
+                name="supplier_payment_terms_days_gte_0",
+            ),
+        ]
+
+    def _normalize_tax_ids(self):
+        self.gstin = (self.gstin or "").strip().upper()
+        self.pan = (self.pan or "").strip().upper()
+
+    def clean_fields(self, exclude=None):
+        # Normalize before the format validators run.
+        self._normalize_tax_ids()
+        super().clean_fields(exclude=exclude)
+
+    # vendor_code has no value until the row is saved, so Django cannot run
+    # its unique check on an unsaved instance. The database enforces it.
+    def validate_unique(self, exclude=None):
+        super().validate_unique(exclude={*(exclude or ()), "vendor_code"})
+
+    def validate_constraints(self, exclude=None):
+        super().validate_constraints(exclude={*(exclude or ()), "vendor_code"})
+
+    def save(self, *args, **kwargs):
+        self._normalize_tax_ids()
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name

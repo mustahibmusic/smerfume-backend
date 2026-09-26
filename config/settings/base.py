@@ -348,6 +348,15 @@ UNFOLD = {
                 ],
             },
             {
+                "title": "Purchases",
+                "items": [
+                    _nav_item(
+                        "Vendors", "storefront",
+                        "admin:inventory_supplier_changelist", "inventory.view_supplier",
+                    ),
+                ],
+            },
+            {
                 "title": "Customers",
                 "items": [
                     _nav_item(

@@ -24,6 +24,7 @@ from decimal import Decimal
 
 from django.contrib import admin as django_admin
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, transaction
 from django.test import RequestFactory, TestCase, TransactionTestCase
 from django.utils import timezone
@@ -866,3 +867,182 @@ class InventoryAdminIntegrityTests(TestCase):
         self.assertFalse(admin_instance.has_add_permission(self.request))
         self.assertFalse(admin_instance.has_change_permission(self.request))
         self.assertFalse(admin_instance.has_delete_permission(self.request))
+
+
+class VendorMasterTests(TestCase):
+    """Vendor Master (P1A): inventory.Supplier shown to staff as Vendor."""
+
+    def _vendor(self, **kwargs):
+        kwargs.setdefault("name", "Test Vendor")
+        return Supplier.objects.create(**kwargs)
+
+    # --- vendor_code ---
+
+    def test_vendor_code_generated_on_create(self):
+        vendor = self._vendor()
+        self.assertEqual(vendor.vendor_code, f"VEN-{vendor.pk:05d}")
+
+    def test_vendor_code_stable_across_saves(self):
+        vendor = self._vendor()
+        code = vendor.vendor_code
+        vendor.name = "Renamed Vendor"
+        vendor.save()
+        vendor.refresh_from_db()
+        self.assertEqual(vendor.vendor_code, code)
+
+    def test_vendor_codes_are_unique(self):
+        first, second = self._vendor(), self._vendor(name="Other")
+        self.assertNotEqual(first.vendor_code, second.vendor_code)
+
+    def test_vendor_code_derived_for_rows_inserted_outside_django(self):
+        # Rows that existed before the migration, or are inserted by raw
+        # SQL, get their code from the database, the same way the backfill
+        # works when the generated column is added.
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO inventory_supplier (id, public_id, is_active, created_at, updated_at,"
+                " name, contact_person, phone, email, address, legal_name, address_line1,"
+                " address_line2, city, state, state_code, pincode, country, gstin, pan,"
+                " gst_treatment, payment_terms_days, notes, external_accounting_id)"
+                " VALUES (1234567, gen_random_uuid(), true, now(), now(), 'Legacy Vendor',"
+                " '', '', '', 'Old street 1', '', '', '', '', '', '', '', 'IN', '', '', '',"
+                " 0, '', '')"
+            )
+        vendor = Supplier.objects.get(pk=1234567)
+        self.assertEqual(vendor.vendor_code, "VEN-1234567")
+
+    def test_vendor_code_not_editable_in_admin(self):
+        from apps.inventory.admin import SupplierAdmin
+
+        admin_instance = SupplierAdmin(Supplier, django_admin.site)
+        self.assertIn("vendor_code", admin_instance.get_readonly_fields(None))
+
+    # --- compatibility ---
+
+    def test_minimal_vendor_and_stock_movement_link(self):
+        vendor = self._vendor()
+        self.assertEqual(vendor.country, "IN")
+        self.assertEqual(vendor.payment_terms_days, 0)
+        movement = StockMovement.objects.create(
+            variant=_make_variant("SKU-VENDOR-COMPAT"),
+            warehouse=Warehouse.objects.get(is_default=True),
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL,
+            movement_type=StockMovement.MOVEMENT_PURCHASE_IN,
+            quantity_delta=Decimal("1"),
+            reason=StockMovement.REASON_PURCHASE,
+            supplier=vendor,
+        )
+        self.assertEqual(movement.supplier, vendor)
+        self.assertIn(movement, vendor.stock_movements.all())
+
+    def test_legacy_address_preserved(self):
+        vendor = self._vendor(address="12 Crawford Market, Mumbai")
+        vendor.address_line1 = "12 Crawford Market"
+        vendor.city = "Mumbai"
+        vendor.save()
+        vendor.refresh_from_db()
+        self.assertEqual(vendor.address, "12 Crawford Market, Mumbai")
+
+    # --- GSTIN / PAN ---
+
+    def test_gstin_and_pan_normalized_before_validation(self):
+        vendor = Supplier(name="Norm", gstin="  27aapfu0939f1zv ", pan=" aapfu0939f ")
+        vendor.full_clean()
+        self.assertEqual(vendor.gstin, "27AAPFU0939F1ZV")
+        self.assertEqual(vendor.pan, "AAPFU0939F")
+
+    def test_gstin_normalized_on_save(self):
+        vendor = self._vendor(gstin=" 27aapfu0939f1zv")
+        vendor.refresh_from_db()
+        self.assertEqual(vendor.gstin, "27AAPFU0939F1ZV")
+
+    def test_invalid_gstin_fails_validation(self):
+        vendor = Supplier(name="Bad", gstin="27AAPFU0939")
+        with self.assertRaises(ValidationError) as ctx:
+            vendor.full_clean()
+        self.assertIn("gstin", ctx.exception.message_dict)
+
+    def test_invalid_pan_fails_validation(self):
+        vendor = Supplier(name="Bad", pan="1234567890")
+        with self.assertRaises(ValidationError) as ctx:
+            vendor.full_clean()
+        self.assertIn("pan", ctx.exception.message_dict)
+
+    def test_multiple_blank_gstins_allowed(self):
+        self._vendor(name="A")
+        self._vendor(name="B")
+        self.assertEqual(Supplier.objects.filter(gstin="").count(), 2)
+
+    def test_duplicate_normalized_gstin_rejected(self):
+        self._vendor(name="A", gstin="27AAPFU0939F1ZV")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self._vendor(name="B", gstin=" 27aapfu0939f1zv ")
+
+    def test_duplicate_gstin_fails_model_validation(self):
+        self._vendor(name="A", gstin="27AAPFU0939F1ZV")
+        with self.assertRaises(ValidationError):
+            Supplier(name="B", gstin="27aapfu0939f1zv").full_clean()
+
+    # --- payment terms ---
+
+    def test_negative_payment_terms_fails_validation(self):
+        with self.assertRaises(ValidationError):
+            Supplier(name="Neg", payment_terms_days=-1).full_clean()
+
+    def test_negative_payment_terms_rejected_by_database(self):
+        vendor = self._vendor()
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Supplier.objects.filter(pk=vendor.pk).update(payment_terms_days=-5)
+
+    # --- admin / navigation ---
+
+    def test_admin_registered_as_vendor_and_delete_denied(self):
+        from apps.inventory.admin import SupplierAdmin
+
+        self.assertIsInstance(django_admin.site._registry[Supplier], SupplierAdmin)
+        self.assertEqual(str(Supplier._meta.verbose_name_plural), "vendors")
+        staff = User.objects.create_superuser(
+            username="vendoradmin", email="vendoradmin@example.com", password="testpass123",
+        )
+        request = RequestFactory().get("/admin/")
+        request.user = staff
+        vendor = self._vendor()
+        self.assertFalse(
+            django_admin.site._registry[Supplier].has_delete_permission(request, vendor)
+        )
+
+    def test_vendors_in_purchases_navigation(self):
+        from django.conf import settings
+        from django.urls import reverse
+
+        groups = {
+            group.get("title"): group["items"]
+            for group in settings.UNFOLD["SIDEBAR"]["navigation"]
+        }
+        items = {item["title"]: item for item in groups["Purchases"]}
+        self.assertEqual(
+            str(items["Vendors"]["link"]), reverse("admin:inventory_supplier_changelist")
+        )
+        staff = User.objects.create_user(
+            username="novendorperm", email="novendorperm@example.com", password="testpass123",
+            is_staff=True,
+        )
+        request = RequestFactory().get("/admin/")
+        request.user = staff
+        self.assertFalse(items["Vendors"]["permission"](request))
+
+    def test_admin_add_form_validates_and_saves(self):
+        staff = User.objects.create_superuser(
+            username="vendorform", email="vendorform@example.com", password="testpass123",
+        )
+        request = RequestFactory().get("/admin/")
+        request.user = staff
+        form_class = django_admin.site._registry[Supplier].get_form(request)
+        form = form_class(data={
+            "name": "Form Vendor", "gstin": "27aapfu0939f1zv", "country": "IN",
+            "payment_terms_days": 15, "is_active": True,
+        })
+        self.assertTrue(form.is_valid(), form.errors)
+        vendor = form.save()
+        self.assertEqual(vendor.gstin, "27AAPFU0939F1ZV")
+        self.assertTrue(vendor.vendor_code.startswith("VEN-"))

@@ -259,6 +259,74 @@ return endpoint stays blocked for in-store orders.
 
 ---
 
+## DEC-009 — Booked Incoming Inventory
+
+### Original Product Bible Requirement
+The Product Bible lists "Incoming Stock" among inventory data points but does not define it,
+and does not allow stock to be sold before it physically arrives.
+
+### Updated Decision
+Stock that a vendor has **explicitly confirmed** for Smerfume may be sold online before it
+arrives:
+- The confirmed quantity is recorded on the purchase order line
+  (`PurchaseOrderLine.confirmed_booked_quantity`) by staff, through one service that keeps an
+  append-only change history. It is the **cumulative** total the vendor has confirmed for the
+  line, including units already received, not the remaining quantity (ordered 10, received 4,
+  vendor confirms the other 6: record 10). Issuing a PO does not make it sellable. General or
+  soft vendor availability does not count.
+- Only issued / partially received POs contribute, only for the PO's warehouse.
+- Sellable quantity = physical available + confirmed booked quantity not yet received and not
+  yet allocated. Incoming quantities are derived, not stored.
+- Customers see normal availability. They are never told whether a unit is physical or booked
+  incoming.
+- Booked stock never increases physical inventory and never creates `purchase_in` movements.
+  It becomes physical only when the goods receipt (GRN) posts.
+- Online checkout (authenticated and guest) reserves physical stock first, then confirmed
+  incoming stock (earliest expected date first). One order item may be split between both.
+  Every reservation allocation records its source.
+- When the GRN posts, retail receipt quantity automatically serves the waiting orders first
+  (oldest reservation first), in the same all-or-nothing transaction. Damaged units never
+  serve customer orders.
+- An order cannot be packed while any of its units still wait for incoming stock.
+- A short delivery does not cancel the remaining booking. Staff cannot
+  lower a confirmed quantity, close or cancel a PO below quantities that
+  active customer allocations still depend on. Those allocations must
+  first be explicitly resolved — preferably reallocated to physical or
+  other confirmed incoming stock; if that is impossible, staff may
+  decide to cancel the affected customer order through the normal
+  cancellation flow. Orders are never cancelled automatically. A
+  customer order can never remain backed by a closed or cancelled PO.
+- Partial conversions and reallocations keep a full audit chain: the remaining part links back
+  to the allocation it was split from.
+- Scope: direct-sale retail bottles through online checkout only. In-store sales, decants,
+  testers, damaged and promotional stock stay physical-only.
+- The feature is off (`BOOKED_INCOMING_SALES_ENABLED=False`) until all three delivery phases
+  are merged and validated. Enabling it is a separate decision.
+
+### Reason
+Booking stock from vendors before arrival lets Smerfume sell confirmed supply earlier without
+misstating physical stock or losing the audit trail between customer orders and purchase
+orders.
+
+### Impact
+- `apps/purchases` — `confirmed_booked_quantity`, `BookedQuantityChange`, booking service,
+  selectors, GRN posting conversion, reallocation, PO close/cancel guards.
+- `apps/inventory` — `StockReservationAllocation` gains an incoming source type and lifecycle.
+- `apps/orders` / checkout — physical-then-incoming allocation, pack gate, admin indicators.
+- Design: `docs/superpowers/specs/2026-09-26-booked-incoming-inventory-design.md`.
+
+### Status
+**APPROVED** — design approved; implementation pending (P2A → P2B → P2C).
+
+### Date
+2026-09-26
+
+### Related Documentation
+- `docs/superpowers/specs/2026-09-26-booked-incoming-inventory-design.md`
+- `docs/INVENTORY_MANAGEMENT.md`
+
+---
+
 ## Self-Consistency Check
 
 The following issues were reviewed after drafting this file:

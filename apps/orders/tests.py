@@ -3354,3 +3354,84 @@ class PackOrderIncomingGateTests(TestCase):
         self.assertContains(resp, "awaiting incoming")
         self.order.refresh_from_db()
         self.assertEqual(self.order.status, Order.STATUS_CONFIRMED)
+
+
+class CheckoutBookedIncomingTests(TestCase):
+    """Online checkout reserves booked incoming stock only while
+    BOOKED_INCOMING_SALES_ENABLED is on; the customer API never changes."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user()
+        self.client.credentials(**_auth_header(self.user))
+        self.variant = _make_variant()
+        InventoryStock.objects.filter(variant=self.variant).update(quantity=Decimal("0"))
+        self.line = _book_incoming(self.variant, 5)
+        self.cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=self.cart, variant=self.variant, quantity=2)
+
+    def _checkout(self):
+        return self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+
+    def _incoming_rows(self):
+        from apps.inventory.models import StockReservationAllocation
+        return StockReservationAllocation.objects.filter(
+            allocation_type=StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
+        )
+
+    def test_flag_defaults_to_off(self):
+        from django.conf import settings
+        self.assertIs(settings.BOOKED_INCOMING_SALES_ENABLED, False)
+
+    def test_flag_off_ignores_booked_stock_and_never_queries_purchases(self):
+        from django.test.utils import CaptureQueriesContext
+        with CaptureQueriesContext(connection) as ctx:
+            resp = self._checkout()
+        self.assertEqual(resp.status_code, 400)
+        self.assertTrue(resp.data["error"].startswith("Only 0.00 unit(s) of"))
+        self.assertEqual(Order.objects.count(), 0)
+        self.assertFalse(self._incoming_rows().exists())
+        self.assertFalse([q for q in ctx.captured_queries if "purchases_" in q["sql"]])
+
+    def test_flag_on_reserves_incoming_with_unchanged_response_shape(self):
+        from django.test import override_settings
+        physical_variant = _make_variant()
+        other = _make_user(mobile="+919700000402", username="p2b-physical")
+        CartItem.objects.create(cart=Cart.objects.create(user=other), variant=physical_variant, quantity=1)
+        other_client = APIClient()
+        other_client.credentials(**_auth_header(other))
+        physical_resp = other_client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+
+        with override_settings(BOOKED_INCOMING_SALES_ENABLED=True):
+            resp = self._checkout()
+
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(set(resp.data), set(physical_resp.data))
+        self.assertEqual(set(resp.data["items"][0]), set(physical_resp.data["items"][0]))
+        self.assertNotIn("incoming", str(resp.data).lower())
+        row = self._incoming_rows().get()
+        self.assertEqual((row.purchase_order_line, row.units, row.incoming_status),
+                         (self.line, 2, "active"))
+        self.assertEqual(row.reservation.order_item.order.order_number, resp.data["order_number"])
+        self.assertFalse(self.cart.items.exists())
+
+    def test_flag_on_shortfall_keeps_public_error_format(self):
+        from django.test import override_settings
+        CartItem.objects.filter(cart=self.cart).update(quantity=6)
+        with override_settings(BOOKED_INCOMING_SALES_ENABLED=True):
+            resp = self._checkout()
+        self.assertEqual(resp.status_code, 400)
+        self.assertTrue(resp.data["error"].startswith("Only 5.00 unit(s) of"))
+        self.assertNotIn("incoming", resp.data["error"].lower())
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_in_store_sale_stays_physical_with_flag_on(self):
+        from django.test import override_settings
+        staff = _make_staff(mobile="+919700000403", username="p2b-counter")
+        with override_settings(BOOKED_INCOMING_SALES_ENABLED=True):
+            with self.assertRaises(reservation_service.InsufficientStockError):
+                order_services.create_in_store_order(
+                    lines=[(self.variant, 1)], staff_user=staff,
+                    customer_mobile="9811100099", payment_method=Order.PAYMENT_METHOD_CASH,
+                )
+        self.assertFalse(self._incoming_rows().exists())

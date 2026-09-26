@@ -15,6 +15,7 @@ Guest checkout flow:
 import logging
 from decimal import Decimal
 
+from django.conf import settings
 from django.db import transaction
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
@@ -219,15 +220,21 @@ class CheckoutView(APIView):
             guest_email=guest_email,
         )
 
-        for cart_item in cart_items:
-            order_item = OrderItem.objects.create(
+        order_items = [
+            OrderItem.objects.create(
                 order=order,
                 variant=cart_item.variant,
                 quantity=cart_item.quantity,
                 unit_price=cart_item.variant.selling_price,
                 **item_financials[cart_item.id],
             )
-            reservation_service.reserve_for_order_item(order_item, warehouse)
+            for cart_item in cart_items
+        ]
+        # Whole-order reservation. Booked incoming stock counts only while
+        # BOOKED_INCOMING_SALES_ENABLED is on (read per request).
+        reservation_service.reserve_order_items(
+            order_items, warehouse, allow_incoming=settings.BOOKED_INCOMING_SALES_ENABLED,
+        )
 
         addr_data = serializer.validated_data["shipping_address"]
         ShippingAddress.objects.create(order=order, **addr_data)

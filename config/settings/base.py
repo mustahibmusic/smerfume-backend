@@ -246,6 +246,9 @@ PARFUMLY_TIMEOUT_SECONDS = float(os.getenv("PARFUMLY_TIMEOUT_SECONDS", "20"))
 # so production shows nothing unless explicitly configured.
 ADMIN_ENVIRONMENT = os.getenv("ADMIN_ENVIRONMENT", "")
 
+# Target of the admin's "View site" link (the storefront, not this backend).
+ADMIN_SITE_URL = os.getenv("ADMIN_SITE_URL", "https://smerfume.com")
+
 
 def admin_environment_callback(request):
     """Return Unfold's [label, colour] pair for the header badge, or None."""
@@ -270,6 +273,7 @@ UNFOLD = {
     "SITE_TITLE": "Smerfume Admin",
     "SITE_HEADER": "Smerfume Backend",
     "SITE_SYMBOL": "local_mall",
+    "SITE_URL": ADMIN_SITE_URL,
     "SHOW_HISTORY": True,
     "SHOW_VIEW_ON_SITE": True,
     "ENVIRONMENT": admin_environment_callback,

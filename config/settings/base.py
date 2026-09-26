@@ -363,6 +363,11 @@ UNFOLD = {
                         "Goods Receipts", "inventory",
                         "admin:purchases_goodsreceipt_changelist", "purchases.view_goodsreceipt",
                     ),
+                    _nav_item(
+                        "Receipt Discrepancies", "report_problem",
+                        "admin:purchases_receiptdiscrepancy_changelist",
+                        "purchases.view_receiptdiscrepancy",
+                    ),
                 ],
             },
             {

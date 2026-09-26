@@ -216,7 +216,7 @@ class PurchaseOrderAdmin(ModelAdmin):
         )}),
         ("Vendor terms", {"fields": ("vendor_reference", "amounts_include_tax")}),
         ("Notes", {"fields": ("notes",)}),
-        ("Receiving", {"fields": ("open_discrepancies",)}),
+        ("Receiving", {"fields": ("open_discrepancies", "awaiting_orders")}),
         ("Totals", {"fields": (
             "total_gross_amount", "total_discount_amount",
             "total_discounted_amount", "total_taxable_value",
@@ -240,7 +240,10 @@ class PurchaseOrderAdmin(ModelAdmin):
         return False
 
     def get_readonly_fields(self, request, obj=None):
-        always = ("number", "status", "open_discrepancies", *self.TOTAL_FIELDS, *AUDIT_FIELDS)
+        always = (
+            "number", "status", "open_discrepancies", "awaiting_orders",
+            *self.TOTAL_FIELDS, *AUDIT_FIELDS,
+        )
         if obj is None:
             return always
         editable = set(obj.editable_fields())
@@ -295,6 +298,33 @@ class PurchaseOrderAdmin(ModelAdmin):
         return format_html(
             '<a href="{}?receipt__purchase_order__id__exact={}&status__exact=open">{}</a>',
             url, obj.pk, count,
+        )
+
+    @admin.display(description="Customer orders awaiting this PO")
+    def awaiting_orders(self, obj):
+        """Active incoming allocations that depend on this PO (spec §6).
+        They block close/cancel until reallocated or their orders cancelled."""
+        if not obj.pk:
+            return "-"
+        rows = [
+            (
+                reverse("admin:orders_order_change", args=[a.reservation.order_item.order_id]),
+                a.reservation.order_item.order.order_number,
+                a.purchase_order_line.variant,
+                selectors.format_units(a.units),
+                reverse("admin:inventory_stockreservationallocation_reallocate", args=[a.pk]),
+            )
+            for a in selectors.active_incoming_allocations(obj)
+        ]
+        if not rows:
+            return "None"
+        return format_html(
+            "<ul>{}</ul>",
+            format_html_join(
+                "",
+                '<li><a href="{}">{}</a>: {} × {} (<a href="{}">Reallocate</a>)</li>',
+                rows,
+            ),
         )
 
     @admin.display(description="PO number")

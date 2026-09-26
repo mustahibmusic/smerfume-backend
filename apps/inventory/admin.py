@@ -1,5 +1,9 @@
 from django import forms
 from django.contrib import admin, messages
+from django.core.exceptions import PermissionDenied
+from django.shortcuts import get_object_or_404, redirect
+from django.template.response import TemplateResponse
+from django.urls import path, reverse
 from unfold.admin import ModelAdmin
 
 from .models import (
@@ -14,6 +18,7 @@ from .models import (
     Warehouse,
 )
 from .services import adjustment as adjustment_services
+from .services import reservation as reservation_services
 
 
 @admin.register(Warehouse)
@@ -296,3 +301,65 @@ class StockReservationAllocationAdmin(ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+    def get_urls(self):
+        return [
+            path(
+                "<int:object_id>/reallocate/",
+                self.admin_site.admin_view(self.reallocate_view),
+                name="inventory_stockreservationallocation_reallocate",
+            ),
+            *super().get_urls(),
+        ]
+
+    def reallocate_view(self, request, object_id):
+        """Reallocate one active incoming allocation (spec §5.6) through
+        reservation_services.reallocate_incoming_allocation. GET shows a
+        confirmation page; only POST changes anything. A failure changes
+        nothing and names the quantity that could not be covered."""
+        if not request.user.has_perm("inventory.reallocate_incoming_allocation"):
+            raise PermissionDenied
+        allocation = get_object_or_404(
+            StockReservationAllocation.objects.select_related(
+                "reservation__order_item__order", "reservation__variant",
+                "purchase_order_line__purchase_order",
+            ),
+            pk=object_id,
+            allocation_type=StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
+        )
+        order = allocation.reservation.order_item.order
+        order_url = reverse("admin:orders_order_change", args=[order.pk])
+        if request.method == "POST":
+            try:
+                reservation_services.reallocate_incoming_allocation(allocation, request.user)
+            except (
+                reservation_services.InsufficientStockError,
+                reservation_services.InvalidReservationStateError,
+            ) as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+            else:
+                self.message_user(
+                    request,
+                    f"{order.order_number}: {allocation.units} incoming unit(s) of "
+                    f"{allocation.reservation.variant} reallocated.",
+                    level=messages.SUCCESS,
+                )
+            return redirect(order_url)
+        po_number = allocation.purchase_order_line.purchase_order.po_number
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Reallocate incoming units for {order.order_number}",
+            "opts": self.model._meta,
+            "form": forms.Form(),
+            "message": (
+                f"Move {allocation.units} unit(s) of {allocation.reservation.variant} off "
+                f"{po_number}. Free physical stock is used first, then other vendor-confirmed "
+                "incoming stock. If the full quantity cannot be covered, nothing changes and "
+                "the order is not cancelled."
+            ),
+            "rows": [f"Current status: {allocation.get_incoming_status_display()}"],
+            "button_label": "Reallocate",
+            "button_class": "bg-primary-600",
+            "back_url": order_url,
+        }
+        return TemplateResponse(request, "admin/purchases/po_action.html", context)

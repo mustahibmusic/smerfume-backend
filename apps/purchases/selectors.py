@@ -133,6 +133,22 @@ def active_incoming_allocated_quantities(po_line_ids):
     return {row["purchase_order_line_id"]: row["total"] for row in rows}
 
 
+def active_incoming_allocations(po):
+    """Active incoming allocations backed by any line of this PO: customer
+    orders still waiting for it (PO close/cancel guard, admin list)."""
+    return (
+        StockReservationAllocation.objects.filter(
+            allocation_type=StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
+            incoming_status=StockReservationAllocation.INCOMING_ACTIVE,
+            purchase_order_line__purchase_order=po,
+        )
+        .select_related(
+            "reservation__order_item__order", "purchase_order_line__variant",
+        )
+        .order_by("pk")
+    )
+
+
 def _incoming_amount(line, received, allocated):
     """max(confirmed_booked_quantity - net retail received - active allocated, 0)."""
     return max(

@@ -151,6 +151,12 @@ def _incoming_amounts(lines):
     return {line.pk: _incoming_amount(line, received, allocated) for line in lines}
 
 
+def incoming_sellable_amounts(lines):
+    """{line_id: incoming sellable} for lines the caller already filtered
+    to bookable POs (checkout passes its locked candidate lines)."""
+    return _incoming_amounts(lines)
+
+
 def booking_figures(po, lines=None):
     """{line_id: {"received", "allocated", "incoming"}} for the lines of one
     PO: net retail received, active incoming allocated and incoming sellable.

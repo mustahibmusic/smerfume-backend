@@ -1,4 +1,5 @@
-from apps.inventory.models import InventoryStock
+from apps.inventory.models import InventoryStock, Warehouse
+from django.conf import settings
 from django.db.models import Prefetch
 from drf_spectacular.utils import (
     OpenApiExample,
@@ -255,6 +256,35 @@ class ProductViewSet(viewsets.ReadOnlyModelViewSet):
         if self.action == "retrieve":
             return ProductDetailSerializer
         return ProductListSerializer
+
+    def get_serializer(self, *args, **kwargs):
+        # With booked incoming sales on, is_available uses the authoritative
+        # sellable-quantity selector for the online-sale (default) warehouse,
+        # computed once for every variant on the page — never per variant.
+        if args and settings.BOOKED_INCOMING_SALES_ENABLED:
+            kwargs.setdefault("context", self.get_serializer_context())
+            kwargs["context"]["sellable_quantities"] = _sellable_quantities_for(args[0])
+        return super().get_serializer(*args, **kwargs)
+
+
+def _sellable_quantities_for(products):
+    """{variant_id: sellable quantity} for the prefetched active variants of
+    one product or a page of products, at the default warehouse (the one
+    online checkout reserves from)."""
+    from apps.purchases.selectors import sellable_quantities
+
+    if isinstance(products, Product):
+        products = [products]
+    variant_ids = [
+        variant.pk
+        for product in products
+        for edition in product.editions.all()
+        for variant in edition.variants.all()
+    ]
+    warehouse = Warehouse.objects.filter(is_default=True).first()
+    if warehouse is None or not variant_ids:
+        return {}
+    return sellable_quantities(variant_ids, warehouse)
 
 
 @extend_schema_view(

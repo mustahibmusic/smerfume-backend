@@ -24,8 +24,29 @@ class WarehouseAdmin(ModelAdmin):
 
 @admin.register(Supplier)
 class SupplierAdmin(ModelAdmin):
-    list_display = ("name", "contact_person", "phone", "email", "is_active")
-    search_fields = ("name", "contact_person", "phone", "email")
+    """Vendor Master. Safe configuration CRUD. Vendors are deactivated,
+    never deleted, so stock history keeps its supplier links."""
+
+    list_display = (
+        "vendor_code", "name", "gstin", "city", "phone", "payment_terms_days", "is_active",
+    )
+    list_filter = ("is_active", "gst_treatment", "state")
+    search_fields = ("vendor_code", "name", "legal_name", "gstin", "phone", "email")
+    readonly_fields = ("vendor_code",)
+    fieldsets = (
+        ("Basic details", {"fields": ("vendor_code", "name", "legal_name", "is_active")}),
+        ("Contact & address", {"fields": (
+            "contact_person", "phone", "email",
+            "address_line1", "address_line2", "city", "state", "state_code", "pincode",
+            "country", "address",
+        )}),
+        ("Tax details", {"fields": ("gstin", "pan", "gst_treatment")}),
+        ("Commercial", {"fields": ("payment_terms_days", "notes")}),
+        ("Integration", {"fields": ("external_accounting_id",), "classes": ("collapse",)}),
+    )
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 class InventoryStockAdjustmentForm(forms.ModelForm):

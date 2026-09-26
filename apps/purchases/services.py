@@ -43,6 +43,20 @@ def _lock(po):
     return PurchaseOrder.objects.select_for_update().get(pk=po.pk)
 
 
+def _refuse_active_incoming(po, action):
+    """Close/cancel guard (spec §5.7). Locks every line of the PO by id
+    after the PO lock: checkout needs a line lock to add an incoming
+    allocation and re-reads PO status after it, so either it commits first
+    and is seen here, or it sees the new status and skips the line."""
+    list(po.lines.select_for_update().order_by("pk").values_list("pk", flat=True))
+    count = selectors.active_incoming_allocations(po).count()
+    if count:
+        raise PurchaseOrderError(
+            f"{po.po_number} cannot be {action}: {count} customer order allocation(s) are "
+            "awaiting this purchase order. Reallocate them or cancel those orders first."
+        )
+
+
 def _check_transition(po, new_status):
     if not po.can_transition_to(new_status):
         raise PurchaseOrderError(
@@ -105,6 +119,7 @@ def cancel_purchase_order(po, user, reason):
         raise PurchaseOrderError(
             f"{po.po_number} has posted goods receipts and cannot be cancelled."
         )
+    _refuse_active_incoming(po, "cancelled")
 
     po.status = PurchaseOrder.STATUS_CANCELLED
     po.cancelled_by = user
@@ -385,6 +400,7 @@ def close_purchase_order(po, user, reason):
         raise PurchaseOrderError("A reason for closing is required.")
     po = _lock(po)
     _check_transition(po, PurchaseOrder.STATUS_CLOSED)
+    _refuse_active_incoming(po, "closed")
     po.status = PurchaseOrder.STATUS_CLOSED
     po.closed_by = user
     po.closed_at = timezone.now()

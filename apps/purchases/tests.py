@@ -2412,3 +2412,56 @@ class IncomingConversionTests(_BookingBase):
         self.assertEqual(allocation.converted_by_receipt_line, lines["retail"])
         stock = self._retail_stock()
         self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("2"), Decimal("2")))
+
+
+class IncomingPOGuardTests(_BookingBase):
+    """PO close / cancel are refused while active incoming allocations
+    depend on the PO (spec §5.7)."""
+
+    def setUp(self):
+        super().setUp()
+        self._book(10)
+
+    def test_cancel_blocked_by_active_incoming(self):
+        self._incoming_allocation(2)
+        with self.assertRaisesMessage(services.PurchaseOrderError, "awaiting"):
+            services.cancel_purchase_order(self.po, self.user, "Vendor withdrew")
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_ISSUED)
+
+    def test_cancel_allowed_when_incoming_released(self):
+        self._incoming_allocation(2, status="released")
+        po = services.cancel_purchase_order(self.po, self.user, "Vendor withdrew")
+        self.assertEqual(po.status, PurchaseOrder.STATUS_CANCELLED)
+
+    def test_close_blocked_by_active_incoming(self):
+        self._incoming_allocation(2)
+        self._receive(retail=3)
+        self._incoming_allocation(1, number="BK-2")
+        with self.assertRaisesMessage(services.PurchaseOrderError, "awaiting"):
+            services.close_purchase_order(self.po, self.user, "Stop waiting")
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_PARTIALLY_RECEIVED)
+
+    def test_close_allowed_after_full_conversion(self):
+        allocation = self._incoming_allocation(2)
+        self._receive(retail=3)
+        allocation.refresh_from_db()
+        self.assertEqual(allocation.incoming_status, "converted")
+        po = services.close_purchase_order(self.po, self.user, "Stop waiting")
+        self.assertEqual(po.status, PurchaseOrder.STATUS_CLOSED)
+
+    def test_guard_counts_every_line_of_the_po(self):
+        other_line = self._line(self.po, variant=_variant("SKU-P2C-GUARD"), quantity_ordered=5)
+        self._book(5, other_line)
+        self._incoming_allocation(1, line=other_line)
+        with self.assertRaises(services.PurchaseOrderError):
+            services.cancel_purchase_order(self.po, self.user, "Vendor withdrew")
+
+    def test_active_incoming_for_po_selector(self):
+        first = self._incoming_allocation(2)
+        self._incoming_allocation(1, status="released", number="BK-2")
+        other_po = self._po()
+        other_line = self._line(other_po)
+        self._incoming_allocation(1, line=other_line, number="BK-3")
+        self.assertEqual(list(selectors.active_incoming_allocations(self.po)), [first])

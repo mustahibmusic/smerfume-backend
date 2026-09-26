@@ -278,8 +278,15 @@ class StockReservationAllocationAdmin(ModelAdmin):
     the exact record of what release_reservation()/consume_reservation()
     must replay; editing them would corrupt that replay."""
 
-    list_display = ("reservation", "allocation_type", "units", "partial_lot", "ml_amount")
-    list_filter = ("allocation_type",)
+    list_display = (
+        "reservation", "allocation_type", "units", "partial_lot", "ml_amount",
+        "purchase_order_line", "incoming_status", "replacement", "split_from",
+    )
+    list_filter = ("allocation_type", "incoming_status")
+    list_select_related = (
+        "reservation", "partial_lot", "purchase_order_line__variant__edition__product__brand",
+        "replacement", "split_from",
+    )
 
     def has_add_permission(self, request):
         return False

@@ -30,6 +30,29 @@ class InvalidReservationStateError(Exception):
     """The reservation is not in a state that allows the requested action."""
 
 
+def _refuse_active_incoming_allocations(reservation):
+    """Active incoming (booked) allocations are released/converted from
+    P2B/P2C on. Until then, refuse clearly rather than mis-handle them.
+    Historical (converted/reallocated/released) incoming rows are skipped."""
+    Allocation = inv_models.StockReservationAllocation
+    if reservation.allocations.filter(
+        allocation_type=Allocation.ALLOCATION_INCOMING_PO_LINE,
+        incoming_status=Allocation.INCOMING_ACTIVE,
+    ).exists():
+        raise InvalidReservationStateError(
+            "This reservation has active incoming (booked) allocations, which are not "
+            "handled yet."
+        )
+
+
+def _physical_allocations(reservation):
+    """Locked physical allocation rows. After the guard above, any incoming
+    row left is historical and holds no capacity."""
+    return reservation.allocations.exclude(
+        allocation_type=inv_models.StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE
+    ).select_for_update()
+
+
 def _lock_retail_stock(variant, warehouse):
     stock, _ = inv_models.InventoryStock.objects.select_for_update().get_or_create(
         variant=variant,
@@ -171,8 +194,9 @@ def release_reservation(reservation):
         inv_models.StockReservation.STATUS_CONFIRMED,
     ):
         raise InvalidReservationStateError(f"Cannot release a reservation in status={reservation.status}")
+    _refuse_active_incoming_allocations(reservation)
 
-    for allocation in reservation.allocations.select_for_update():
+    for allocation in _physical_allocations(reservation):
         if allocation.allocation_type == inv_models.StockReservationAllocation.ALLOCATION_RETAIL_UNIT:
             stock = inv_models.InventoryStock.objects.select_for_update().get(pk=allocation.inventory_stock_id)
             stock.quantity_reserved -= allocation.units
@@ -199,8 +223,9 @@ def consume_reservation(reservation, performed_by=None):
         inv_models.StockReservation.STATUS_CONFIRMED,
     ):
         raise InvalidReservationStateError(f"Cannot consume a reservation in status={reservation.status}")
+    _refuse_active_incoming_allocations(reservation)
 
-    allocations = list(reservation.allocations.select_for_update())
+    allocations = list(_physical_allocations(reservation))
 
     if reservation.purpose == inv_models.StockReservation.PURPOSE_DIRECT_SALE:
         for allocation in allocations:

@@ -233,6 +233,14 @@ MSG91_TEMPLATE_ID = os.getenv("MSG91_TEMPLATE_ID", "")
 MSG91_SENDER_ID = os.getenv("MSG91_SENDER_ID", "SMRFME")
 
 
+# ── Booked incoming inventory (DEC-009) ───────────────────────────────────────
+# BOOKED_INCOMING_SALES_ENABLED (bool env var, default False):
+#   When True, storefront availability and online checkout may use
+#   vendor-confirmed booked incoming stock. Must stay False until P2C
+#   (GRN conversion and shortfall protection) is merged and validated.
+BOOKED_INCOMING_SALES_ENABLED = os.getenv("BOOKED_INCOMING_SALES_ENABLED", "False") == "True"
+
+
 # ── Parfumly catalogue import ──────────────────────────────────────────────────
 # Public, unauthenticated fragrance metadata API used only by the
 # `import_parfumly_brand` management command (apps.catalog.parfumly).
@@ -367,6 +375,11 @@ UNFOLD = {
                         "Receipt Discrepancies", "report_problem",
                         "admin:purchases_receiptdiscrepancy_changelist",
                         "purchases.view_receiptdiscrepancy",
+                    ),
+                    _nav_item(
+                        "Booked Quantity History", "history",
+                        "admin:purchases_bookedquantitychange_changelist",
+                        "purchases.view_bookedquantitychange",
                     ),
                 ],
             },

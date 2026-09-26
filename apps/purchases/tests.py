@@ -21,11 +21,21 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, transaction
-from django.test import RequestFactory, TestCase, TransactionTestCase
+from django.test import RequestFactory, TestCase, TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
+from django.utils import timezone
 
 from apps.catalog.models import Brand, Category, Product, ProductEdition, ProductVariant
-from apps.inventory.models import InventoryStock, StockMovement, StockTransaction, Supplier, Warehouse
+from apps.inventory.models import (
+    InventoryStock,
+    StockMovement,
+    StockReservation,
+    StockReservationAllocation,
+    StockTransaction,
+    Supplier,
+    Warehouse,
+)
 from apps.inventory.services import reservation as reservation_service
 from apps.orders.models import Order, OrderItem
 from apps.purchases import selectors, services
@@ -35,6 +45,7 @@ from apps.purchases.admin import (
     PurchaseOrderLineInline,
 )
 from apps.purchases.models import (
+    BookedQuantityChange,
     GoodsReceipt,
     GoodsReceiptLine,
     PurchaseOrder,
@@ -475,7 +486,8 @@ class PurchaseOrderAdminTests(_POBase):
         items = {item["title"]: item for item in groups["Purchases"]}
         self.assertEqual(
             list(items),
-            ["Vendors", "Purchase Orders", "Goods Receipts", "Receipt Discrepancies"],
+            ["Vendors", "Purchase Orders", "Goods Receipts", "Receipt Discrepancies",
+             "Booked Quantity History"],
         )
         self.assertEqual(
             str(items["Goods Receipts"]["link"]),
@@ -1725,3 +1737,447 @@ class GoodsReceiptReversalConcurrencyTests(TransactionTestCase):
         else:
             self.assertEqual(results[0], "GoodsReceiptError")
             self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("5"), Decimal("3")))
+
+
+# --- P2A: booked incoming foundation ---
+
+
+class BookedQuantityModelTests(_POBase):
+    def test_confirmed_booked_quantity_defaults_to_zero(self):
+        line = self._line(self._po())
+        self.assertEqual(line.confirmed_booked_quantity, 0)
+
+    def test_db_rejects_negative_confirmed_booked_quantity(self):
+        line = self._line(self._po())
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            PurchaseOrderLine.objects.filter(pk=line.pk).update(confirmed_booked_quantity=-1)
+
+    def test_field_label_says_cumulative(self):
+        field = PurchaseOrderLine._meta.get_field("confirmed_booked_quantity")
+        self.assertEqual(field.verbose_name, "Vendor-confirmed total (cumulative)")
+        self.assertIn("including units already received", field.help_text)
+
+    def test_bookable_statuses(self):
+        self.assertEqual(
+            PurchaseOrder.BOOKABLE_STATUSES,
+            (PurchaseOrder.STATUS_ISSUED, PurchaseOrder.STATUS_PARTIALLY_RECEIVED),
+        )
+
+    def test_permission_exists(self):
+        self.assertTrue(
+            Permission.objects.filter(
+                codename="confirm_booked_quantity", content_type__app_label="purchases"
+            ).exists()
+        )
+
+    def test_change_row_is_immutable(self):
+        line = self._line(self._po())
+        change = BookedQuantityChange.objects.create(
+            purchase_order_line=line, old_quantity=0, new_quantity=4,
+            note="Vendor mail 12 Sep", performed_by=self.user,
+        )
+        change.note = "edited"
+        with self.assertRaises(ValidationError):
+            change.save()
+        with self.assertRaises(ValidationError):
+            change.delete()
+        self.assertEqual(BookedQuantityChange.objects.get(pk=change.pk).note, "Vendor mail 12 Sep")
+
+    def test_flag_defaults_off(self):
+        self.assertIs(settings.BOOKED_INCOMING_SALES_ENABLED, False)
+
+
+class _BookingBase(_GRNBase):
+    """Issued PO: 10 units of self.variant at the default warehouse."""
+
+    def _book(self, quantity, line=None):
+        line = line or self.po_line
+        PurchaseOrderLine.objects.filter(pk=line.pk).update(confirmed_booked_quantity=quantity)
+        line.refresh_from_db()
+        return line
+
+    def _incoming_allocation(self, units, line=None, status="active", number="BK-1"):
+        order = Order.objects.create(
+            user=self.user, order_number=number, subtotal=Decimal("0"), total=Decimal("0"),
+        )
+        item = OrderItem.objects.create(
+            order=order, variant=self.variant, quantity=int(units), unit_price=Decimal("4500"),
+        )
+        reservation = StockReservation.objects.create(
+            order_item=item, variant=self.variant, warehouse=self.warehouse,
+            purpose=StockReservation.PURPOSE_DIRECT_SALE, quantity=Decimal(units),
+        )
+        extra = {}
+        if status == "released":
+            extra["incoming_resolved_at"] = timezone.now()
+        return StockReservationAllocation.objects.create(
+            reservation=reservation,
+            allocation_type=StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
+            purchase_order_line=line or self.po_line,
+            units=Decimal(units), incoming_status=status, **extra,
+        )
+
+    def _receive(self, retail=0, damaged=0):
+        receipt = self._receipt()
+        lines = {}
+        if retail:
+            lines["retail"] = self._grn_line(receipt, retail)
+        if damaged:
+            lines["damaged"] = self._grn_line(receipt, damaged, stock_type="damaged")
+        self._post(receipt)
+        receipt.refresh_from_db()
+        return receipt, lines
+
+    def _physical(self, quantity):
+        InventoryStock.objects.update_or_create(
+            variant=self.variant, warehouse=self.warehouse, stock_type="retail",
+            defaults={"quantity": quantity},
+        )
+
+
+class BookingSelectorTests(_BookingBase):
+    def test_unbooked_line_has_no_incoming(self):
+        self.assertEqual(selectors.incoming_sellable(self.po_line), Decimal("0"))
+
+    def test_cumulative_semantics(self):
+        # Ordered 10, received 4, vendor confirms the other 6 -> confirmed total 10.
+        self._receive(retail=4)
+        line = self._book(10)
+        self.assertEqual(selectors.incoming_sellable(line), Decimal("6"))
+
+    def test_active_allocations_reduce_incoming(self):
+        line = self._book(5)
+        self._incoming_allocation(2)
+        self.assertEqual(selectors.incoming_sellable(line), Decimal("3"))
+
+    def test_non_active_allocations_do_not_count(self):
+        line = self._book(5)
+        self._incoming_allocation(2, status="released")
+        self.assertEqual(selectors.incoming_sellable(line), Decimal("5"))
+
+    def test_damaged_receipts_do_not_count_as_received(self):
+        self._receive(retail=2, damaged=3)
+        line = self._book(10)
+        self.assertEqual(selectors.incoming_sellable(line), Decimal("8"))
+
+    def test_reversal_lowers_net_retail_received(self):
+        receipt, lines = self._receive(retail=4)
+        line = self._book(10)
+        services.reverse_goods_receipt(receipt, self.user, "Keyed wrong", {lines["retail"].pk: 1})
+        self.assertEqual(selectors.incoming_sellable(line), Decimal("7"))
+
+    def test_confirmed_below_received_is_zero_not_negative(self):
+        self._receive(retail=5)
+        line = self._book(3)
+        self.assertEqual(selectors.incoming_sellable(line), Decimal("0"))
+
+    def test_only_bookable_po_statuses_contribute(self):
+        line = self._book(5)
+        for status in (PurchaseOrder.STATUS_DRAFT, PurchaseOrder.STATUS_CLOSED,
+                       PurchaseOrder.STATUS_CANCELLED, PurchaseOrder.STATUS_RECEIVED):
+            PurchaseOrder.objects.filter(pk=self.po.pk).update(status=status)
+            line.refresh_from_db()
+            self.assertEqual(selectors.incoming_sellable(line), Decimal("0"), status)
+            self.assertEqual(
+                selectors.incoming_sellable_by_line([self.variant.pk], self.warehouse), {}, status
+            )
+
+    def test_other_warehouse_does_not_contribute(self):
+        self._book(5)
+        other = Warehouse.objects.create(name="Other WH", city="Pune")
+        self.assertEqual(selectors.incoming_sellable_by_line([self.variant.pk], other), {})
+
+    def test_by_line_lists_positive_lines_only(self):
+        self._book(5)
+        second = self._line(self.po, quantity_ordered=4, tax_rate=Decimal("18"))
+        self.assertEqual(
+            selectors.incoming_sellable_by_line([self.variant.pk], self.warehouse),
+            {self.po_line.pk: Decimal("5")},
+        )
+        self._book(4, line=second)
+        self.assertEqual(
+            selectors.incoming_sellable_by_line([self.variant.pk], self.warehouse),
+            {self.po_line.pk: Decimal("5"), second.pk: Decimal("4")},
+        )
+
+    def test_received_quantities_stock_type_filter(self):
+        self._receive(retail=2, damaged=3)
+        self.assertEqual(selectors.received_quantities([self.po_line.pk]), {self.po_line.pk: 5})
+        self.assertEqual(
+            selectors.received_quantities([self.po_line.pk], stock_type="retail"),
+            {self.po_line.pk: 2},
+        )
+
+
+class SellableQuantitySelectorTests(_BookingBase):
+    def test_flag_off_returns_physical_only(self):
+        self._physical(3)
+        self._book(5)
+        self.assertEqual(selectors.sellable_quantity(self.variant, self.warehouse), Decimal("3"))
+
+    @override_settings(BOOKED_INCOMING_SALES_ENABLED=True)
+    def test_flag_on_adds_incoming(self):
+        self._physical(3)
+        self._book(5)
+        self.assertEqual(selectors.sellable_quantity(self.variant, self.warehouse), Decimal("8"))
+
+    @override_settings(BOOKED_INCOMING_SALES_ENABLED=True)
+    def test_physical_reserved_is_excluded(self):
+        self._physical(3)
+        InventoryStock.objects.filter(variant=self.variant).update(quantity_reserved=2)
+        self.assertEqual(selectors.sellable_quantity(self.variant, self.warehouse), Decimal("1"))
+
+    @override_settings(BOOKED_INCOMING_SALES_ENABLED=True)
+    def test_bulk_includes_every_requested_variant(self):
+        other = _variant("SKU-PO-OTHER")
+        self._book(2)
+        self.assertEqual(
+            selectors.sellable_quantities([self.variant.pk, other.pk], self.warehouse),
+            {self.variant.pk: Decimal("2"), other.pk: Decimal("0")},
+        )
+
+    def test_only_retail_stock_counts_as_physical(self):
+        InventoryStock.objects.create(
+            variant=self.variant, warehouse=self.warehouse, stock_type="damaged", quantity=4,
+        )
+        self.assertEqual(selectors.sellable_quantity(self.variant, self.warehouse), Decimal("0"))
+
+
+class SetConfirmedBookedQuantityTests(_BookingBase):
+    def _set(self, quantity, note="Vendor confirmed by mail", line=None):
+        return services.set_confirmed_booked_quantity(
+            line or self.po_line, quantity, self.user, note
+        )
+
+    def test_sets_value_and_appends_history(self):
+        line, change = self._set(6)
+        self.assertEqual(line.confirmed_booked_quantity, 6)
+        self.assertEqual(
+            (change.old_quantity, change.new_quantity, change.note, change.performed_by),
+            (0, 6, "Vendor confirmed by mail", self.user),
+        )
+        line, change = self._set(8, note="Two more confirmed")
+        self.assertEqual((change.old_quantity, change.new_quantity), (6, 8))
+        self.assertEqual(BookedQuantityChange.objects.filter(purchase_order_line=line).count(), 2)
+
+    def test_unchanged_value_writes_no_history(self):
+        self._set(6)
+        line, change = self._set(6)
+        self.assertIsNone(change)
+        self.assertEqual(BookedQuantityChange.objects.count(), 1)
+
+    def test_allowed_on_partially_received_po(self):
+        self._receive(retail=4)
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_PARTIALLY_RECEIVED)
+        line, _ = self._set(10)
+        self.assertEqual(selectors.incoming_sellable(line), Decimal("6"))
+
+    def test_rejected_on_non_bookable_po(self):
+        for status in (PurchaseOrder.STATUS_DRAFT, PurchaseOrder.STATUS_RECEIVED,
+                       PurchaseOrder.STATUS_CLOSED, PurchaseOrder.STATUS_CANCELLED):
+            PurchaseOrder.objects.filter(pk=self.po.pk).update(status=status)
+            with self.assertRaises(services.BookedQuantityError, msg=status):
+                self._set(3)
+        self.assertEqual(BookedQuantityChange.objects.count(), 0)
+
+    def test_bounds(self):
+        with self.assertRaises(services.BookedQuantityError):
+            self._set(-1)
+        with self.assertRaises(services.BookedQuantityError):
+            self._set(11)  # ordered 10
+        line, _ = self._set(10)
+        self.assertEqual(line.confirmed_booked_quantity, 10)
+
+    def test_note_required(self):
+        with self.assertRaises(services.BookedQuantityError):
+            self._set(3, note="   ")
+
+    def test_unchanged_quantity_with_blank_note_is_a_no_op(self):
+        self._set(4)
+        line, change = self._set(4, note="  ")
+        self.assertIsNone(change)
+        self.assertEqual(line.confirmed_booked_quantity, 4)
+        self.assertEqual(BookedQuantityChange.objects.count(), 1)
+
+    def test_lowering_below_active_allocations_is_blocked(self):
+        self._set(5)
+        self._incoming_allocation(3)
+        with self.assertRaises(services.BookedQuantityError):
+            self._set(2)
+        self.po_line.refresh_from_db()
+        self.assertEqual(self.po_line.confirmed_booked_quantity, 5)
+        line, _ = self._set(3)  # exactly covers the 3 allocated units
+        self.assertEqual(line.confirmed_booked_quantity, 3)
+
+    def test_lowering_guard_accounts_for_received(self):
+        # Received 4, confirmed 10, 3 allocated: lowest allowed is 4 + 3 = 7.
+        self._receive(retail=4)
+        self._set(10)
+        self._incoming_allocation(3)
+        with self.assertRaises(services.BookedQuantityError):
+            self._set(6)
+        line, _ = self._set(7)
+        self.assertEqual(selectors.incoming_sellable(line), Decimal("0"))
+
+    def test_released_allocations_do_not_block_lowering(self):
+        self._set(5)
+        self._incoming_allocation(3, status="released")
+        line, _ = self._set(0)
+        self.assertEqual(line.confirmed_booked_quantity, 0)
+
+    def test_does_not_touch_inventory(self):
+        self._physical(2)
+        before = list(InventoryStock.objects.values_list("quantity", "quantity_reserved"))
+        movements = StockMovement.objects.count()
+        self._set(5)
+        self.assertEqual(
+            list(InventoryStock.objects.values_list("quantity", "quantity_reserved")), before
+        )
+        self.assertEqual(StockMovement.objects.count(), movements)
+
+
+class BookedQuantityAdminTests(_BookingBase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.user)
+        self.url = reverse("admin:purchases_purchaseorder_confirm_booked", args=[self.po.pk])
+
+    def test_get_shows_cumulative_explanation_and_changes_nothing(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "cumulative")
+        self.assertContains(response, "including units already received")
+        self.po_line.refresh_from_db()
+        self.assertEqual(self.po_line.confirmed_booked_quantity, 0)
+        self.assertEqual(BookedQuantityChange.objects.count(), 0)
+
+    def test_post_sets_quantity_and_reports_incoming_available(self):
+        self._receive(retail=4)
+        response = self.client.post(
+            self.url,
+            {"line": self.po_line.pk, "quantity": 10, "note": "Vendor confirmed rest"},
+            follow=True,
+        )
+        self.po_line.refresh_from_db()
+        self.assertEqual(self.po_line.confirmed_booked_quantity, 10)
+        self.assertContains(response, "Incoming available to sell: 6")
+
+    def test_post_error_is_shown_and_nothing_changes(self):
+        response = self.client.post(
+            self.url, {"line": self.po_line.pk, "quantity": 11, "note": "x"}, follow=True,
+        )
+        self.assertContains(response, "between 0 and the ordered quantity")
+        self.assertEqual(BookedQuantityChange.objects.count(), 0)
+
+    def test_permission_required(self):
+        staff = User.objects.create_user(username="nobook", password="x", is_staff=True)
+        staff.user_permissions.add(Permission.objects.get(codename="view_purchaseorder"))
+        self.client.force_login(staff)
+        self.client.post(self.url, {"line": self.po_line.pk, "quantity": 3, "note": "x"})
+        self.po_line.refresh_from_db()
+        self.assertEqual(self.po_line.confirmed_booked_quantity, 0)
+
+    def test_action_hidden_on_draft_po(self):
+        model_admin = django_admin.site._registry[PurchaseOrder]
+        request = RequestFactory().get("/admin/")
+        request.user = self.user
+        draft = self._po()
+        self.assertFalse(model_admin.has_confirm_booked_permission(request, draft.pk))
+        self.assertTrue(model_admin.has_confirm_booked_permission(request, self.po.pk))
+
+    def test_inline_shows_booking_columns(self):
+        self._book(10)
+        inline = PurchaseOrderLineInline(PurchaseOrder, django_admin.site)
+        self.assertEqual(inline.confirmed_booked(self.po_line), 10)
+        self.assertEqual(inline.incoming_available(self.po_line), Decimal("10"))
+        self.assertEqual(inline.allocated_awaiting(self.po_line), Decimal("0"))
+        self.assertEqual(inline.received_net_retail(self.po_line), 0)
+        self.assertNotIn("confirmed_booked_quantity", inline.fields)
+
+    def test_history_admin_is_read_only(self):
+        model_admin = django_admin.site._registry[BookedQuantityChange]
+        request = RequestFactory().get("/admin/")
+        request.user = self.user
+        self.assertFalse(model_admin.has_add_permission(request))
+        self.assertFalse(model_admin.has_change_permission(request))
+        self.assertFalse(model_admin.has_delete_permission(request))
+        self.assertEqual(
+            self.client.get(reverse("admin:purchases_bookedquantitychange_changelist")).status_code,
+            200,
+        )
+
+
+class BookingQueryCountTests(_BookingBase):
+    """Booking figures stay a fixed number of queries whatever the number
+    of PO lines or variants (no per-line / per-variant N+1)."""
+
+    def _add_lines(self, count):
+        variants = []
+        for number in range(count):
+            variant = _variant(f"SKU-QC-{number}")
+            self._book(5, self._line(self.po, variant=variant, quantity_ordered=5))
+            self._book(5, self._line(self.po, variant=variant, quantity_ordered=5))
+            variants.append(variant)
+        return variants
+
+    def _count(self, func):
+        with CaptureQueriesContext(connection) as context:
+            func()
+        return len(context.captured_queries)
+
+    @override_settings(BOOKED_INCOMING_SALES_ENABLED=True)
+    def test_sellable_quantities_query_count_is_fixed(self):
+        self._book(5)
+        with self.assertNumQueries(4):
+            selectors.sellable_quantities([self.variant.pk], self.warehouse)
+        ids = [self.variant.pk] + [v.pk for v in self._add_lines(3)]
+        with self.assertNumQueries(4):
+            result = selectors.sellable_quantities(ids, self.warehouse)
+        self.assertEqual(result[ids[-1]], Decimal("10"))
+
+    def test_incoming_sellable_by_line_query_count_is_fixed(self):
+        self._book(5)
+        with self.assertNumQueries(3):
+            selectors.incoming_sellable_by_line([self.variant.pk], self.warehouse)
+        ids = [self.variant.pk] + [v.pk for v in self._add_lines(3)]
+        with self.assertNumQueries(3):
+            selectors.incoming_sellable_by_line(ids, self.warehouse)
+
+    def test_booking_figures_query_count_is_fixed(self):
+        self._book(5)
+        with self.assertNumQueries(3):
+            selectors.booking_figures(self.po)
+        self._add_lines(3)
+        with self.assertNumQueries(3):
+            figures = selectors.booking_figures(self.po)
+        self.assertEqual(len(figures), 7)
+
+    def test_booking_figures_zero_incoming_outside_bookable_status(self):
+        self._book(5)
+        PurchaseOrder.objects.filter(pk=self.po.pk).update(status=PurchaseOrder.STATUS_CLOSED)
+        self.po.refresh_from_db()
+        self.assertEqual(selectors.booking_figures(self.po)[self.po_line.pk]["incoming"], Decimal("0"))
+
+    def test_inline_booking_columns_use_cached_figures(self):
+        self._add_lines(2)
+        self._incoming_allocation(2)
+        inline = PurchaseOrderLineInline(PurchaseOrder, django_admin.site)
+        request = RequestFactory().get("/admin/")
+        request.user = self.user
+        inline.get_formset(request, self.po)
+        lines = list(self.po.lines.all())
+        with self.assertNumQueries(0):
+            for line in lines:
+                inline.received_net_retail(line)
+                inline.allocated_awaiting(line)
+                inline.incoming_available(line)
+        self.assertEqual(inline.allocated_awaiting(self.po_line), Decimal("2"))
+
+    def test_confirm_page_query_count_does_not_grow_with_lines(self):
+        self.client.force_login(self.user)
+        url = reverse("admin:purchases_purchaseorder_confirm_booked", args=[self.po.pk])
+        one_line = self._count(lambda: self.client.get(url))
+        self._add_lines(2)
+        four_lines = self._count(lambda: self.client.get(url))
+        self.assertEqual(one_line, four_lines)

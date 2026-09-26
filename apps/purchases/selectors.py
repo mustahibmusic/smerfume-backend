@@ -2,12 +2,24 @@
 Read-only purchase queries. Received quantities are always derived, never
 stored: POSTED STANDARD goods receipt lines minus POSTED REVERSAL lines. A
 short (missing) unit is never on a receipt line, so it never counts as
-received; damaged units that physically arrived do.
+received; damaged units that physically arrived do. Booked incoming quantities
+(DEC-009) are derived the same way; only confirmed_booked_quantity is stored.
 """
 
+from decimal import Decimal
+
+from django.conf import settings
 from django.db.models import Case, F, IntegerField, Sum, When
 
-from .models import GoodsReceipt, GoodsReceiptLine, PurchaseOrder, ReceiptDiscrepancy
+from apps.inventory.models import InventoryStock, StockReservationAllocation
+
+from .models import (
+    GoodsReceipt,
+    GoodsReceiptLine,
+    PurchaseOrder,
+    PurchaseOrderLine,
+    ReceiptDiscrepancy,
+)
 
 
 def _posted_standard_lines():
@@ -17,23 +29,23 @@ def _posted_standard_lines():
     )
 
 
-def received_quantities(po_line_ids):
+def received_quantities(po_line_ids, stock_type=None):
     """{po_line_id: net physically received units} for many PO lines in
-    one query. Lines with nothing received are omitted."""
+    one query. Lines with nothing received are omitted. stock_type limits
+    the count to one stock type (reversal lines copy the original's)."""
     signed = Case(
         When(receipt__receipt_type=GoodsReceipt.TYPE_REVERSAL, then=-F("quantity")),
         default=F("quantity"),
         output_field=IntegerField(),
     )
-    rows = (
-        GoodsReceiptLine.objects.filter(
-            receipt__status=GoodsReceipt.STATUS_POSTED,
-            receipt__receipt_type__in=(GoodsReceipt.TYPE_STANDARD, GoodsReceipt.TYPE_REVERSAL),
-            po_line_id__in=list(po_line_ids),
-        )
-        .values("po_line_id")
-        .annotate(total=Sum(signed))
+    lines = GoodsReceiptLine.objects.filter(
+        receipt__status=GoodsReceipt.STATUS_POSTED,
+        receipt__receipt_type__in=(GoodsReceipt.TYPE_STANDARD, GoodsReceipt.TYPE_REVERSAL),
+        po_line_id__in=list(po_line_ids),
     )
+    if stock_type is not None:
+        lines = lines.filter(stock_type=stock_type)
+    rows = lines.values("po_line_id").annotate(total=Sum(signed))
     return {row["po_line_id"]: row["total"] for row in rows if row["total"]}
 
 
@@ -93,3 +105,118 @@ def open_discrepancy_count(po):
         receipt__status=GoodsReceipt.STATUS_POSTED,
         status=ReceiptDiscrepancy.STATUS_OPEN,
     ).count()
+
+
+# --- Booked incoming inventory (DEC-009) ---
+
+ZERO = Decimal("0")
+
+
+def format_units(value):
+    """Whole-unit quantities for messages: Decimal("3.00") -> "3"."""
+    return str(int(value)) if value == int(value) else str(value)
+
+
+def active_incoming_allocated_quantities(po_line_ids):
+    """{po_line_id: units held by active incoming allocations}. Converted,
+    reallocated and released rows never count: converted units are already
+    covered by physical quantity_reserved."""
+    rows = (
+        StockReservationAllocation.objects.filter(
+            allocation_type=StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
+            incoming_status=StockReservationAllocation.INCOMING_ACTIVE,
+            purchase_order_line_id__in=list(po_line_ids),
+        )
+        .values("purchase_order_line_id")
+        .annotate(total=Sum("units"))
+    )
+    return {row["purchase_order_line_id"]: row["total"] for row in rows}
+
+
+def _incoming_amount(line, received, allocated):
+    """max(confirmed_booked_quantity - net retail received - active allocated, 0)."""
+    return max(
+        Decimal(line.confirmed_booked_quantity)
+        - received.get(line.pk, 0)
+        - allocated.get(line.pk, ZERO),
+        ZERO,
+    )
+
+
+def _incoming_amounts(lines):
+    """{line_id: incoming sellable} for already-filtered bookable lines."""
+    ids = [line.pk for line in lines]
+    received = received_quantities(ids, stock_type="retail")
+    allocated = active_incoming_allocated_quantities(ids)
+    return {line.pk: _incoming_amount(line, received, allocated) for line in lines}
+
+
+def booking_figures(po, lines=None):
+    """{line_id: {"received", "allocated", "incoming"}} for the lines of one
+    PO: net retail received, active incoming allocated and incoming sellable.
+    A fixed number of queries, whatever the line count (admin display)."""
+    if lines is None:
+        lines = po.lines.all()
+    lines = list(lines)
+    ids = [line.pk for line in lines]
+    received = received_quantities(ids, stock_type="retail")
+    allocated = active_incoming_allocated_quantities(ids)
+    bookable = po.status in PurchaseOrder.BOOKABLE_STATUSES
+    return {
+        line.pk: {
+            "received": received.get(line.pk, 0),
+            "allocated": allocated.get(line.pk, ZERO),
+            "incoming": _incoming_amount(line, received, allocated) if bookable else ZERO,
+        }
+        for line in lines
+    }
+
+
+def _bookable_lines(variant_ids, warehouse):
+    return list(
+        PurchaseOrderLine.objects.filter(
+            variant_id__in=list(variant_ids),
+            purchase_order__warehouse=warehouse,
+            purchase_order__status__in=PurchaseOrder.BOOKABLE_STATUSES,
+            confirmed_booked_quantity__gt=0,
+        )
+    )
+
+
+def incoming_sellable(po_line):
+    """Incoming units of one PO line still available to sell. Zero unless
+    its PO is issued or partially received."""
+    if po_line.purchase_order.status not in PurchaseOrder.BOOKABLE_STATUSES:
+        return ZERO
+    return _incoming_amounts([po_line])[po_line.pk]
+
+
+def incoming_sellable_by_line(variant_ids, warehouse):
+    """{po_line_id: incoming sellable} for bookable lines of these variants
+    at this warehouse. Lines with nothing to sell are omitted."""
+    amounts = _incoming_amounts(_bookable_lines(variant_ids, warehouse))
+    return {line_id: amount for line_id, amount in amounts.items() if amount > 0}
+
+
+def sellable_quantities(variant_ids, warehouse):
+    """{variant_id: physical retail available + incoming sellable}. The one
+    authoritative availability figure (DEC-009). Incoming counts only when
+    settings.BOOKED_INCOMING_SALES_ENABLED is True."""
+    variant_ids = list(variant_ids)
+    result = {variant_id: ZERO for variant_id in variant_ids}
+    for stock in InventoryStock.objects.filter(
+        variant_id__in=variant_ids,
+        warehouse=warehouse,
+        stock_type=InventoryStock.STOCK_TYPE_RETAIL,
+    ):
+        result[stock.variant_id] += max(stock.available, ZERO)
+    if settings.BOOKED_INCOMING_SALES_ENABLED:
+        lines = _bookable_lines(variant_ids, warehouse)
+        amounts = _incoming_amounts(lines)
+        for line in lines:
+            result[line.variant_id] += amounts[line.pk]
+    return result
+
+
+def sellable_quantity(variant, warehouse):
+    return sellable_quantities([variant.pk], warehouse)[variant.pk]

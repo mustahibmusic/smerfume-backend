@@ -4,7 +4,8 @@ change PurchaseOrder.status or GoodsReceipt.status. Every operation locks
 its rows, checks the move and stamps who/when.
 
 Lock order, always: PurchaseOrder -> GoodsReceipt -> ReceiptDiscrepancy
--> PurchaseOrderLine (by id) -> InventoryStock (by variant, stock type).
+-> PurchaseOrderLine (by id) -> StockReservation (by id)
+-> StockReservationAllocation (by id) -> InventoryStock (by variant, stock type).
 Only posting a goods receipt (or its reversal) changes inventory;
 discrepancies never do.
 """
@@ -23,6 +24,7 @@ from apps.inventory.services.receipt import (
 
 from . import selectors
 from .models import (
+    BookedQuantityChange,
     GoodsReceipt,
     GoodsReceiptLine,
     PurchaseOrder,
@@ -516,3 +518,62 @@ def resolve_discrepancy(discrepancy, user, resolution, notes=""):
         "status", "resolution", "resolution_notes", "resolved_by", "resolved_at", "updated_at",
     ])
     return discrepancy
+
+
+# --- Booked incoming inventory (DEC-009) ---
+
+
+class BookedQuantityError(Exception):
+    """Raised when a booked quantity change is not allowed."""
+
+
+@transaction.atomic
+def set_confirmed_booked_quantity(line, quantity, performed_by, note):
+    """Set the cumulative vendor-confirmed total for a PO line and append
+    one BookedQuantityChange. The total includes units already received;
+    it is not the remaining quantity. Returns (line, change); change is
+    None when the value is unchanged.
+
+    Lowering is refused while the remaining booking would no longer cover
+    the active incoming allocations of customer orders: those must be
+    reallocated or released first."""
+    note = (note or "").strip()
+    if isinstance(quantity, bool) or not isinstance(quantity, int):
+        raise BookedQuantityError("Booked quantity must be a whole number.")
+
+    po = _lock(line.purchase_order)
+    line = PurchaseOrderLine.objects.select_for_update().get(pk=line.pk)
+    if po.status not in PurchaseOrder.BOOKABLE_STATUSES:
+        raise BookedQuantityError(
+            f"{po.po_number} is {po.get_status_display()}. Booked quantities can be set "
+            "only on issued or partially received purchase orders."
+        )
+    if quantity < 0 or quantity > line.quantity_ordered:
+        raise BookedQuantityError(
+            f"Booked quantity must be between 0 and the ordered quantity ({line.quantity_ordered})."
+        )
+    if quantity == line.confirmed_booked_quantity:
+        return line, None
+    if not note:
+        raise BookedQuantityError("A note about the vendor confirmation is required.")
+
+    received = selectors.received_quantities([line.pk], stock_type="retail").get(line.pk, 0)
+    allocated = selectors.active_incoming_allocated_quantities([line.pk]).get(line.pk, 0)
+    if max(quantity - received, 0) < allocated:
+        raise BookedQuantityError(
+            f"Customer orders are waiting for {selectors.format_units(allocated)} unit(s) of "
+            f"this line. With {received} already received, the confirmed total cannot go "
+            f"below {selectors.format_units(received + allocated)}. Reallocate or cancel "
+            "those orders first."
+        )
+
+    change = BookedQuantityChange.objects.create(
+        purchase_order_line=line,
+        old_quantity=line.confirmed_booked_quantity,
+        new_quantity=quantity,
+        note=note,
+        performed_by=performed_by,
+    )
+    line.confirmed_booked_quantity = quantity
+    line.save(update_fields=["confirmed_booked_quantity", "updated_at"])
+    return line, change

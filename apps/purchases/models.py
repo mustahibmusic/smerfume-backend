@@ -58,6 +58,9 @@ class PurchaseOrder(BaseModel):
         STATUS_PARTIALLY_RECEIVED: {STATUS_ISSUED},
     }
     RECEIVABLE_STATUSES = (STATUS_ISSUED, STATUS_PARTIALLY_RECEIVED)
+    # POs whose lines may carry a vendor-confirmed booked quantity that
+    # counts as incoming stock (DEC-009).
+    BOOKABLE_STATUSES = (STATUS_ISSUED, STATUS_PARTIALLY_RECEIVED)
 
     # Header fields staff may edit in each status. Lines are editable only
     # in draft.
@@ -211,12 +214,26 @@ class PurchaseOrderLine(BaseModel):
         max_length=8, blank=True,
         validators=[RegexValidator(r"^\d{4,8}$", "Enter a 4 to 8 digit HSN code.")],
     )
+    confirmed_booked_quantity = models.PositiveIntegerField(
+        default=0,
+        verbose_name="Vendor-confirmed total (cumulative)",
+        help_text=(
+            "Total units the vendor has confirmed for this line, including units already "
+            "received. Not the remaining quantity: ordered 10, received 4, vendor confirms "
+            "the other 6 -> enter 10. Changed only through 'Confirm booked quantity'."
+        ),
+    )
 
     class Meta:
         ordering = ["id"]
+        permissions = [("confirm_booked_quantity", "Can confirm booked quantity")]
         constraints = [
             models.CheckConstraint(
                 condition=Q(quantity_ordered__gt=0), name="po_line_quantity_ordered_gt_0"
+            ),
+            models.CheckConstraint(
+                condition=Q(confirmed_booked_quantity__gte=0),
+                name="po_line_confirmed_booked_gte_0",
             ),
             models.CheckConstraint(
                 condition=Q(unit_price__gte=0), name="po_line_unit_price_gte_0"
@@ -283,6 +300,36 @@ class PurchaseOrderLine(BaseModel):
         else:
             ex_tax = self.discounted_line_amount
         return _round(ex_tax / self.quantity_ordered, UNIT_COST)
+
+
+class BookedQuantityChange(BaseModel):
+    """Append-only history of PurchaseOrderLine.confirmed_booked_quantity.
+    Written only by services.set_confirmed_booked_quantity; never updated
+    or deleted."""
+
+    purchase_order_line = models.ForeignKey(
+        PurchaseOrderLine, on_delete=models.PROTECT, related_name="booked_quantity_changes"
+    )
+    old_quantity = models.PositiveIntegerField()
+    new_quantity = models.PositiveIntegerField()
+    note = models.TextField(help_text="Vendor confirmation or reason for the change.")
+    performed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+"
+    )
+
+    class Meta:
+        ordering = ["-id"]
+
+    def __str__(self):
+        return f"{self.purchase_order_line}: {self.old_quantity} -> {self.new_quantity}"
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError("Booked quantity history cannot be changed.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Booked quantity history cannot be deleted.")
 
 
 class GoodsReceipt(BaseModel):

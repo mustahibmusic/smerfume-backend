@@ -534,8 +534,21 @@ class StockReservation(BaseModel):
         return f"Reservation({self.order_item_id}, {self.quantity}, {self.status})"
 
 
+# Physical allocations never carry incoming-source or lifecycle fields.
+_NO_INCOMING_FIELDS = {
+    "purchase_order_line__isnull": True,
+    "incoming_status__isnull": True,
+    "converted_by_receipt_line__isnull": True,
+    "replacement__isnull": True,
+    "split_from__isnull": True,
+    "incoming_resolved_at__isnull": True,
+}
+
+
 class StockReservationAllocation(BaseModel):
-    """Records exactly what physical capacity one StockReservation claimed.
+    """Records exactly what capacity one StockReservation claimed: physical
+    stock (retail_unit / partial_lot) or vendor-confirmed booked stock that
+    has not arrived yet (incoming_po_line, DEC-009).
 
     Release and consume operate strictly off these rows — never by
     re-running FIFO or re-deriving what "should" be released/consumed.
@@ -543,10 +556,24 @@ class StockReservationAllocation(BaseModel):
 
     ALLOCATION_RETAIL_UNIT = "retail_unit"
     ALLOCATION_PARTIAL_LOT = "partial_lot"
+    ALLOCATION_INCOMING_PO_LINE = "incoming_po_line"
 
     ALLOCATION_TYPE_CHOICES = (
         (ALLOCATION_RETAIL_UNIT, "Retail Unit"),
         (ALLOCATION_PARTIAL_LOT, "Partial Lot"),
+        (ALLOCATION_INCOMING_PO_LINE, "Incoming PO Line"),
+    )
+
+    INCOMING_ACTIVE = "active"
+    INCOMING_CONVERTED = "converted"
+    INCOMING_REALLOCATED = "reallocated"
+    INCOMING_RELEASED = "released"
+
+    INCOMING_STATUS_CHOICES = (
+        (INCOMING_ACTIVE, "Active"),
+        (INCOMING_CONVERTED, "Converted"),
+        (INCOMING_REALLOCATED, "Reallocated"),
+        (INCOMING_RELEASED, "Released"),
     )
 
     reservation = models.ForeignKey(
@@ -579,6 +606,36 @@ class StockReservationAllocation(BaseModel):
     )
     ml_amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
 
+    # Populated when allocation_type == incoming_po_line (DEC-009): units
+    # promised from vendor-confirmed booked stock that has not arrived.
+    # Only incoming_status == active rows count in any current total.
+    purchase_order_line = models.ForeignKey(
+        "purchases.PurchaseOrderLine",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="incoming_allocations",
+    )
+    incoming_status = models.CharField(
+        max_length=20, choices=INCOMING_STATUS_CHOICES, null=True, blank=True
+    )
+    converted_by_receipt_line = models.ForeignKey(
+        "purchases.GoodsReceiptLine",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="converted_allocations",
+    )
+    # The allocation that took over this row's units (converted/reallocated).
+    replacement = models.ForeignKey(
+        "self", on_delete=models.PROTECT, null=True, blank=True, related_name="replaced"
+    )
+    # Lineage only: the incoming row this active remainder was split from.
+    split_from = models.ForeignKey(
+        "self", on_delete=models.PROTECT, null=True, blank=True, related_name="split_remainders"
+    )
+    incoming_resolved_at = models.DateTimeField(null=True, blank=True)
+
     class Meta:
         constraints = [
             models.CheckConstraint(
@@ -589,6 +646,7 @@ class StockReservationAllocation(BaseModel):
                         units__isnull=False,
                         partial_lot__isnull=True,
                         ml_amount__isnull=True,
+                        **_NO_INCOMING_FIELDS,
                     )
                     | models.Q(
                         allocation_type="partial_lot",
@@ -597,13 +655,72 @@ class StockReservationAllocation(BaseModel):
                         inventory_stock__isnull=True,
                         units__isnull=True,
                         claimed_ml__isnull=True,
+                        **_NO_INCOMING_FIELDS,
+                    )
+                    | models.Q(
+                        allocation_type="incoming_po_line",
+                        purchase_order_line__isnull=False,
+                        units__isnull=False,
+                        incoming_status__isnull=False,
+                        inventory_stock__isnull=True,
+                        partial_lot__isnull=True,
+                        ml_amount__isnull=True,
+                        claimed_ml__isnull=True,
                     )
                 ),
                 name="allocation_fields_match_allocation_type",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(incoming_status__isnull=True)
+                    | models.Q(
+                        incoming_status="active",
+                        converted_by_receipt_line__isnull=True,
+                        replacement__isnull=True,
+                        incoming_resolved_at__isnull=True,
+                    )
+                    | models.Q(
+                        incoming_status="converted",
+                        converted_by_receipt_line__isnull=False,
+                        replacement__isnull=False,
+                        incoming_resolved_at__isnull=False,
+                    )
+                    | models.Q(
+                        incoming_status="reallocated",
+                        converted_by_receipt_line__isnull=True,
+                        replacement__isnull=False,
+                        incoming_resolved_at__isnull=False,
+                    )
+                    | models.Q(
+                        incoming_status="released",
+                        converted_by_receipt_line__isnull=True,
+                        replacement__isnull=True,
+                        incoming_resolved_at__isnull=False,
+                    )
+                ),
+                name="allocation_incoming_lifecycle_fields",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(allocation_type="incoming_po_line") | models.Q(units__gt=0)
+                ),
+                name="allocation_incoming_units_gt_0",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["purchase_order_line"],
+                condition=models.Q(allocation_type="incoming_po_line", incoming_status="active"),
+                name="alloc_active_incoming_line_idx",
             ),
         ]
 
     def __str__(self):
         if self.allocation_type == self.ALLOCATION_RETAIL_UNIT:
             return f"{self.units} retail unit(s) for reservation {self.reservation_id}"
+        if self.allocation_type == self.ALLOCATION_INCOMING_PO_LINE:
+            return (
+                f"{self.units} incoming unit(s) from PO line {self.purchase_order_line_id} "
+                f"[{self.incoming_status}] for reservation {self.reservation_id}"
+            )
         return f"{self.ml_amount}ml from lot {self.partial_lot_id} for reservation {self.reservation_id}"

@@ -52,6 +52,7 @@ from apps.inventory.models import (
 from apps.inventory.services import reservation as reservation_service
 from apps.inventory.services import adjustment as adjustment_service
 from apps.orders.models import Order, OrderItem
+from apps.purchases.models import PurchaseOrder, PurchaseOrderLine
 
 User = get_user_model()
 
@@ -1046,3 +1047,176 @@ class VendorMasterTests(TestCase):
         vendor = form.save()
         self.assertEqual(vendor.gstin, "27AAPFU0939F1ZV")
         self.assertTrue(vendor.vendor_code.startswith("VEN-"))
+
+
+def _incoming_variant(sku):
+    brand = Brand.objects.get_or_create(name="IncBrand", slug="incbrand")[0]
+    category = Category.objects.get_or_create(name="IncCat", slug="inccat")[0]
+    product = Product.objects.get_or_create(
+        name="IncProduct", slug="incproduct", defaults={"brand": brand, "category": category},
+    )[0]
+    edition = ProductEdition.objects.get_or_create(
+        product=product, slug="incproduct-edp",
+        defaults={"name": "EDP", "concentration": "edp", "gender": "unisex"},
+    )[0]
+    return ProductVariant.objects.create(
+        edition=edition, size_ml=100, selling_price="4500.00", mrp="5000.00", sku=sku,
+    )
+
+
+# --- P2A: incoming allocation schema ---
+
+
+class _IncomingAllocationBase(TestCase):
+    """A direct-sale reservation and a PO line to hang incoming rows on."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="incoming", password="x")
+        self.warehouse = Warehouse.objects.get(is_default=True)
+        self.variant = _incoming_variant("SKU-INC-100")
+        self.stock = InventoryStock.objects.create(
+            variant=self.variant, warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=5,
+        )
+        supplier = Supplier.objects.create(name="Incoming Vendor")
+        po = PurchaseOrder.objects.create(
+            supplier=supplier, warehouse=self.warehouse, created_by=self.user,
+        )
+        self.po_line = PurchaseOrderLine.objects.create(
+            purchase_order=po, variant=self.variant, quantity_ordered=10,
+            unit_price=Decimal("100.00"),
+        )
+        order = Order.objects.create(
+            user=self.user, order_number="INC-1", subtotal=Decimal("0"), total=Decimal("0"),
+        )
+        item = OrderItem.objects.create(
+            order=order, variant=self.variant, quantity=2, unit_price=Decimal("4500"),
+        )
+        self.reservation = StockReservation.objects.create(
+            order_item=item, variant=self.variant, warehouse=self.warehouse,
+            purpose=StockReservation.PURPOSE_DIRECT_SALE, quantity=Decimal("2"),
+        )
+
+    def _incoming(self, **kwargs):
+        values = {
+            "reservation": self.reservation,
+            "allocation_type": StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
+            "purchase_order_line": self.po_line,
+            "units": Decimal("2"),
+            "incoming_status": StockReservationAllocation.INCOMING_ACTIVE,
+        }
+        values.update(kwargs)
+        return StockReservationAllocation.objects.create(**values)
+
+    def _physical(self, **kwargs):
+        values = {
+            "reservation": self.reservation,
+            "allocation_type": StockReservationAllocation.ALLOCATION_RETAIL_UNIT,
+            "inventory_stock": self.stock,
+            "units": Decimal("1"),
+        }
+        values.update(kwargs)
+        return StockReservationAllocation.objects.create(**values)
+
+    def _assert_rejected(self, factory, **kwargs):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            factory(**kwargs)
+
+
+class IncomingAllocationSchemaTests(_IncomingAllocationBase):
+    """DB constraints for incoming_po_line allocations (DEC-009)."""
+
+    def test_active_incoming_row_is_valid(self):
+        row = self._incoming()
+        self.assertEqual(row.incoming_status, "active")
+
+    def test_incoming_requires_po_line_and_status(self):
+        self._assert_rejected(self._incoming, purchase_order_line=None)
+        self._assert_rejected(self._incoming, incoming_status=None)
+
+    def test_incoming_rejects_physical_source_fields(self):
+        self._assert_rejected(self._incoming, inventory_stock=self.stock)
+
+    def test_incoming_units_must_be_positive(self):
+        self._assert_rejected(self._incoming, units=Decimal("0"))
+
+    def test_physical_rows_reject_incoming_fields(self):
+        self._assert_rejected(self._physical, purchase_order_line=self.po_line)
+        self._assert_rejected(self._physical, incoming_status="active")
+        source = self._incoming()
+        self._assert_rejected(self._physical, split_from=source)
+
+    def test_existing_physical_row_still_valid(self):
+        self.assertIsNone(self._physical().incoming_status)
+
+    def test_active_rejects_resolution_fields(self):
+        physical = self._physical()
+        self._assert_rejected(self._incoming, replacement=physical)
+        self._assert_rejected(self._incoming, incoming_resolved_at=timezone.now())
+
+    def test_converted_requires_receipt_line_and_replacement(self):
+        physical = self._physical()
+        self._assert_rejected(
+            self._incoming, incoming_status="converted", replacement=physical,
+            incoming_resolved_at=timezone.now(),
+        )
+
+    def test_reallocated_requires_replacement(self):
+        self._assert_rejected(
+            self._incoming, incoming_status="reallocated", incoming_resolved_at=timezone.now(),
+        )
+        physical = self._physical()
+        row = self._incoming(
+            incoming_status="reallocated", replacement=physical,
+            incoming_resolved_at=timezone.now(),
+        )
+        self.assertEqual(row.replacement, physical)
+
+    def test_released_rejects_links(self):
+        physical = self._physical()
+        self._assert_rejected(
+            self._incoming, incoming_status="released", replacement=physical,
+            incoming_resolved_at=timezone.now(),
+        )
+        row = self._incoming(incoming_status="released", incoming_resolved_at=timezone.now())
+        self.assertIsNone(row.replacement)
+
+    def test_split_from_links_remainder_to_source(self):
+        source = self._incoming()
+        remainder = self._incoming(units=Decimal("1"), split_from=source)
+        self.assertEqual(remainder.split_from, source)
+        self.assertEqual(list(source.split_remainders.all()), [remainder])
+
+
+class IncomingAllocationGuardTests(_IncomingAllocationBase):
+    """P2A has no incoming handling in release/consume; they must refuse
+    clearly instead of crashing or skipping."""
+
+    def test_release_refuses_reservation_with_incoming_row(self):
+        self._incoming()
+        with self.assertRaises(reservation_service.InvalidReservationStateError):
+            reservation_service.release_reservation(self.reservation)
+
+    def test_consume_refuses_reservation_with_incoming_row(self):
+        self._incoming()
+        with self.assertRaises(reservation_service.InvalidReservationStateError):
+            reservation_service.consume_reservation(self.reservation)
+
+    def test_historical_incoming_rows_do_not_block_release_or_consume(self):
+        stock_before = InventoryStock.objects.get(pk=self.stock.pk).quantity
+        self._physical(units=Decimal("2"))
+        InventoryStock.objects.filter(pk=self.stock.pk).update(quantity_reserved=2)
+        self._incoming(incoming_status="released", incoming_resolved_at=timezone.now())
+        reservation_service.consume_reservation(self.reservation)
+        self.reservation.refresh_from_db()
+        self.assertEqual(self.reservation.status, StockReservation.STATUS_CONSUMED)
+        self.assertEqual(
+            InventoryStock.objects.get(pk=self.stock.pk).quantity, stock_before - 2
+        )
+
+    def test_historical_incoming_row_skipped_on_release(self):
+        self._physical(units=Decimal("2"))
+        InventoryStock.objects.filter(pk=self.stock.pk).update(quantity_reserved=2)
+        self._incoming(incoming_status="released", incoming_resolved_at=timezone.now())
+        reservation_service.release_reservation(self.reservation)
+        self.assertEqual(InventoryStock.objects.get(pk=self.stock.pk).quantity_reserved, 0)

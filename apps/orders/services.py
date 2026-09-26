@@ -25,6 +25,7 @@ from apps.inventory.models import (
     PartialBottleLot,
     StockMovement,
     StockReservation,
+    StockReservationAllocation,
     StockTransaction,
     Warehouse,
 )
@@ -189,6 +190,9 @@ def pack_order(order, performed_by=None):
     allocation is committed physically. Packing directly from `pending`
     would bypass that gate, so it is rejected rather than assumed allowed.
 
+    Also rejected while any item still has an active incoming (booked)
+    allocation: those units have not arrived. The order stays confirmed.
+
     Consumes each OrderItem's existing StockReservation via
     reservation_service.consume_reservation() — which itself only ever
     replays the exact StockReservationAllocation rows recorded at checkout.
@@ -207,6 +211,15 @@ def pack_order(order, performed_by=None):
     if order.status != Order.STATUS_CONFIRMED:
         raise OrderPackingError(
             f"Cannot pack an order in status={order.status}; it must be confirmed first."
+        )
+
+    if StockReservationAllocation.objects.filter(
+        reservation__order_item__order=order,
+        allocation_type=StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
+        incoming_status=StockReservationAllocation.INCOMING_ACTIVE,
+    ).exists():
+        raise OrderPackingError(
+            "Cannot pack this order yet: it is awaiting incoming (booked) stock."
         )
 
     for order_item in order.items.all():

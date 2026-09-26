@@ -69,6 +69,11 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         # "is there sellable stock right now" signal for catalogue/SEM
         # display, not a simulation of full decant-fulfillment logic — the
         # authoritative check still happens at reservation time in checkout.
+        # With booked incoming sales on, ProductViewSet supplies the
+        # selector's sellable quantities (default warehouse) instead.
+        sellable = self.context.get("sellable_quantities")
+        if sellable is not None:
+            return sellable.get(obj.pk, 0) > 0
         return any(
             (s.quantity - s.quantity_reserved) > 0
             for s in obj.inventory_stocks.all()

@@ -3257,3 +3257,236 @@ class InStoreSaleAdminTests(TestCase):
         resp = client.post(ADMIN_IN_STORE_URL, self._post_data())
         self.assertIn(resp.status_code, (302, 403))
         self.assertEqual(Order.objects.count(), 0)
+
+
+# ── P2B: booked incoming checkout ─────────────────────────────────────────────
+
+
+def _book_incoming(variant, confirmed, status=None, expected_date=None, warehouse=None):
+    """An issued PO line for `variant` with `confirmed` vendor-booked units."""
+    from apps.inventory.models import Supplier
+    from apps.purchases.models import PurchaseOrder, PurchaseOrderLine
+
+    staff = User.objects.filter(username="p2b-buyer").first() or User.objects.create_user(
+        username="p2b-buyer", password="x", mobile_number=f"+9197{uuid.uuid4().int % 10**8:08d}",
+    )
+    po = PurchaseOrder.objects.create(
+        supplier=Supplier.objects.get_or_create(name="P2B Vendor")[0],
+        warehouse=warehouse or Warehouse.objects.get(is_default=True),
+        created_by=staff,
+        status=status or PurchaseOrder.STATUS_ISSUED,
+        expected_date=expected_date,
+    )
+    return PurchaseOrderLine.objects.create(
+        purchase_order=po, variant=variant, quantity_ordered=max(confirmed, 1),
+        unit_price=Decimal("100.00"), confirmed_booked_quantity=confirmed,
+    )
+
+
+def _add_active_incoming(reservation, po_line, units):
+    from apps.inventory.models import StockReservationAllocation
+
+    return StockReservationAllocation.objects.create(
+        reservation=reservation,
+        allocation_type=StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
+        purchase_order_line=po_line,
+        units=Decimal(units),
+        incoming_status=StockReservationAllocation.INCOMING_ACTIVE,
+    )
+
+
+class PackOrderIncomingGateTests(TestCase):
+    """pack_order refuses while any item still waits for booked stock."""
+
+    def setUp(self):
+        self.user = _make_user()
+        self.staff = User.objects.create_superuser(
+            username="p2bstaff", email="p2bstaff@example.com", password="testpass123",
+        )
+        self.variant = _make_variant()
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=1)
+        client = APIClient()
+        client.credentials(**_auth_header(self.user))
+        resp = client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.order = Order.objects.get(order_number=resp.data["order_number"])
+        self.reservation = StockReservation.objects.get(order_item__order=self.order)
+        self.incoming = _add_active_incoming(self.reservation, _book_incoming(self.variant, 5), 1)
+        self.stock = InventoryStock.objects.get(variant=self.variant, stock_type="retail")
+
+    def test_cod_verify_unchanged_with_incoming_allocation(self):
+        order_services.verify_cod_order(self.order, verified_by=self.staff)
+        self.order.refresh_from_db()
+        self.reservation.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_CONFIRMED)
+        self.assertEqual(self.reservation.status, StockReservation.STATUS_CONFIRMED)
+
+    def test_pack_refuses_while_incoming_active(self):
+        order_services.verify_cod_order(self.order, verified_by=self.staff)
+        with self.assertRaisesMessage(order_services.OrderPackingError, "awaiting incoming"):
+            order_services.pack_order(self.order, performed_by=self.staff)
+        self.order.refresh_from_db()
+        self.reservation.refresh_from_db()
+        self.stock.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_CONFIRMED)
+        self.assertEqual(self.reservation.status, StockReservation.STATUS_CONFIRMED)
+        self.assertEqual((self.stock.quantity, self.stock.quantity_reserved), (100, 1))
+        self.assertFalse(StockMovement.objects.filter(source_order_item__order=self.order).exists())
+
+    def test_pack_proceeds_once_incoming_no_longer_active(self):
+        order_services.verify_cod_order(self.order, verified_by=self.staff)
+        type(self.incoming).objects.filter(pk=self.incoming.pk).update(
+            incoming_status="released", incoming_resolved_at=timezone.now(),
+        )
+        order_services.pack_order(self.order, performed_by=self.staff)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_PROCESSING)
+
+    def test_admin_pack_action_warns_instead_of_erroring(self):
+        order_services.verify_cod_order(self.order, verified_by=self.staff)
+        self.client.login(username="p2bstaff@example.com", password="testpass123")
+        resp = self.client.post(
+            "/admin/orders/order/",
+            {"action": "pack_orders", "_selected_action": [self.order.pk]},
+            follow=True,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "awaiting incoming")
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_CONFIRMED)
+
+
+class CheckoutBookedIncomingTests(TestCase):
+    """Online checkout reserves booked incoming stock only while
+    BOOKED_INCOMING_SALES_ENABLED is on; the customer API never changes."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user()
+        self.client.credentials(**_auth_header(self.user))
+        self.variant = _make_variant()
+        InventoryStock.objects.filter(variant=self.variant).update(quantity=Decimal("0"))
+        self.line = _book_incoming(self.variant, 5)
+        self.cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=self.cart, variant=self.variant, quantity=2)
+
+    def _checkout(self):
+        return self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+
+    def _incoming_rows(self):
+        from apps.inventory.models import StockReservationAllocation
+        return StockReservationAllocation.objects.filter(
+            allocation_type=StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
+        )
+
+    def test_flag_defaults_to_off(self):
+        from django.conf import settings
+        self.assertIs(settings.BOOKED_INCOMING_SALES_ENABLED, False)
+
+    def test_flag_off_ignores_booked_stock_and_never_queries_purchases(self):
+        from django.test.utils import CaptureQueriesContext
+        with CaptureQueriesContext(connection) as ctx:
+            resp = self._checkout()
+        self.assertEqual(resp.status_code, 400)
+        self.assertTrue(resp.data["error"].startswith("Only 0.00 unit(s) of"))
+        self.assertEqual(Order.objects.count(), 0)
+        self.assertFalse(self._incoming_rows().exists())
+        self.assertFalse([q for q in ctx.captured_queries if "purchases_" in q["sql"]])
+
+    def test_flag_on_reserves_incoming_with_unchanged_response_shape(self):
+        from django.test import override_settings
+        physical_variant = _make_variant()
+        other = _make_user(mobile="+919700000402", username="p2b-physical")
+        CartItem.objects.create(cart=Cart.objects.create(user=other), variant=physical_variant, quantity=1)
+        other_client = APIClient()
+        other_client.credentials(**_auth_header(other))
+        physical_resp = other_client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+
+        with override_settings(BOOKED_INCOMING_SALES_ENABLED=True):
+            resp = self._checkout()
+
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(set(resp.data), set(physical_resp.data))
+        self.assertEqual(set(resp.data["items"][0]), set(physical_resp.data["items"][0]))
+        self.assertNotIn("incoming", str(resp.data).lower())
+        row = self._incoming_rows().get()
+        self.assertEqual((row.purchase_order_line, row.units, row.incoming_status),
+                         (self.line, 2, "active"))
+        self.assertEqual(row.reservation.order_item.order.order_number, resp.data["order_number"])
+        self.assertFalse(self.cart.items.exists())
+
+    def test_flag_on_shortfall_keeps_public_error_format(self):
+        from django.test import override_settings
+        CartItem.objects.filter(cart=self.cart).update(quantity=6)
+        with override_settings(BOOKED_INCOMING_SALES_ENABLED=True):
+            resp = self._checkout()
+        self.assertEqual(resp.status_code, 400)
+        self.assertTrue(resp.data["error"].startswith("Only 5.00 unit(s) of"))
+        self.assertNotIn("incoming", resp.data["error"].lower())
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_in_store_sale_stays_physical_with_flag_on(self):
+        from django.test import override_settings
+        staff = _make_staff(mobile="+919700000403", username="p2b-counter")
+        with override_settings(BOOKED_INCOMING_SALES_ENABLED=True):
+            with self.assertRaises(reservation_service.InsufficientStockError):
+                order_services.create_in_store_order(
+                    lines=[(self.variant, 1)], staff_user=staff,
+                    customer_mobile="9811100099", payment_method=Order.PAYMENT_METHOD_CASH,
+                )
+        self.assertFalse(self._incoming_rows().exists())
+
+
+class OrderAdminAwaitingIncomingTests(TestCase):
+    """Read-only admin surfacing of orders waiting for booked stock."""
+
+    def setUp(self):
+        self.staff = User.objects.create_superuser(
+            username="p2badmin", email="p2badmin@example.com", password="testpass123",
+        )
+        self.client.login(username="p2badmin@example.com", password="testpass123")
+        self.variant = _make_variant()
+        self.line = _book_incoming(self.variant, 5)
+        self.waiting = self._order("+919700000501")
+        self.ready = self._order("+919700000502")
+        _add_active_incoming(
+            StockReservation.objects.get(order_item__order=self.waiting), self.line, 1,
+        )
+
+    def _order(self, mobile):
+        user = _make_user(mobile=mobile, username=f"p2b{mobile[-3:]}")
+        CartItem.objects.create(cart=Cart.objects.create(user=user), variant=self.variant, quantity=1)
+        client = APIClient()
+        client.credentials(**_auth_header(user))
+        resp = client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        return Order.objects.get(order_number=resp.data["order_number"])
+
+    def test_changelist_shows_awaiting_incoming_column(self):
+        resp = self.client.get("/admin/orders/order/")
+        self.assertContains(resp, "Awaiting incoming")
+
+    def test_filter_yes_and_no(self):
+        resp = self.client.get("/admin/orders/order/", {"awaiting_incoming": "yes"})
+        self.assertContains(resp, self.waiting.order_number)
+        self.assertNotContains(resp, self.ready.order_number)
+        resp = self.client.get("/admin/orders/order/", {"awaiting_incoming": "no"})
+        self.assertContains(resp, self.ready.order_number)
+        self.assertNotContains(resp, self.waiting.order_number)
+
+    def test_changelist_query_count_independent_of_rows(self):
+        from django.test.utils import CaptureQueriesContext
+        with CaptureQueriesContext(connection) as before:
+            self.client.get("/admin/orders/order/")
+        for n in range(3):
+            order = self._order(f"+91970000060{n}")
+            _add_active_incoming(StockReservation.objects.get(order_item__order=order), self.line, 1)
+        with CaptureQueriesContext(connection) as after:
+            self.client.get("/admin/orders/order/")
+        self.assertEqual(len(before.captured_queries), len(after.captured_queries))
+
+    def test_change_page_shows_allocation_breakdown(self):
+        resp = self.client.get(f"/admin/orders/order/{self.waiting.pk}/change/")
+        self.assertContains(resp, "Stock allocation")
+        self.assertContains(resp, self.line.purchase_order.po_number)
+        self.assertContains(resp, "Incoming")
+        self.assertContains(resp, "Physical")

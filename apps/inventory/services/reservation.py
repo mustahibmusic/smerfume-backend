@@ -14,7 +14,8 @@ elsewhere):
       select_for_update() on the rows it touches before reading them.
 """
 
-from decimal import ROUND_CEILING, Decimal
+import datetime
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from django.db import transaction
 from django.utils import timezone
@@ -31,31 +32,53 @@ class InvalidReservationStateError(Exception):
 
 
 def _refuse_active_incoming_allocations(reservation):
-    """Active incoming (booked) allocations are released/converted from
-    P2B/P2C on. Until then, refuse clearly rather than mis-handle them.
-    Historical (converted/reallocated/released) incoming rows are skipped."""
+    """Active incoming (booked) units are not on the shelf yet, so they can
+    never be consumed; GRN conversion or reallocation (P2C) resolves them
+    first. Historical (converted/reallocated/released) rows are skipped."""
     Allocation = inv_models.StockReservationAllocation
     if reservation.allocations.filter(
         allocation_type=Allocation.ALLOCATION_INCOMING_PO_LINE,
         incoming_status=Allocation.INCOMING_ACTIVE,
     ).exists():
         raise InvalidReservationStateError(
-            "This reservation has active incoming (booked) allocations, which are not "
-            "handled yet."
+            "This reservation has active incoming (booked) allocations that have not "
+            "arrived yet."
+        )
+
+
+def _release_active_incoming_allocations(reservation):
+    """Mark active incoming rows released. They hold no stock, so nothing
+    else changes; their units count as incoming sellable again."""
+    Allocation = inv_models.StockReservationAllocation
+    ids = list(
+        reservation.allocations.filter(
+            allocation_type=Allocation.ALLOCATION_INCOMING_PO_LINE,
+            incoming_status=Allocation.INCOMING_ACTIVE,
+        )
+        .select_for_update()
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
+    if ids:
+        now = timezone.now()
+        Allocation.objects.filter(pk__in=ids).update(
+            incoming_status=Allocation.INCOMING_RELEASED,
+            incoming_resolved_at=now,
+            updated_at=now,
         )
 
 
 def _physical_allocations(reservation):
-    """Locked physical allocation rows. After the guard above, any incoming
-    row left is historical and holds no capacity."""
+    """Locked physical allocation rows. Incoming rows are never physical
+    capacity, whatever their status."""
     return reservation.allocations.exclude(
         allocation_type=inv_models.StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE
     ).select_for_update()
 
 
-def _lock_retail_stock(variant, warehouse):
+def _lock_retail_stock(variant_id, warehouse):
     stock, _ = inv_models.InventoryStock.objects.select_for_update().get_or_create(
-        variant=variant,
+        variant_id=variant_id,
         warehouse=warehouse,
         stock_type=inv_models.InventoryStock.STOCK_TYPE_RETAIL,
         defaults={"quantity": Decimal("0")},
@@ -63,41 +86,147 @@ def _lock_retail_stock(variant, warehouse):
     return stock
 
 
-def _lock_partial_lots(variant, warehouse):
+def _lock_partial_lots(variant_id, warehouse):
     return list(
         inv_models.PartialBottleLot.objects.select_for_update()
-        .filter(variant=variant, warehouse=warehouse, is_depleted=False)
+        .filter(variant_id=variant_id, warehouse=warehouse, is_depleted=False)
         .order_by("opened_at")
     )
 
 
+def _lock_candidate_lines(variant_ids, warehouse):
+    """Phase 1 lock: PO lines that may back incoming sales, by id. The PO
+    row itself is not locked (spec §8)."""
+    from apps.purchases.models import PurchaseOrder, PurchaseOrderLine
+
+    return list(
+        PurchaseOrderLine.objects.select_for_update(of=("self",))
+        .filter(
+            variant_id__in=variant_ids,
+            purchase_order__warehouse=warehouse,
+            purchase_order__status__in=PurchaseOrder.BOOKABLE_STATUSES,
+            confirmed_booked_quantity__gt=0,
+        )
+        .order_by("pk")
+    )
+
+
+def _incoming_capacity(variant_ids, warehouse):
+    """{variant_id: [[po_line, incoming units left], ...]} in allocation
+    priority order: expected_date (nulls last), then PO id, then line id.
+
+    The parent PO status is re-read after the line lock, so a PO closed or
+    cancelled meanwhile drops out (race with P2C close/cancel guards)."""
+    from apps.purchases import selectors as purchase_selectors
+    from apps.purchases.models import PurchaseOrder
+
+    lines = _lock_candidate_lines(variant_ids, warehouse)
+    if not lines:
+        return {}
+    po_rows = {
+        pk: (status, expected_date)
+        for pk, status, expected_date in PurchaseOrder.objects.filter(
+            pk__in={line.purchase_order_id for line in lines}
+        ).values_list("pk", "status", "expected_date")
+    }
+    lines = [
+        line for line in lines
+        if po_rows[line.purchase_order_id][0] in PurchaseOrder.BOOKABLE_STATUSES
+    ]
+    amounts = purchase_selectors.incoming_sellable_amounts(lines)
+
+    def priority(line):
+        expected_date = po_rows[line.purchase_order_id][1]
+        return (
+            expected_date is None, expected_date or datetime.date.min,
+            line.purchase_order_id, line.pk,
+        )
+
+    capacity = {}
+    for line in sorted(lines, key=priority):
+        if amounts[line.pk] > 0:
+            capacity.setdefault(line.variant_id, []).append([line, amounts[line.pk]])
+    return capacity
+
+
 @transaction.atomic
 def reserve_for_order_item(order_item, warehouse):
-    """Reserve inventory for one OrderItem. Returns the created StockReservation.
+    """Reserve physical inventory for one OrderItem (in-store sales). Returns
+    the created StockReservation. Never uses booked incoming stock.
 
     Dispatches to a direct-sale or decant-fulfillment reservation depending
     on whether the ordered variant has a DecantSource. Raises
     InsufficientStockError if there isn't enough available capacity.
     """
-    variant = order_item.variant
-    decant_source = inv_models.DecantSource.objects.filter(decant_variant=variant).first()
-
-    if decant_source is None:
-        return _reserve_direct(order_item, variant, warehouse)
-    return _reserve_decant(order_item, decant_source, warehouse)
+    return reserve_order_items([order_item], warehouse, allow_incoming=False)[0]
 
 
-def _reserve_direct(order_item, variant, warehouse):
-    stock = _lock_retail_stock(variant, warehouse)
-    needed = Decimal(order_item.quantity)
+@transaction.atomic
+def reserve_order_items(order_items, warehouse, allow_incoming=False):
+    """Reserve inventory for every OrderItem of one online order, all or
+    nothing. Returns the StockReservations in item order.
 
-    if stock.available < needed:
-        raise InsufficientStockError(
-            f"Only {stock.available} unit(s) of {variant} available at {warehouse}, needed {needed}."
+    Lock order (spec §8): candidate incoming PurchaseOrderLines by id (only
+    when allow_incoming), then retail InventoryStock by variant id, then
+    PartialBottleLots. Direct-sale items take physical stock first, then
+    booked incoming units; decant items are physical only. Any shortfall
+    raises InsufficientStockError and rolls the whole order back.
+    """
+    order_items = list(order_items)
+    variant_ids = {item.variant_id for item in order_items}
+    decant_sources = {
+        source.decant_variant_id: source
+        for source in inv_models.DecantSource.objects.select_related("source_variant").filter(
+            decant_variant_id__in=variant_ids
         )
+    }
+    direct_ids = sorted(variant_ids - decant_sources.keys())
+    source_ids = sorted({source.source_variant_id for source in decant_sources.values()})
 
-    stock.quantity_reserved += needed
-    stock.save(update_fields=["quantity_reserved", "updated_at"])
+    incoming = _incoming_capacity(direct_ids, warehouse) if allow_incoming and direct_ids else {}
+    stocks = {
+        variant_id: _lock_retail_stock(variant_id, warehouse)
+        for variant_id in sorted(set(direct_ids) | set(source_ids))
+    }
+    lots = {variant_id: _lock_partial_lots(variant_id, warehouse) for variant_id in source_ids}
+
+    reservations = []
+    for item in order_items:
+        source = decant_sources.get(item.variant_id)
+        if source is None:
+            reservations.append(_reserve_direct(
+                item, stocks[item.variant_id], incoming.get(item.variant_id, []), warehouse,
+            ))
+        else:
+            reservations.append(_reserve_decant(
+                item, source, stocks[source.source_variant_id],
+                lots[source.source_variant_id], warehouse,
+            ))
+    return reservations
+
+
+def _reserve_direct(order_item, stock, incoming, warehouse):
+    """Physical units first, then incoming units from `incoming` (the
+    shared, priority-ordered [[line, units left], ...] for this variant)."""
+    variant = order_item.variant
+    needed = Decimal(order_item.quantity)
+    incoming_total = sum((units for _, units in incoming), Decimal("0"))
+
+    if incoming_total:
+        # Whole physical bottles only, so the incoming remainder is whole too.
+        on_hand = max(stock.available, Decimal("0"))
+        physical = min(on_hand.to_integral_value(rounding=ROUND_FLOOR), needed)
+        available = on_hand + incoming_total
+    else:
+        physical = needed
+        available = stock.available
+    if available < needed:
+        raise InsufficientStockError(
+            f"Only {available} unit(s) of {variant} available at {warehouse}, needed {needed}."
+        )
+    incoming_needed = needed - physical
+    if incoming_needed != incoming_needed.to_integral_value():
+        raise ValueError(f"Incoming allocations must be whole units, got {incoming_needed}.")
 
     reservation = inv_models.StockReservation.objects.create(
         order_item=order_item,
@@ -106,22 +235,39 @@ def _reserve_direct(order_item, variant, warehouse):
         purpose=inv_models.StockReservation.PURPOSE_DIRECT_SALE,
         quantity=needed,
     )
-    inv_models.StockReservationAllocation.objects.create(
-        reservation=reservation,
-        allocation_type=inv_models.StockReservationAllocation.ALLOCATION_RETAIL_UNIT,
-        inventory_stock=stock,
-        units=needed,
-    )
+    if physical > 0:
+        stock.quantity_reserved += physical
+        stock.save(update_fields=["quantity_reserved", "updated_at"])
+        inv_models.StockReservationAllocation.objects.create(
+            reservation=reservation,
+            allocation_type=inv_models.StockReservationAllocation.ALLOCATION_RETAIL_UNIT,
+            inventory_stock=stock,
+            units=physical,
+        )
+
+    remaining = incoming_needed
+    for entry in incoming:
+        if remaining <= 0:
+            break
+        take = min(entry[1], remaining)
+        if take <= 0:
+            continue
+        entry[1] -= take
+        remaining -= take
+        inv_models.StockReservationAllocation.objects.create(
+            reservation=reservation,
+            allocation_type=inv_models.StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
+            purchase_order_line=entry[0],
+            units=take,
+            incoming_status=inv_models.StockReservationAllocation.INCOMING_ACTIVE,
+        )
     return reservation
 
 
-def _reserve_decant(order_item, decant_source, warehouse):
+def _reserve_decant(order_item, decant_source, retail_stock, lots, warehouse):
     source_variant = decant_source.source_variant
     size_ml = Decimal(source_variant.size_ml)
     needed_ml = Decimal(order_item.quantity) * decant_source.decant_volume_ml
-
-    lots = _lock_partial_lots(source_variant, warehouse)
-    retail_stock = _lock_retail_stock(source_variant, warehouse)
 
     available_ml = sum((lot.available_ml for lot in lots), Decimal("0")) + retail_stock.available * size_ml
     if available_ml < needed_ml:
@@ -187,15 +333,16 @@ def confirm_reservation(reservation):
 def release_reservation(reservation):
     """Release a held/confirmed reservation, restoring exactly the capacity
     recorded on its StockReservationAllocation rows. Never recalculates
-    what should be released — only reverses what was actually recorded."""
+    what should be released — only reverses what was actually recorded.
+    Active incoming (booked) rows become `released`, with no stock change."""
     reservation = inv_models.StockReservation.objects.select_for_update().get(pk=reservation.pk)
     if reservation.status not in (
         inv_models.StockReservation.STATUS_HELD,
         inv_models.StockReservation.STATUS_CONFIRMED,
     ):
         raise InvalidReservationStateError(f"Cannot release a reservation in status={reservation.status}")
-    _refuse_active_incoming_allocations(reservation)
 
+    _release_active_incoming_allocations(reservation)
     for allocation in _physical_allocations(reservation):
         if allocation.allocation_type == inv_models.StockReservationAllocation.ALLOCATION_RETAIL_UNIT:
             stock = inv_models.InventoryStock.objects.select_for_update().get(pk=allocation.inventory_stock_id)

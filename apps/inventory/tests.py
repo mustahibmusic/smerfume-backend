@@ -19,14 +19,18 @@ Test groups (stabilization pass — admin integrity audit):
     InventoryAdminIntegrityTests    — protected fields cannot be bypassed via admin
 """
 
+import datetime
+import re
 import threading
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.contrib import admin as django_admin
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, transaction
-from django.test import RequestFactory, TestCase, TransactionTestCase
+from django.test import RequestFactory, TestCase, TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from apps.catalog.models import Brand, Category, Product, ProductEdition, ProductVariant
@@ -1191,13 +1195,48 @@ class IncomingAllocationSchemaTests(_IncomingAllocationBase):
 
 
 class IncomingAllocationGuardTests(_IncomingAllocationBase):
-    """P2A has no incoming handling in release/consume; they must refuse
-    clearly instead of crashing or skipping."""
+    """Release frees active incoming rows (P2B); consume still refuses them
+    until they are converted or reallocated (P2C)."""
 
-    def test_release_refuses_reservation_with_incoming_row(self):
-        self._incoming()
-        with self.assertRaises(reservation_service.InvalidReservationStateError):
-            reservation_service.release_reservation(self.reservation)
+    def test_release_marks_active_incoming_row_released(self):
+        row = self._incoming()
+        reservation_service.release_reservation(self.reservation)
+        row.refresh_from_db()
+        self.reservation.refresh_from_db()
+        self.assertEqual(row.incoming_status, StockReservationAllocation.INCOMING_RELEASED)
+        self.assertIsNotNone(row.incoming_resolved_at)
+        self.assertEqual(self.reservation.status, StockReservation.STATUS_RELEASED)
+        stock = InventoryStock.objects.get(pk=self.stock.pk)
+        self.assertEqual((stock.quantity, stock.quantity_reserved), (5, 0))
+
+    def test_release_returns_units_to_incoming_sellable(self):
+        from apps.purchases import selectors as purchase_selectors
+        PurchaseOrderLine.objects.filter(pk=self.po_line.pk).update(confirmed_booked_quantity=10)
+        PurchaseOrder.objects.filter(pk=self.po_line.purchase_order_id).update(
+            status=PurchaseOrder.STATUS_ISSUED
+        )
+        self._incoming(units=Decimal("4"))
+        line = PurchaseOrderLine.objects.get(pk=self.po_line.pk)
+        self.assertEqual(purchase_selectors.incoming_sellable(line), 6)
+        reservation_service.release_reservation(self.reservation)
+        self.assertEqual(purchase_selectors.incoming_sellable(line), 10)
+
+    def test_release_mixed_physical_and_incoming(self):
+        self._physical(units=Decimal("1"))
+        InventoryStock.objects.filter(pk=self.stock.pk).update(quantity_reserved=1)
+        row = self._incoming(units=Decimal("1"))
+        reservation_service.release_reservation(self.reservation)
+        row.refresh_from_db()
+        self.assertEqual(row.incoming_status, StockReservationAllocation.INCOMING_RELEASED)
+        self.assertEqual(InventoryStock.objects.get(pk=self.stock.pk).quantity_reserved, 0)
+
+    def test_release_leaves_historical_incoming_rows_untouched(self):
+        resolved_at = timezone.now() - timezone.timedelta(days=1)
+        old = self._incoming(incoming_status="released", incoming_resolved_at=resolved_at)
+        self._incoming(units=Decimal("1"))
+        reservation_service.release_reservation(self.reservation)
+        old.refresh_from_db()
+        self.assertEqual(old.incoming_resolved_at, resolved_at)
 
     def test_consume_refuses_reservation_with_incoming_row(self):
         self._incoming()
@@ -1282,3 +1321,289 @@ class IncomingAllocationGuardTests(_IncomingAllocationBase):
         self.assertFalse(
             StockMovement.objects.filter(source_order_item=self.reservation.order_item).exists()
         )
+
+
+# --- P2B: whole-order checkout reservation ---
+
+
+class _ReserveOrderItemsBase(TestCase):
+    def setUp(self):
+        self.warehouse = Warehouse.objects.get(is_default=True)
+        self.buyer = User.objects.create_user(username="p2b-inv-buyer", password="x")
+        self.supplier = Supplier.objects.create(name="P2B Inventory Vendor")
+
+    def _variant(self, sku, stock=None, size_ml=100):
+        variant = _make_variant(sku, size_ml=size_ml)
+        if stock is not None:
+            InventoryStock.objects.create(
+                variant=variant, warehouse=self.warehouse,
+                stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal(stock),
+            )
+        return variant
+
+    def _items(self, *pairs):
+        """One order with an OrderItem per (variant, quantity) pair."""
+        first = _make_order_item(pairs[0][0], pairs[0][1])
+        items = [first]
+        for variant, quantity in pairs[1:]:
+            items.append(OrderItem.objects.create(
+                order=first.order, variant=variant, quantity=quantity,
+                unit_price=Decimal(variant.selling_price),
+            ))
+        return items
+
+    def _book(self, variant, confirmed, status=PurchaseOrder.STATUS_ISSUED,
+              expected_date=None, warehouse=None):
+        po = PurchaseOrder.objects.create(
+            supplier=self.supplier, warehouse=warehouse or self.warehouse,
+            created_by=self.buyer, status=status, expected_date=expected_date,
+        )
+        return PurchaseOrderLine.objects.create(
+            purchase_order=po, variant=variant, quantity_ordered=max(confirmed, 1),
+            unit_price=Decimal("100.00"), confirmed_booked_quantity=confirmed,
+        )
+
+    def _stock(self, variant):
+        return InventoryStock.objects.get(
+            variant=variant, warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL,
+        )
+
+    def _incoming_rows(self, **filters):
+        return StockReservationAllocation.objects.filter(
+            allocation_type=StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE, **filters,
+        )
+
+
+class ReserveOrderItemsPhysicalTests(_ReserveOrderItemsBase):
+    """reserve_order_items with allow_incoming=False: today's physical
+    behaviour, with whole-order sorted stock locks."""
+
+    def test_reserves_every_item_physically(self):
+        a, b = self._variant("P2B-PHY-A", stock=5), self._variant("P2B-PHY-B", stock=5)
+        reservations = reservation_service.reserve_order_items(
+            self._items((a, 2), (b, 3)), self.warehouse,
+        )
+        self.assertEqual([r.quantity for r in reservations], [2, 3])
+        self.assertEqual(self._stock(a).quantity_reserved, 2)
+        self.assertEqual(self._stock(b).quantity_reserved, 3)
+        for reservation in reservations:
+            allocation = reservation.allocations.get()
+            self.assertEqual(
+                allocation.allocation_type, StockReservationAllocation.ALLOCATION_RETAIL_UNIT
+            )
+            self.assertEqual(allocation.units, reservation.quantity)
+
+    def test_stock_rows_locked_in_variant_order(self):
+        variants = [self._variant(f"P2B-LOCK-{n}", stock=5) for n in range(3)]
+        items = self._items((variants[2], 1), (variants[0], 1), (variants[1], 1))
+        with CaptureQueriesContext(connection) as ctx:
+            reservation_service.reserve_order_items(items, self.warehouse)
+        locked = []
+        for query in ctx.captured_queries:
+            sql = query["sql"]
+            if "FOR UPDATE" in sql and "inventory_inventorystock" in sql:
+                match = re.search(r'"variant_id" = (\d+)', sql)
+                if match:
+                    locked.append(int(match.group(1)))
+        self.assertEqual(locked, sorted(v.pk for v in variants))
+
+    def test_direct_and_decant_items_share_the_source_counter(self):
+        source = self._variant("P2B-SRC", stock=1)
+        decant = _make_variant("P2B-DEC", size_ml=10, is_decant=True)
+        DecantSource.objects.create(
+            decant_variant=decant, source_variant=source, decant_volume_ml=Decimal("10"),
+        )
+        with self.assertRaises(reservation_service.InsufficientStockError):
+            reservation_service.reserve_order_items(
+                self._items((source, 1), (decant, 1)), self.warehouse,
+            )
+        self.assertEqual(self._stock(source).quantity_reserved, 0)
+        self.assertFalse(StockReservation.objects.exists())
+
+    def test_shortfall_rolls_back_every_item(self):
+        a, b = self._variant("P2B-RB-A", stock=5), self._variant("P2B-RB-B", stock=1)
+        with self.assertRaises(reservation_service.InsufficientStockError):
+            reservation_service.reserve_order_items(self._items((a, 2), (b, 2)), self.warehouse)
+        self.assertEqual(self._stock(a).quantity_reserved, 0)
+        self.assertFalse(StockReservation.objects.exists())
+
+    def test_shortfall_message_unchanged(self):
+        variant = self._variant("P2B-MSG", stock=1)
+        with self.assertRaises(reservation_service.InsufficientStockError) as ctx:
+            reservation_service.reserve_order_items(self._items((variant, 2)), self.warehouse)
+        self.assertEqual(
+            str(ctx.exception),
+            f"Only {self._stock(variant).available} unit(s) of {variant} available at "
+            f"{self.warehouse}, needed 2.",
+        )
+
+    def test_booked_lines_ignored_and_never_queried(self):
+        variant = self._variant("P2B-OFF", stock=0)
+        self._book(variant, 5)
+        with CaptureQueriesContext(connection) as ctx:
+            with self.assertRaises(reservation_service.InsufficientStockError):
+                reservation_service.reserve_order_items(self._items((variant, 1)), self.warehouse)
+        self.assertFalse([q for q in ctx.captured_queries if "purchases_" in q["sql"]])
+        self.assertFalse(self._incoming_rows().exists())
+
+    @override_settings(BOOKED_INCOMING_SALES_ENABLED=True)
+    def test_reserve_for_order_item_stays_physical_only(self):
+        """In-store path: physical only, even with the flag on."""
+        variant = self._variant("P2B-INSTORE", stock=0)
+        self._book(variant, 5)
+        with self.assertRaises(reservation_service.InsufficientStockError):
+            reservation_service.reserve_for_order_item(_make_order_item(variant, 1), self.warehouse)
+        self.assertFalse(self._incoming_rows().exists())
+
+
+class ReserveOrderItemsIncomingTests(_ReserveOrderItemsBase):
+    """reserve_order_items with allow_incoming=True: physical first, then
+    booked incoming PO lines (spec §5.3)."""
+
+    def _reserve(self, *pairs):
+        return reservation_service.reserve_order_items(
+            self._items(*pairs), self.warehouse, allow_incoming=True,
+        )
+
+    def test_incoming_only(self):
+        variant = self._variant("P2B-IN-ONLY", stock=0)
+        line = self._book(variant, 5)
+        [reservation] = self._reserve((variant, 3))
+        allocation = reservation.allocations.get()
+        self.assertEqual(
+            allocation.allocation_type, StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE
+        )
+        self.assertEqual(allocation.purchase_order_line, line)
+        self.assertEqual(allocation.incoming_status, StockReservationAllocation.INCOMING_ACTIVE)
+        self.assertEqual(allocation.units, 3)
+        self.assertEqual(reservation.quantity, 3)
+        self.assertEqual(self._stock(variant).quantity_reserved, 0)
+
+    def test_physical_first_then_incoming(self):
+        variant = self._variant("P2B-MIX", stock=2)
+        self._book(variant, 5)
+        [reservation] = self._reserve((variant, 4))
+        rows = {a.allocation_type: a.units for a in reservation.allocations.all()}
+        self.assertEqual(rows, {"retail_unit": 2, "incoming_po_line": 2})
+        self.assertEqual(self._stock(variant).quantity_reserved, 2)
+
+    def test_physical_covers_everything_when_enough(self):
+        variant = self._variant("P2B-PHYS-ENOUGH", stock=5)
+        self._book(variant, 5)
+        self._reserve((variant, 3))
+        self.assertFalse(self._incoming_rows().exists())
+
+    def test_priority_expected_date_nulls_last(self):
+        variant = self._variant("P2B-PRIO", stock=0)
+        undated = self._book(variant, 2)
+        later = self._book(variant, 2, expected_date=datetime.date(2026, 12, 1))
+        sooner = self._book(variant, 2, expected_date=datetime.date(2026, 11, 1))
+        self._reserve((variant, 5))
+        units = {row.purchase_order_line_id: row.units for row in self._incoming_rows()}
+        self.assertEqual(units, {sooner.pk: 2, later.pk: 2, undated.pk: 1})
+
+    def test_priority_ties_break_on_po_then_line_id(self):
+        variant = self._variant("P2B-TIE", stock=0)
+        first = self._book(variant, 2)
+        self._book(variant, 2)
+        self._reserve((variant, 2))
+        self.assertEqual(
+            list(self._incoming_rows().values_list("purchase_order_line_id", flat=True)),
+            [first.pk],
+        )
+
+    def test_non_contributing_lines_ignored(self):
+        variant = self._variant("P2B-EXCL", stock=0)
+        other_warehouse = Warehouse.objects.create(name="P2B Other Warehouse")
+        for status in (
+            PurchaseOrder.STATUS_DRAFT, PurchaseOrder.STATUS_CLOSED,
+            PurchaseOrder.STATUS_CANCELLED, PurchaseOrder.STATUS_RECEIVED,
+        ):
+            self._book(variant, 5, status=status)
+        self._book(variant, 5, warehouse=other_warehouse)
+        self._book(variant, 0)
+        with self.assertRaises(reservation_service.InsufficientStockError):
+            self._reserve((variant, 1))
+        self.assertFalse(self._incoming_rows().exists())
+
+    def test_existing_active_allocations_reduce_incoming(self):
+        variant = self._variant("P2B-TAKEN", stock=0)
+        self._book(variant, 3)
+        self._reserve((variant, 2))
+        with self.assertRaises(reservation_service.InsufficientStockError):
+            self._reserve((variant, 2))
+        self._reserve((variant, 1))
+
+    def test_line_dropped_when_po_no_longer_bookable_after_lock(self):
+        """The PO status is re-read after the line lock (close/cancel race)."""
+        variant = self._variant("P2B-RACE", stock=0)
+        line = self._book(variant, 5)
+        PurchaseOrder.objects.filter(pk=line.purchase_order_id).update(
+            status=PurchaseOrder.STATUS_CLOSED
+        )
+        with patch.object(reservation_service, "_lock_candidate_lines", return_value=[line]):
+            with self.assertRaises(reservation_service.InsufficientStockError):
+                self._reserve((variant, 1))
+        self.assertFalse(self._incoming_rows().exists())
+
+    def test_items_in_one_order_cannot_share_the_same_unit(self):
+        variant = self._variant("P2B-SHARE", stock=0)
+        line = self._book(variant, 3)
+        with self.assertRaises(reservation_service.InsufficientStockError):
+            self._reserve((variant, 2), (variant, 2))
+        self._reserve((variant, 2), (variant, 1))
+        self.assertEqual(
+            sum(r.units for r in self._incoming_rows(purchase_order_line=line)), 3
+        )
+
+    def test_incoming_units_are_whole(self):
+        variant = self._variant("P2B-WHOLE", stock="1.5")
+        self._book(variant, 5)
+        [reservation] = self._reserve((variant, 2))
+        rows = {a.allocation_type: a.units for a in reservation.allocations.all()}
+        self.assertEqual(rows, {"retail_unit": 1, "incoming_po_line": 1})
+
+    def test_fractional_incoming_quantity_rejected(self):
+        variant = self._variant("P2B-FRACTION", stock=0)
+        self._book(variant, 5)
+        [item] = self._items((variant, 1))
+        item.quantity = Decimal("1.5")
+        with self.assertRaises(ValueError):
+            reservation_service.reserve_order_items([item], self.warehouse, allow_incoming=True)
+        self.assertFalse(self._incoming_rows().exists())
+
+    def test_decant_items_never_use_incoming(self):
+        source = self._variant("P2B-DSRC", stock=0)
+        self._book(source, 5)
+        decant = _make_variant("P2B-DDEC", size_ml=10, is_decant=True)
+        DecantSource.objects.create(
+            decant_variant=decant, source_variant=source, decant_volume_ml=Decimal("10"),
+        )
+        with self.assertRaises(reservation_service.InsufficientStockError):
+            self._reserve((decant, 1))
+        self.assertFalse(self._incoming_rows().exists())
+
+    def test_shortfall_message_uses_combined_figure(self):
+        variant = self._variant("P2B-IN-MSG", stock=1)
+        self._book(variant, 2)
+        with self.assertRaises(reservation_service.InsufficientStockError) as ctx:
+            self._reserve((variant, 5))
+        self.assertEqual(
+            str(ctx.exception),
+            f"Only 3.00 unit(s) of {variant} available at {self.warehouse}, needed 5.",
+        )
+        self.assertNotIn("incoming", str(ctx.exception).lower())
+
+    def test_purchases_query_count_is_independent_of_item_count(self):
+        def purchases_queries(count):
+            pairs = []
+            for n in range(count):
+                variant = self._variant(f"P2B-QC-{count}-{n}", stock=0)
+                self._book(variant, 5)
+                pairs.append((variant, 1))
+            with CaptureQueriesContext(connection) as ctx:
+                self._reserve(*pairs)
+            return len([q for q in ctx.captured_queries if "purchases_" in q["sql"]])
+
+        self.assertEqual(purchases_queries(1), purchases_queries(3))

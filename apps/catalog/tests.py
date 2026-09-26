@@ -1120,3 +1120,107 @@ class CatalogAvailabilityTests(CatalogTestBase):
         response = self.client.get(detail_url("sauvage"))
         variant = self._edition(response, "sauvage-edp")["variants"][0]
         self.assertEqual(variant["sku"], "TEST-SAUVAGE-100ML")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16. Booked incoming availability (P2B)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CatalogBookedIncomingAvailabilityTests(CatalogTestBase):
+    """is_available goes through the sellable-quantity selector while
+    BOOKED_INCOMING_SALES_ENABLED is on, for the default (online-sale)
+    warehouse only. Response shape never changes."""
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        from django.contrib.auth import get_user_model
+        from apps.inventory.models import Supplier
+
+        cls.warehouse = Warehouse.objects.get(is_default=True)
+        cls.other_warehouse = Warehouse.objects.create(name="Catalog Other Warehouse")
+        cls.sauvage_variant = cls.edition_sauvage.variants.get()
+        cls.buyer = get_user_model().objects.create_user(username="catalog-buyer", password="x")
+        cls.supplier = Supplier.objects.create(name="Catalog Vendor")
+
+    def _book(self, variant, confirmed=3, warehouse=None):
+        from apps.purchases.models import PurchaseOrder, PurchaseOrderLine
+
+        po = PurchaseOrder.objects.create(
+            supplier=self.supplier, warehouse=warehouse or self.warehouse,
+            created_by=self.buyer, status=PurchaseOrder.STATUS_ISSUED,
+        )
+        return PurchaseOrderLine.objects.create(
+            purchase_order=po, variant=variant, quantity_ordered=confirmed,
+            unit_price=Decimal("100.00"), confirmed_booked_quantity=confirmed,
+        )
+
+    def _sauvage_variant_data(self):
+        response = self.client.get(detail_url("sauvage"))
+        return self._edition(response, "sauvage-edp")["variants"][0]
+
+    def _list_variant_data(self):
+        response = self.client.get(LIST_URL)
+        product = next(p for p in response.data["results"] if p["slug"] == "sauvage")
+        edition = next(e for e in product["editions"] if e["slug"] == "sauvage-edp")
+        return edition["variants"][0]
+
+    def test_flag_off_ignores_booked_stock_without_purchase_queries(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        self._book(self.sauvage_variant)
+        with CaptureQueriesContext(connection) as ctx:
+            data = self._sauvage_variant_data()
+            self.client.get(LIST_URL)
+        self.assertFalse(data["is_available"])
+        self.assertFalse([q for q in ctx.captured_queries if "purchases_" in q["sql"]])
+
+    @override_settings(BOOKED_INCOMING_SALES_ENABLED=True)
+    def test_flag_on_booked_stock_makes_variant_available(self):
+        self._book(self.sauvage_variant)
+        self.assertTrue(self._sauvage_variant_data()["is_available"])
+        self.assertTrue(self._list_variant_data()["is_available"])
+
+    @override_settings(BOOKED_INCOMING_SALES_ENABLED=True)
+    def test_flag_on_physical_stock_still_available(self):
+        InventoryStock.objects.create(
+            variant=self.sauvage_variant, warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal("1"),
+        )
+        self.assertTrue(self._sauvage_variant_data()["is_available"])
+
+    @override_settings(BOOKED_INCOMING_SALES_ENABLED=True)
+    def test_flag_on_uses_only_the_online_sale_warehouse(self):
+        InventoryStock.objects.create(
+            variant=self.sauvage_variant, warehouse=self.other_warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal("5"),
+        )
+        self._book(self.sauvage_variant, warehouse=self.other_warehouse)
+        self.assertFalse(self._sauvage_variant_data()["is_available"])
+
+    def test_response_shape_unchanged_by_flag(self):
+        self._book(self.sauvage_variant)
+        off = self._sauvage_variant_data()
+        with override_settings(BOOKED_INCOMING_SALES_ENABLED=True):
+            on = self._sauvage_variant_data()
+        self.assertEqual(set(off), set(on))
+        self.assertEqual((off["is_available"], on["is_available"]), (False, True))
+
+    @override_settings(BOOKED_INCOMING_SALES_ENABLED=True)
+    def test_flag_on_list_query_count_independent_of_variant_count(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        self._book(self.sauvage_variant)
+        with CaptureQueriesContext(connection) as before:
+            self.client.get(LIST_URL)
+        for variant in ProductVariant.objects.exclude(pk=self.sauvage_variant.pk):
+            self._book(variant)
+            InventoryStock.objects.get_or_create(
+                variant=variant, warehouse=self.warehouse,
+                stock_type=InventoryStock.STOCK_TYPE_RETAIL, defaults={"quantity": Decimal("2")},
+            )
+        with CaptureQueriesContext(connection) as after:
+            self.client.get(LIST_URL)
+        self.assertEqual(len(before.captured_queries), len(after.captured_queries))

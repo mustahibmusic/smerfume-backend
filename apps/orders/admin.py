@@ -1,9 +1,11 @@
 from django import forms
 from django.contrib import admin
 from django.contrib import messages
+from django.db.models import Exists, OuterRef
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
 from django.urls import reverse
+from django.utils.html import format_html, format_html_join
 from rest_framework import serializers as drf_serializers
 from unfold.admin import ModelAdmin
 from unfold.decorators import action
@@ -16,7 +18,7 @@ from unfold.widgets import (
 )
 
 from apps.catalog.models import ProductVariant
-from apps.inventory.models import Warehouse
+from apps.inventory.models import StockReservationAllocation, Warehouse
 from apps.inventory.services.reservation import InsufficientStockError
 
 from . import services as order_services
@@ -117,13 +119,38 @@ class ShippingAddressInline(admin.StackedInline):
     can_delete = False
 
 
+def _awaiting_incoming():
+    """True while any item of the order has an active incoming (booked)
+    allocation, i.e. waits for stock that has not arrived."""
+    return Exists(StockReservationAllocation.objects.filter(
+        reservation__order_item__order=OuterRef("pk"),
+        allocation_type=StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
+        incoming_status=StockReservationAllocation.INCOMING_ACTIVE,
+    ))
+
+
+class AwaitingIncomingFilter(admin.SimpleListFilter):
+    title = "awaiting incoming"
+    parameter_name = "awaiting_incoming"
+
+    def lookups(self, request, model_admin):
+        return (("yes", "Yes"), ("no", "No"))
+
+    def queryset(self, request, queryset):
+        if self.value() == "yes":
+            return queryset.filter(awaiting_incoming=True)
+        if self.value() == "no":
+            return queryset.filter(awaiting_incoming=False)
+        return queryset
+
+
 @admin.register(Order)
 class OrderAdmin(ModelAdmin):
     list_display = (
         "order_number", "user", "channel", "status", "payment_method", "total",
-        "is_guest_order_display", "guest_email", "created_at",
+        "is_guest_order_display", "guest_email", "awaiting_incoming_display", "created_at",
     )
-    list_filter = ("channel", "status", "payment_method", "created_at")
+    list_filter = ("channel", "status", "payment_method", AwaitingIncomingFilter, "created_at")
     search_fields = ("order_number", "user__mobile_number", "user__email", "guest_email")
     readonly_fields = (
         "public_id", "order_number", "user", "subtotal",
@@ -138,6 +165,7 @@ class OrderAdmin(ModelAdmin):
         # reservations) that only the service functions below perform
         # correctly — never editable directly, use the actions instead.
         "status",
+        "allocation_breakdown",
     )
     inlines = [OrderItemInline, ShippingAddressInline]
     actions = ["verify_cod_orders", "pack_orders", "mark_shipped", "mark_delivered", "cancel_orders"]
@@ -177,6 +205,9 @@ class OrderAdmin(ModelAdmin):
         ("Status & Notes", {
             "fields": ("status", "customer_notes"),
         }),
+        ("Stock allocation", {
+            "fields": ("allocation_breakdown",),
+        }),
         ("Replacement", {
             "fields": ("is_replacement", "original_order"),
         }),
@@ -188,6 +219,52 @@ class OrderAdmin(ModelAdmin):
     @admin.display(description="Guest order", boolean=True)
     def is_guest_order_display(self, obj):
         return obj.is_guest_order
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).annotate(awaiting_incoming=_awaiting_incoming())
+
+    @admin.display(description="Awaiting incoming", boolean=True, ordering="awaiting_incoming")
+    def awaiting_incoming_display(self, obj):
+        return obj.awaiting_incoming
+
+    @admin.display(description="Stock allocation")
+    def allocation_breakdown(self, obj):
+        """Per-item physical / incoming allocation rows (read-only)."""
+        allocations = (
+            StockReservationAllocation.objects.filter(reservation__order_item__order=obj)
+            .select_related(
+                "reservation__order_item__variant",
+                "purchase_order_line__purchase_order",
+            )
+            .order_by("reservation__order_item_id", "pk")
+        )
+        rows = []
+        for allocation in allocations:
+            if allocation.allocation_type == StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE:
+                source = "Incoming"
+                po_number = allocation.purchase_order_line.purchase_order.po_number
+                amount = f"{allocation.units} pcs"
+                state = allocation.get_incoming_status_display()
+            else:
+                source = "Physical"
+                po_number = "—"
+                if allocation.allocation_type == StockReservationAllocation.ALLOCATION_PARTIAL_LOT:
+                    amount = f"{allocation.ml_amount} ml"
+                else:
+                    amount = f"{allocation.units} pcs"
+                state = allocation.reservation.get_status_display()
+            rows.append((
+                allocation.reservation.order_item.variant, source, po_number, amount, state,
+            ))
+        if not rows:
+            return "—"
+        return format_html(
+            "<table><thead><tr><th>Item</th><th>Source</th><th>PO</th><th>Quantity</th>"
+            "<th>Status</th></tr></thead><tbody>{}</tbody></table>",
+            format_html_join(
+                "", "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>", rows,
+            ),
+        )
 
     @action(
         description="New in-store sale",

@@ -316,9 +316,11 @@ class StockTransaction(BaseModel):
     TYPE_ADJUSTMENT = "adjustment"
     TYPE_RETURN_DISPOSITION = "return_disposition"
     TYPE_SALE = "sale"
+    TYPE_PURCHASE_REVERSAL = "purchase_reversal"
 
     TYPE_CHOICES = (
         (TYPE_PURCHASE_RECEIPT, "Purchase Receipt"),
+        (TYPE_PURCHASE_REVERSAL, "Purchase Receipt Reversal"),
         (TYPE_DECANT_BOTTLE_OPENED, "Decant Bottle Opened"),
         (TYPE_ADJUSTMENT, "Adjustment"),
         (TYPE_RETURN_DISPOSITION, "Return Disposition"),
@@ -356,9 +358,11 @@ class StockMovement(BaseModel):
     MOVEMENT_RETURN_RESTOCKED_RETAIL = "return_restocked_retail"
     MOVEMENT_RETURN_RESTOCKED_PARTIAL = "return_restocked_partial"
     MOVEMENT_RETURN_DAMAGED = "return_damaged"
+    MOVEMENT_PURCHASE_REVERSAL_OUT = "purchase_reversal_out"
 
     MOVEMENT_TYPE_CHOICES = (
         (MOVEMENT_PURCHASE_IN, "Purchase In"),
+        (MOVEMENT_PURCHASE_REVERSAL_OUT, "Purchase Reversal Out"),
         (MOVEMENT_SALE_OUT, "Sale Out"),
         (MOVEMENT_ADJUSTMENT, "Adjustment"),
         (MOVEMENT_DECANT_BOTTLE_OPENED_RETAIL_OUT, "Decant Bottle Opened - Retail Out"),

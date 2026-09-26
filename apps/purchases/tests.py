@@ -1351,3 +1351,377 @@ class DiscrepancyAdminTests(_DiscrepancyBase):
         self.client.force_login(staff)
         url = reverse("admin:purchases_receiptdiscrepancy_resolve", args=[short.pk])
         self.assertEqual(self.client.post(url, {"resolution": "accepted"}).status_code, 403)
+
+
+# --- P1E: goods receipt reversals ---
+
+
+class _ReversalBase(_GRNBase):
+    def _posted(self, retail=6, damaged=0):
+        receipt = self._receipt()
+        retail_line = self._grn_line(receipt, retail)
+        damaged_line = self._grn_line(receipt, damaged, stock_type="damaged") if damaged else None
+        self._post(receipt)
+        receipt.refresh_from_db()
+        return receipt, retail_line, damaged_line
+
+    def _reverse(self, receipt, quantities, reason="Keyed wrong quantity"):
+        return services.reverse_goods_receipt(receipt, self.user, reason, quantities)
+
+    def _state(self):
+        return (
+            list(InventoryStock.objects.order_by("pk").values_list("quantity", "quantity_reserved")),
+            StockMovement.objects.count(), StockTransaction.objects.count(),
+            GoodsReceipt.objects.count(), GoodsReceiptLine.objects.count(),
+        )
+
+
+class GoodsReceiptReversalTests(_ReversalBase):
+    def test_partial_reversal_ledger_and_audit_chain(self):
+        receipt, line, _ = self._posted(6)
+        original_movement = StockMovement.objects.get()
+        reversal = self._reverse(receipt, {line.pk: 2})
+
+        self.assertEqual(self._stock(), Decimal("4"))
+        self.assertEqual(reversal.receipt_type, GoodsReceipt.TYPE_REVERSAL)
+        self.assertEqual(reversal.status, GoodsReceipt.STATUS_POSTED)
+        self.assertEqual(reversal.reverses, receipt)
+        self.assertEqual(reversal.reversal_reason, "Keyed wrong quantity")
+        self.assertEqual(
+            (reversal.purchase_order_id, reversal.supplier_id, reversal.warehouse_id),
+            (receipt.purchase_order_id, receipt.supplier_id, receipt.warehouse_id),
+        )
+        txn = reversal.stock_transaction
+        self.assertEqual(txn.transaction_type, StockTransaction.TYPE_PURCHASE_REVERSAL)
+        self.assertIn(receipt.grn_number, txn.notes)
+        self.assertIn(reversal.grn_number, txn.notes)
+
+        # reversal movement -> reversal line -> reverses_line -> original line -> original GRN
+        movement = StockMovement.objects.get(transaction_group=txn)
+        self.assertEqual(movement.movement_type, StockMovement.MOVEMENT_PURCHASE_REVERSAL_OUT)
+        self.assertEqual(movement.quantity_delta, Decimal("-2"))
+        self.assertEqual(movement.stock_type, "retail")
+        reversal_line = movement.source_receipt_line
+        self.assertEqual(reversal_line.receipt, reversal)
+        self.assertEqual(reversal_line.reverses_line, line)
+        self.assertEqual(reversal_line.reverses_line.receipt, receipt)
+        line.refresh_from_db()
+        self.assertEqual(
+            (reversal_line.variant_id, reversal_line.stock_type, reversal_line.unit_cost,
+             reversal_line.tax_rate, reversal_line.po_line_id),
+            (line.variant_id, line.stock_type, line.unit_cost, line.tax_rate, line.po_line_id),
+        )
+
+        # The original receipt, line and movement are unchanged.
+        receipt_after = GoodsReceipt.objects.get(pk=receipt.pk)
+        self.assertEqual(receipt_after.status, GoodsReceipt.STATUS_POSTED)
+        self.assertEqual(receipt_after.updated_at, receipt.updated_at)
+        self.assertEqual(line.quantity, 6)
+        original_after = StockMovement.objects.get(pk=original_movement.pk)
+        self.assertEqual(original_after.quantity_delta, Decimal("6"))
+        self.assertEqual(original_after.source_receipt_line_id, line.pk)
+
+    def test_multiple_reversals_are_cumulative(self):
+        receipt, line, _ = self._posted(6)
+        self._reverse(receipt, {line.pk: 2})
+        self._reverse(receipt, {line.pk: 3})
+        self.assertEqual(selectors.reversible_quantities(receipt), {line.pk: 1})
+        before = self._state()
+        with self.assertRaisesMessage(services.GoodsReceiptError, "already reversed 5"):
+            self._reverse(receipt, {line.pk: 2})
+        self.assertEqual(self._state(), before)
+        self._reverse(receipt, {line.pk: 1})
+        self.assertEqual(self._stock(), Decimal("0"))
+        self.assertEqual(selectors.received_quantity(self.po_line), 0)
+        with self.assertRaises(services.GoodsReceiptError):
+            self._reverse(receipt, {line.pk: 1})
+
+    def test_single_reversal_cannot_exceed_line_quantity(self):
+        receipt, line, _ = self._posted(3)
+        with self.assertRaises(services.GoodsReceiptError):
+            self._reverse(receipt, {line.pk: 4})
+        self.assertEqual(self._stock(), Decimal("3"))
+
+    def test_reversal_of_retail_and_damaged_lines(self):
+        receipt, retail, damaged = self._posted(4, damaged=1)
+        reversal = self._reverse(receipt, {retail.pk: 1, damaged.pk: 1})
+        self.assertEqual(self._stock("retail"), Decimal("3"))
+        self.assertEqual(self._stock("damaged"), Decimal("0"))
+        self.assertEqual(reversal.lines.count(), 2)
+        self.assertEqual(
+            StockMovement.objects.filter(transaction_group=reversal.stock_transaction).count(), 2
+        )
+        # The damaged discrepancy on the original stays as it was.
+        discrepancy = ReceiptDiscrepancy.objects.get()
+        self.assertEqual(discrepancy.receipt, receipt)
+        self.assertEqual(discrepancy.status, ReceiptDiscrepancy.STATUS_OPEN)
+        self.assertFalse(reversal.discrepancies.exists())
+
+    def test_invalid_reversals_refused_without_changes(self):
+        receipt, line, _ = self._posted(4)
+        _, other_line, _ = self._posted(2)
+        before = self._state()
+        cases = [
+            ({line.pk: 1}, ""),
+            ({line.pk: 0}, "x"),
+            ({}, "x"),
+            ({line.pk: -1}, "x"),
+            ({other_line.pk: 1}, "x"),
+        ]
+        for quantities, reason in cases:
+            with self.subTest(quantities=quantities, reason=reason):
+                with self.assertRaises(services.GoodsReceiptError):
+                    services.reverse_goods_receipt(receipt, self.user, reason, quantities)
+        self.assertEqual(self._state(), before)
+
+    def test_only_posted_standard_receipts_can_be_reversed(self):
+        receipt, line, _ = self._posted(4)
+        reversal = self._reverse(receipt, {line.pk: 1})
+        draft = self._receipt()
+        draft_line = self._grn_line(draft, 1)
+        cancelled = self._receipt()
+        services.cancel_goods_receipt(cancelled, self.user, "duplicate")
+        for target, quantities in (
+            (draft, {draft_line.pk: 1}),
+            (cancelled, {line.pk: 1}),
+            (reversal, {reversal.lines.get().pk: 1}),
+        ):
+            with self.subTest(receipt=target.grn_number):
+                with self.assertRaisesMessage(services.GoodsReceiptError, "posted standard"):
+                    self._reverse(target, quantities)
+        opening = GoodsReceipt.objects.create(
+            receipt_type=GoodsReceipt.TYPE_OPENING, warehouse=self.warehouse,
+        )
+        with self.assertRaises(services.GoodsReceiptError):
+            self._reverse(opening, {line.pk: 1})
+
+    def test_reserved_stock_blocks_reversal(self):
+        receipt, line, _ = self._posted(5)
+        order = Order.objects.create(
+            user=self.user, order_number="SMR-REV-1", subtotal=Decimal("0"), total=Decimal("0"),
+        )
+        order_item = OrderItem.objects.create(
+            order=order, variant=self.variant, quantity=3, unit_price=Decimal("4500"),
+        )
+        reservation_service.reserve_for_order_item(order_item, self.warehouse)
+        before = self._state()
+        with self.assertRaisesMessage(services.GoodsReceiptError, "only 2.00 is available"):
+            self._reverse(receipt, {line.pk: 3})
+        self.assertEqual(self._state(), before)
+        self._reverse(receipt, {line.pk: 2})
+        stock = InventoryStock.objects.get(variant=self.variant, stock_type="retail")
+        self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("3"), Decimal("3")))
+
+    def test_sold_stock_blocks_reversal(self):
+        receipt, line, _ = self._posted(5)
+        InventoryStock.objects.filter(variant=self.variant).update(quantity=Decimal("1"))
+        with self.assertRaises(services.GoodsReceiptError):
+            self._reverse(receipt, {line.pk: 2})
+        self.assertFalse(GoodsReceipt.objects.filter(receipt_type="reversal").exists())
+
+    def test_po_status_recalculated_backwards(self):
+        receipt, line, _ = self._posted(10)
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_RECEIVED)
+        self._reverse(receipt, {line.pk: 4})
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_PARTIALLY_RECEIVED)
+        self.assertEqual(selectors.received_quantity(self.po_line), 6)
+        self.assertEqual(selectors.outstanding_quantity(self.po_line), 4)
+        self._reverse(receipt, {line.pk: 6})
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_ISSUED)
+        # History remains, so the PO still cannot be cancelled.
+        self.assertTrue(selectors.po_has_posted_receipts(self.po))
+        with self.assertRaises(services.PurchaseOrderError):
+            services.cancel_purchase_order(self.po, self.user, "no")
+
+    def test_received_to_issued_in_one_reversal(self):
+        receipt, line, _ = self._posted(10)
+        self._reverse(receipt, {line.pk: 10})
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_ISSUED)
+
+    def test_backward_transitions_not_manually_allowed(self):
+        for status, targets in PurchaseOrder.RECALCULATION_TRANSITIONS.items():
+            for target in targets:
+                with self.subTest(status=status, target=target):
+                    self.assertFalse(PurchaseOrder(status=status).can_transition_to(target))
+
+    def test_freed_quantity_can_be_received_again_and_over_receipt_holds(self):
+        receipt, line, _ = self._posted(10)
+        self._reverse(receipt, {line.pk: 3})
+        again = self._receipt()
+        self._grn_line(again, 4)
+        with self.assertRaisesMessage(services.GoodsReceiptError, "Over-receipt"):
+            self._post(again)
+        again.lines.update(quantity=3)
+        self._post(again)
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_RECEIVED)
+        self.assertEqual(selectors.received_quantity(self.po_line), 10)
+        self.assertEqual(self._stock(), Decimal("10"))
+
+    def test_closed_po_stays_closed_and_unreceived_grows(self):
+        receipt, line, _ = self._posted(6)
+        services.close_purchase_order(self.po, self.user, "Vendor stopped")
+        self.po.refresh_from_db()
+        self.assertEqual(selectors.closed_short_quantity(self.po_line), 4)
+        self._reverse(receipt, {line.pk: 2})
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_CLOSED)
+        self.assertEqual(selectors.closed_short_quantity(self.po_line), 6)
+        self._reverse(receipt, {line.pk: 4})
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_CLOSED)
+        self.assertEqual(selectors.closed_short_quantity(self.po_line), 10)
+
+    def test_reversal_constraints(self):
+        receipt, _, _ = self._posted(2)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            GoodsReceipt.objects.create(
+                receipt_type=GoodsReceipt.TYPE_STANDARD, supplier=self.supplier,
+                warehouse=self.warehouse, purchase_order=self.po, reverses=receipt,
+            )
+        reversal = GoodsReceipt.objects.create(
+            receipt_type=GoodsReceipt.TYPE_REVERSAL, supplier=self.supplier,
+            warehouse=self.warehouse, purchase_order=self.po, reverses=receipt,
+            stock_transaction=StockTransaction.objects.create(
+                transaction_type=StockTransaction.TYPE_PURCHASE_REVERSAL,
+            ),
+        )
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            GoodsReceipt.objects.filter(pk=reversal.pk).update(
+                status="posted", posted_at=receipt.posted_at,
+            )
+
+
+class GoodsReceiptReversalAdminTests(_ReversalBase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.user)
+        self.model_admin = django_admin.site._registry[GoodsReceipt]
+        self.request = RequestFactory().get("/admin/")
+        self.request.user = self.user
+
+    def test_button_only_when_reversible(self):
+        draft = self._receipt()
+        self.assertFalse(self.model_admin.has_reverse_permission(self.request, draft.pk))
+        receipt, line, _ = self._posted(2)
+        self.assertTrue(self.model_admin.has_reverse_permission(self.request, receipt.pk))
+        reversal = self._reverse(receipt, {line.pk: 2})
+        self.assertFalse(self.model_admin.has_reverse_permission(self.request, receipt.pk))
+        self.assertFalse(self.model_admin.has_reverse_permission(self.request, reversal.pk))
+
+    def test_get_is_safe_and_post_reverses(self):
+        receipt, line, _ = self._posted(5)
+        url = reverse("admin:purchases_goodsreceipt_reverse_grn", args=[receipt.pk])
+        response = self.client.get(url)
+        self.assertContains(response, "reversible 5")
+        self.assertFalse(GoodsReceipt.objects.filter(receipt_type="reversal").exists())
+        response = self.client.post(url, {f"line_{line.pk}": "2", "reason": "Counted twice"})
+        reversal = GoodsReceipt.objects.get(receipt_type="reversal")
+        self.assertRedirects(
+            response, reverse("admin:purchases_goodsreceipt_change", args=[reversal.pk]),
+            fetch_redirect_response=False,
+        )
+        self.assertEqual(self._stock(), Decimal("3"))
+        page = self.client.get(reverse("admin:purchases_goodsreceipt_change", args=[receipt.pk]))
+        self.assertContains(page, reversal.grn_number)
+        page = self.client.get(reverse("admin:purchases_goodsreceipt_change", args=[reversal.pk]))
+        self.assertContains(page, receipt.grn_number)
+        self.assertContains(page, "Counted twice")
+
+    def test_reason_required_and_limit_enforced_by_form(self):
+        receipt, line, _ = self._posted(5)
+        url = reverse("admin:purchases_goodsreceipt_reverse_grn", args=[receipt.pk])
+        self.client.post(url, {f"line_{line.pk}": "2", "reason": ""})
+        self.client.post(url, {f"line_{line.pk}": "6", "reason": "x"})
+        self.assertFalse(GoodsReceipt.objects.filter(receipt_type="reversal").exists())
+        self.assertEqual(self._stock(), Decimal("5"))
+
+    def test_reversal_detail_read_only(self):
+        receipt, line, _ = self._posted(2)
+        reversal = self._reverse(receipt, {line.pk: 1})
+        readonly = self.model_admin.get_readonly_fields(self.request, reversal)
+        for field in ("received_date", "notes", "reversal_reason", "reverses_link"):
+            self.assertIn(field, readonly)
+        inline = GoodsReceiptLineInline(GoodsReceipt, django_admin.site)
+        self.assertFalse(inline.has_change_permission(self.request, reversal))
+        self.assertFalse(self.model_admin.has_post_permission(self.request, reversal.pk))
+        self.assertFalse(self.model_admin.has_cancel_permission(self.request, reversal.pk))
+
+    def test_reverse_requires_permission(self):
+        staff = User.objects.create_user(
+            username="revclerk", email="revclerk@example.com", password="testpass123", is_staff=True,
+        )
+        staff.user_permissions.add(*Permission.objects.filter(
+            content_type__app_label="purchases",
+            codename__in=["view_goodsreceipt", "change_goodsreceipt", "post_goodsreceipt"],
+        ))
+        receipt, line, _ = self._posted(2)
+        self.client.force_login(staff)
+        url = reverse("admin:purchases_goodsreceipt_reverse_grn", args=[receipt.pk])
+        response = self.client.post(url, {f"line_{line.pk}": "1", "reason": "x"})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self._stock(), Decimal("2"))
+
+
+class GoodsReceiptReversalConcurrencyTests(TransactionTestCase):
+    """Real concurrent transactions; reuses the P1C threaded helpers."""
+
+    setUp = GoodsReceiptConcurrencyTests.setUp
+    _receipt_with = GoodsReceiptConcurrencyTests._receipt_with
+    _run_parallel = GoodsReceiptConcurrencyTests._run_parallel
+    _retail = GoodsReceiptConcurrencyTests._retail
+
+    def _posted(self, quantity):
+        receipt = self._receipt_with(quantity)
+        services.post_goods_receipt(receipt, self.user)
+        return receipt, receipt.lines.get()
+
+    def _checkout_item(self, quantity, number):
+        order = Order.objects.create(
+            user=self.user, order_number=number, subtotal=Decimal("0"), total=Decimal("0"),
+        )
+        return OrderItem.objects.create(
+            order=order, variant=self.variant, quantity=quantity, unit_price=Decimal("4500"),
+        )
+
+    def test_same_line_reversed_twice_concurrently(self):
+        receipt, line = self._posted(5)
+        results = self._run_parallel(
+            lambda: services.reverse_goods_receipt(receipt, self.user, "a", {line.pk: 3}),
+            lambda: services.reverse_goods_receipt(receipt, self.user, "b", {line.pk: 3}),
+        )
+        self.assertEqual(sorted(results), ["GoodsReceiptError", "ok"])
+        self.assertEqual(self._retail().quantity, Decimal("2"))
+        self.assertEqual(GoodsReceipt.objects.filter(receipt_type="reversal").count(), 1)
+        self.assertEqual(StockMovement.objects.count(), 2)
+
+    def test_reversal_and_checkout_reservation_both_fit(self):
+        receipt, line = self._posted(5)
+        item = self._checkout_item(3, "SMR-REV-CONC-1")
+        results = self._run_parallel(
+            lambda: services.reverse_goods_receipt(receipt, self.user, "x", {line.pk: 2}),
+            lambda: reservation_service.reserve_for_order_item(item, self.warehouse),
+        )
+        self.assertEqual(results, ["ok", "ok"])
+        stock = self._retail()
+        self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("3"), Decimal("3")))
+
+    def test_reversal_and_checkout_reservation_compete(self):
+        receipt, line = self._posted(5)
+        item = self._checkout_item(3, "SMR-REV-CONC-2")
+        results = self._run_parallel(
+            lambda: services.reverse_goods_receipt(receipt, self.user, "x", {line.pk: 4}),
+            lambda: reservation_service.reserve_for_order_item(item, self.warehouse),
+        )
+        self.assertFalse([r for r in results if "eadlock" in str(r)], results)
+        stock = self._retail()
+        self.assertGreaterEqual(stock.quantity, stock.quantity_reserved)
+        if results[0] == "ok":
+            self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("1"), Decimal("0")))
+        else:
+            self.assertEqual(results[0], "GoodsReceiptError")
+            self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("5"), Decimal("3")))

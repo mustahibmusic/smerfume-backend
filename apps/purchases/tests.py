@@ -35,6 +35,7 @@ from apps.purchases.admin import (
     PurchaseOrderLineInline,
 )
 from apps.purchases.models import (
+    BookedQuantityChange,
     GoodsReceipt,
     GoodsReceiptLine,
     PurchaseOrder,
@@ -1725,3 +1726,51 @@ class GoodsReceiptReversalConcurrencyTests(TransactionTestCase):
         else:
             self.assertEqual(results[0], "GoodsReceiptError")
             self.assertEqual((stock.quantity, stock.quantity_reserved), (Decimal("5"), Decimal("3")))
+
+
+# --- P2A: booked incoming foundation ---
+
+
+class BookedQuantityModelTests(_POBase):
+    def test_confirmed_booked_quantity_defaults_to_zero(self):
+        line = self._line(self._po())
+        self.assertEqual(line.confirmed_booked_quantity, 0)
+
+    def test_db_rejects_negative_confirmed_booked_quantity(self):
+        line = self._line(self._po())
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            PurchaseOrderLine.objects.filter(pk=line.pk).update(confirmed_booked_quantity=-1)
+
+    def test_field_label_says_cumulative(self):
+        field = PurchaseOrderLine._meta.get_field("confirmed_booked_quantity")
+        self.assertEqual(field.verbose_name, "Vendor-confirmed total (cumulative)")
+        self.assertIn("including units already received", field.help_text)
+
+    def test_bookable_statuses(self):
+        self.assertEqual(
+            PurchaseOrder.BOOKABLE_STATUSES,
+            (PurchaseOrder.STATUS_ISSUED, PurchaseOrder.STATUS_PARTIALLY_RECEIVED),
+        )
+
+    def test_permission_exists(self):
+        self.assertTrue(
+            Permission.objects.filter(
+                codename="confirm_booked_quantity", content_type__app_label="purchases"
+            ).exists()
+        )
+
+    def test_change_row_is_immutable(self):
+        line = self._line(self._po())
+        change = BookedQuantityChange.objects.create(
+            purchase_order_line=line, old_quantity=0, new_quantity=4,
+            note="Vendor mail 12 Sep", performed_by=self.user,
+        )
+        change.note = "edited"
+        with self.assertRaises(ValidationError):
+            change.save()
+        with self.assertRaises(ValidationError):
+            change.delete()
+        self.assertEqual(BookedQuantityChange.objects.get(pk=change.pk).note, "Vendor mail 12 Sep")
+
+    def test_flag_defaults_off(self):
+        self.assertIs(settings.BOOKED_INCOMING_SALES_ENABLED, False)

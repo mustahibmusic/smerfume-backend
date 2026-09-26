@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     "apps.offers",
     "apps.notifications",
     "apps.reviews",
+    "apps.purchases",
 ]
 
 MIDDLEWARE = [
@@ -353,6 +354,10 @@ UNFOLD = {
                     _nav_item(
                         "Vendors", "storefront",
                         "admin:inventory_supplier_changelist", "inventory.view_supplier",
+                    ),
+                    _nav_item(
+                        "Purchase Orders", "shopping_cart",
+                        "admin:purchases_purchaseorder_changelist", "purchases.view_purchaseorder",
                     ),
                 ],
             },

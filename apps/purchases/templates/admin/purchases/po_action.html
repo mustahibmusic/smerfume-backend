@@ -1,0 +1,27 @@
+{% extends "admin/base_site.html" %}
+
+{% block breadcrumbs %}{% endblock %}
+
+{% block content %}
+<div class="max-w-2xl">
+    <p class="mb-6 text-sm">{{ message }}</p>
+
+    <form method="post" novalidate>
+        {% csrf_token %}
+        {% for field in form %}
+            {% include "unfold/helpers/field.html" with field=field %}
+        {% endfor %}
+
+        <div class="flex gap-4 mt-4">
+            <button type="submit"
+                    class="{{ button_class }} border border-transparent font-medium px-3 py-2 rounded-default text-sm text-white">
+                {{ button_label }}
+            </button>
+            <a href="{{ back_url }}"
+               class="border border-base-200 font-medium px-3 py-2 rounded-default text-sm">
+                Go back
+            </a>
+        </div>
+    </form>
+</div>
+{% endblock %}

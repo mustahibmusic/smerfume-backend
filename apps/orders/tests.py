@@ -3435,3 +3435,58 @@ class CheckoutBookedIncomingTests(TestCase):
                     customer_mobile="9811100099", payment_method=Order.PAYMENT_METHOD_CASH,
                 )
         self.assertFalse(self._incoming_rows().exists())
+
+
+class OrderAdminAwaitingIncomingTests(TestCase):
+    """Read-only admin surfacing of orders waiting for booked stock."""
+
+    def setUp(self):
+        self.staff = User.objects.create_superuser(
+            username="p2badmin", email="p2badmin@example.com", password="testpass123",
+        )
+        self.client.login(username="p2badmin@example.com", password="testpass123")
+        self.variant = _make_variant()
+        self.line = _book_incoming(self.variant, 5)
+        self.waiting = self._order("+919700000501")
+        self.ready = self._order("+919700000502")
+        _add_active_incoming(
+            StockReservation.objects.get(order_item__order=self.waiting), self.line, 1,
+        )
+
+    def _order(self, mobile):
+        user = _make_user(mobile=mobile, username=f"p2b{mobile[-3:]}")
+        CartItem.objects.create(cart=Cart.objects.create(user=user), variant=self.variant, quantity=1)
+        client = APIClient()
+        client.credentials(**_auth_header(user))
+        resp = client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        return Order.objects.get(order_number=resp.data["order_number"])
+
+    def test_changelist_shows_awaiting_incoming_column(self):
+        resp = self.client.get("/admin/orders/order/")
+        self.assertContains(resp, "Awaiting incoming")
+
+    def test_filter_yes_and_no(self):
+        resp = self.client.get("/admin/orders/order/", {"awaiting_incoming": "yes"})
+        self.assertContains(resp, self.waiting.order_number)
+        self.assertNotContains(resp, self.ready.order_number)
+        resp = self.client.get("/admin/orders/order/", {"awaiting_incoming": "no"})
+        self.assertContains(resp, self.ready.order_number)
+        self.assertNotContains(resp, self.waiting.order_number)
+
+    def test_changelist_query_count_independent_of_rows(self):
+        from django.test.utils import CaptureQueriesContext
+        with CaptureQueriesContext(connection) as before:
+            self.client.get("/admin/orders/order/")
+        for n in range(3):
+            order = self._order(f"+91970000060{n}")
+            _add_active_incoming(StockReservation.objects.get(order_item__order=order), self.line, 1)
+        with CaptureQueriesContext(connection) as after:
+            self.client.get("/admin/orders/order/")
+        self.assertEqual(len(before.captured_queries), len(after.captured_queries))
+
+    def test_change_page_shows_allocation_breakdown(self):
+        resp = self.client.get(f"/admin/orders/order/{self.waiting.pk}/change/")
+        self.assertContains(resp, "Stock allocation")
+        self.assertContains(resp, self.line.purchase_order.po_number)
+        self.assertContains(resp, "Incoming")
+        self.assertContains(resp, "Physical")

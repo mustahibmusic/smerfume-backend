@@ -1939,3 +1939,90 @@ class SellableQuantitySelectorTests(_BookingBase):
             variant=self.variant, warehouse=self.warehouse, stock_type="damaged", quantity=4,
         )
         self.assertEqual(selectors.sellable_quantity(self.variant, self.warehouse), Decimal("0"))
+
+
+class SetConfirmedBookedQuantityTests(_BookingBase):
+    def _set(self, quantity, note="Vendor confirmed by mail", line=None):
+        return services.set_confirmed_booked_quantity(
+            line or self.po_line, quantity, self.user, note
+        )
+
+    def test_sets_value_and_appends_history(self):
+        line, change = self._set(6)
+        self.assertEqual(line.confirmed_booked_quantity, 6)
+        self.assertEqual(
+            (change.old_quantity, change.new_quantity, change.note, change.performed_by),
+            (0, 6, "Vendor confirmed by mail", self.user),
+        )
+        line, change = self._set(8, note="Two more confirmed")
+        self.assertEqual((change.old_quantity, change.new_quantity), (6, 8))
+        self.assertEqual(BookedQuantityChange.objects.filter(purchase_order_line=line).count(), 2)
+
+    def test_unchanged_value_writes_no_history(self):
+        self._set(6)
+        line, change = self._set(6)
+        self.assertIsNone(change)
+        self.assertEqual(BookedQuantityChange.objects.count(), 1)
+
+    def test_allowed_on_partially_received_po(self):
+        self._receive(retail=4)
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_PARTIALLY_RECEIVED)
+        line, _ = self._set(10)
+        self.assertEqual(selectors.incoming_sellable(line), Decimal("6"))
+
+    def test_rejected_on_non_bookable_po(self):
+        for status in (PurchaseOrder.STATUS_DRAFT, PurchaseOrder.STATUS_RECEIVED,
+                       PurchaseOrder.STATUS_CLOSED, PurchaseOrder.STATUS_CANCELLED):
+            PurchaseOrder.objects.filter(pk=self.po.pk).update(status=status)
+            with self.assertRaises(services.BookedQuantityError, msg=status):
+                self._set(3)
+        self.assertEqual(BookedQuantityChange.objects.count(), 0)
+
+    def test_bounds(self):
+        with self.assertRaises(services.BookedQuantityError):
+            self._set(-1)
+        with self.assertRaises(services.BookedQuantityError):
+            self._set(11)  # ordered 10
+        line, _ = self._set(10)
+        self.assertEqual(line.confirmed_booked_quantity, 10)
+
+    def test_note_required(self):
+        with self.assertRaises(services.BookedQuantityError):
+            self._set(3, note="   ")
+
+    def test_lowering_below_active_allocations_is_blocked(self):
+        self._set(5)
+        self._incoming_allocation(3)
+        with self.assertRaises(services.BookedQuantityError):
+            self._set(2)
+        self.po_line.refresh_from_db()
+        self.assertEqual(self.po_line.confirmed_booked_quantity, 5)
+        line, _ = self._set(3)  # exactly covers the 3 allocated units
+        self.assertEqual(line.confirmed_booked_quantity, 3)
+
+    def test_lowering_guard_accounts_for_received(self):
+        # Received 4, confirmed 10, 3 allocated: lowest allowed is 4 + 3 = 7.
+        self._receive(retail=4)
+        self._set(10)
+        self._incoming_allocation(3)
+        with self.assertRaises(services.BookedQuantityError):
+            self._set(6)
+        line, _ = self._set(7)
+        self.assertEqual(selectors.incoming_sellable(line), Decimal("0"))
+
+    def test_released_allocations_do_not_block_lowering(self):
+        self._set(5)
+        self._incoming_allocation(3, status="released")
+        line, _ = self._set(0)
+        self.assertEqual(line.confirmed_booked_quantity, 0)
+
+    def test_does_not_touch_inventory(self):
+        self._physical(2)
+        before = list(InventoryStock.objects.values_list("quantity", "quantity_reserved"))
+        movements = StockMovement.objects.count()
+        self._set(5)
+        self.assertEqual(
+            list(InventoryStock.objects.values_list("quantity", "quantity_reserved")), before
+        )
+        self.assertEqual(StockMovement.objects.count(), movements)

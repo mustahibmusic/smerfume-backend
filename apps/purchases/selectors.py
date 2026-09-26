@@ -112,6 +112,11 @@ def open_discrepancy_count(po):
 ZERO = Decimal("0")
 
 
+def format_units(value):
+    """Whole-unit quantities for messages: Decimal("3.00") -> "3"."""
+    return str(int(value)) if value == int(value) else str(value)
+
+
 def active_incoming_allocated_quantities(po_line_ids):
     """{po_line_id: units held by active incoming allocations}. Converted,
     reallocated and released rows never count: converted units are already

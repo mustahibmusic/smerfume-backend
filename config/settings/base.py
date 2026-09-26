@@ -374,6 +374,11 @@ UNFOLD = {
                         "admin:purchases_receiptdiscrepancy_changelist",
                         "purchases.view_receiptdiscrepancy",
                     ),
+                    _nav_item(
+                        "Booked Quantity History", "history",
+                        "admin:purchases_bookedquantitychange_changelist",
+                        "purchases.view_bookedquantitychange",
+                    ),
                 ],
             },
             {

@@ -485,7 +485,8 @@ class PurchaseOrderAdminTests(_POBase):
         items = {item["title"]: item for item in groups["Purchases"]}
         self.assertEqual(
             list(items),
-            ["Vendors", "Purchase Orders", "Goods Receipts", "Receipt Discrepancies"],
+            ["Vendors", "Purchase Orders", "Goods Receipts", "Receipt Discrepancies",
+             "Booked Quantity History"],
         )
         self.assertEqual(
             str(items["Goods Receipts"]["link"]),
@@ -2026,3 +2027,74 @@ class SetConfirmedBookedQuantityTests(_BookingBase):
             list(InventoryStock.objects.values_list("quantity", "quantity_reserved")), before
         )
         self.assertEqual(StockMovement.objects.count(), movements)
+
+
+class BookedQuantityAdminTests(_BookingBase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.user)
+        self.url = reverse("admin:purchases_purchaseorder_confirm_booked", args=[self.po.pk])
+
+    def test_get_shows_cumulative_explanation_and_changes_nothing(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "cumulative")
+        self.assertContains(response, "including units already received")
+        self.po_line.refresh_from_db()
+        self.assertEqual(self.po_line.confirmed_booked_quantity, 0)
+        self.assertEqual(BookedQuantityChange.objects.count(), 0)
+
+    def test_post_sets_quantity_and_reports_incoming_available(self):
+        self._receive(retail=4)
+        response = self.client.post(
+            self.url,
+            {"line": self.po_line.pk, "quantity": 10, "note": "Vendor confirmed rest"},
+            follow=True,
+        )
+        self.po_line.refresh_from_db()
+        self.assertEqual(self.po_line.confirmed_booked_quantity, 10)
+        self.assertContains(response, "Incoming available to sell: 6")
+
+    def test_post_error_is_shown_and_nothing_changes(self):
+        response = self.client.post(
+            self.url, {"line": self.po_line.pk, "quantity": 11, "note": "x"}, follow=True,
+        )
+        self.assertContains(response, "between 0 and the ordered quantity")
+        self.assertEqual(BookedQuantityChange.objects.count(), 0)
+
+    def test_permission_required(self):
+        staff = User.objects.create_user(username="nobook", password="x", is_staff=True)
+        staff.user_permissions.add(Permission.objects.get(codename="view_purchaseorder"))
+        self.client.force_login(staff)
+        self.client.post(self.url, {"line": self.po_line.pk, "quantity": 3, "note": "x"})
+        self.po_line.refresh_from_db()
+        self.assertEqual(self.po_line.confirmed_booked_quantity, 0)
+
+    def test_action_hidden_on_draft_po(self):
+        model_admin = django_admin.site._registry[PurchaseOrder]
+        request = RequestFactory().get("/admin/")
+        request.user = self.user
+        draft = self._po()
+        self.assertFalse(model_admin.has_confirm_booked_permission(request, draft.pk))
+        self.assertTrue(model_admin.has_confirm_booked_permission(request, self.po.pk))
+
+    def test_inline_shows_booking_columns(self):
+        self._book(10)
+        inline = PurchaseOrderLineInline(PurchaseOrder, django_admin.site)
+        self.assertEqual(inline.confirmed_booked(self.po_line), 10)
+        self.assertEqual(inline.incoming_available(self.po_line), Decimal("10"))
+        self.assertEqual(inline.allocated_awaiting(self.po_line), Decimal("0"))
+        self.assertEqual(inline.received_net_retail(self.po_line), 0)
+        self.assertNotIn("confirmed_booked_quantity", inline.fields)
+
+    def test_history_admin_is_read_only(self):
+        model_admin = django_admin.site._registry[BookedQuantityChange]
+        request = RequestFactory().get("/admin/")
+        request.user = self.user
+        self.assertFalse(model_admin.has_add_permission(request))
+        self.assertFalse(model_admin.has_change_permission(request))
+        self.assertFalse(model_admin.has_delete_permission(request))
+        self.assertEqual(
+            self.client.get(reverse("admin:purchases_bookedquantitychange_changelist")).status_code,
+            200,
+        )

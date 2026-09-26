@@ -20,6 +20,7 @@ from apps.inventory.models import Supplier
 from . import selectors
 from . import services as po_services
 from .models import (
+    BookedQuantityChange,
     GoodsReceipt,
     GoodsReceiptLine,
     PurchaseOrder,
@@ -45,10 +46,12 @@ class PurchaseOrderLineInline(TabularInline):
         "variant", "quantity_ordered", "unit_price", "line_discount_amount",
         "tax_rate", "hsn_code", "gross_line_amount", "taxable_value",
         "effective_unit_cost_ex_tax", "received", "outstanding",
+        "confirmed_booked", "received_net_retail", "allocated_awaiting", "incoming_available",
     )
     readonly_fields = (
         "gross_line_amount", "taxable_value", "effective_unit_cost_ex_tax",
         "received", "outstanding",
+        "confirmed_booked", "received_net_retail", "allocated_awaiting", "incoming_available",
     )
 
     def _is_draft(self, obj):
@@ -88,6 +91,28 @@ class PurchaseOrderLineInline(TabularInline):
             return f"0 (closed, {closed_short} not received)"
         return selectors.outstanding_quantity(line)
 
+    @admin.display(description="Vendor-confirmed total (cumulative)")
+    def confirmed_booked(self, line):
+        return line.confirmed_booked_quantity if line.pk else "-"
+
+    @admin.display(description="Received (net retail)")
+    def received_net_retail(self, line):
+        if not line.pk:
+            return "-"
+        return selectors.received_quantities([line.pk], stock_type="retail").get(line.pk, 0)
+
+    @admin.display(description="Allocated to customer orders (awaiting arrival)")
+    def allocated_awaiting(self, line):
+        if not line.pk:
+            return "-"
+        return selectors.active_incoming_allocated_quantities([line.pk]).get(
+            line.pk, selectors.ZERO
+        )
+
+    @admin.display(description="Incoming available to sell")
+    def incoming_available(self, line):
+        return selectors.incoming_sellable(line) if line.pk else "-"
+
 
 class CancelPurchaseOrderForm(forms.Form):
     reason = forms.CharField(widget=UnfoldAdminTextareaWidget, label="Reason for cancelling")
@@ -95,6 +120,23 @@ class CancelPurchaseOrderForm(forms.Form):
 
 class ClosePurchaseOrderForm(forms.Form):
     reason = forms.CharField(widget=UnfoldAdminTextareaWidget, label="Reason for closing")
+
+
+class ConfirmBookedQuantityForm(forms.Form):
+    line = forms.ModelChoiceField(queryset=PurchaseOrderLine.objects.none(), label="PO line")
+    quantity = forms.IntegerField(
+        min_value=0,
+        label="Vendor-confirmed total (cumulative)",
+        help_text=(
+            "Total units the vendor has confirmed for this line, including units already "
+            "received. Ordered 10, received 4, vendor confirms the other 6: enter 10."
+        ),
+    )
+    note = forms.CharField(widget=UnfoldAdminTextareaWidget, label="Vendor confirmation note")
+
+    def __init__(self, *args, po, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["line"].queryset = po.lines.select_related("variant")
 
 
 class ReverseGoodsReceiptForm(forms.Form):
@@ -158,7 +200,7 @@ class PurchaseOrderAdmin(ModelAdmin):
         "vendor_reference", "lines__variant__sku",
     )
     list_select_related = ("supplier", "warehouse", "created_by")
-    actions_detail = ["issue_po", "receive_goods", "close_po", "cancel_po"]
+    actions_detail = ["issue_po", "receive_goods", "confirm_booked", "close_po", "cancel_po"]
     fieldsets = (
         ("Purchase order", {"fields": (
             "number", "status", "supplier", "warehouse", "order_date", "expected_date",
@@ -291,6 +333,11 @@ class PurchaseOrderAdmin(ModelAdmin):
             object_id, [PurchaseOrder.STATUS_PARTIALLY_RECEIVED]
         )
 
+    def has_confirm_booked_permission(self, request, object_id=None):
+        return request.user.has_perm("purchases.confirm_booked_quantity") and self._po_in_status(
+            object_id, list(PurchaseOrder.BOOKABLE_STATUSES)
+        )
+
     def has_receive_permission(self, request, object_id=None):
         return request.user.has_perm("purchases.add_goodsreceipt") and self._po_in_status(
             object_id, list(PurchaseOrder.RECEIVABLE_STATUSES)
@@ -329,6 +376,47 @@ class PurchaseOrderAdmin(ModelAdmin):
             f"Start a goods receipt for {po.po_number} from {po.supplier}. Nothing is "
             "received until you enter quantities and post the receipt.",
             "Start goods receipt", "bg-primary-600",
+        )
+
+    @action(
+        description="Confirm booked quantity", url_path="confirm-booked",
+        permissions=["confirm_booked"], icon="event_available",
+    )
+    def confirm_booked(self, request, object_id):
+        """GET shows each line's booking figures and a form; only POST
+        changes the vendor-confirmed total, through the service."""
+        po = get_object_or_404(PurchaseOrder, pk=object_id)
+        form = ConfirmBookedQuantityForm(request.POST or None, po=po)
+        if request.method == "POST" and form.is_valid():
+            try:
+                line, _ = po_services.set_confirmed_booked_quantity(
+                    form.cleaned_data["line"], form.cleaned_data["quantity"],
+                    request.user, form.cleaned_data["note"],
+                )
+            except po_services.BookedQuantityError as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+            else:
+                self.message_user(
+                    request,
+                    f"{line.variant}: vendor-confirmed total is {line.confirmed_booked_quantity}. "
+                    f"Incoming available to sell: {selectors.format_units(selectors.incoming_sellable(line))}.",
+                    level=messages.SUCCESS,
+                )
+            return redirect(self._change_url(po))
+        rows = [
+            f"{line.variant} — ordered {line.quantity_ordered}, vendor-confirmed total "
+            f"{line.confirmed_booked_quantity}, received (net retail) "
+            f"{selectors.received_quantities([line.pk], stock_type='retail').get(line.pk, 0)}, "
+            f"incoming available to sell {selectors.format_units(selectors.incoming_sellable(line))}"
+            for line in po.lines.select_related("variant")
+        ]
+        return self._action_page(
+            request, po, f"Confirm booked quantity for {po.po_number}", form,
+            "Enter the cumulative total the vendor has confirmed for one line, including "
+            "units already received. It is not the remaining quantity. Confirmed units "
+            "not yet received can be sold before they arrive once booked selling is "
+            "switched on. Physical stock is not changed.",
+            "Save confirmed total", "bg-primary-600", rows=rows,
         )
 
     @action(description="Issue", url_path="issue", permissions=["issue"], icon="send")
@@ -390,13 +478,15 @@ class PurchaseOrderAdmin(ModelAdmin):
             "Cancel purchase order", "bg-red-600",
         )
 
-    def _action_page(self, request, po, title, form, message, button_label, button_class):
+    def _action_page(self, request, po, title, form, message, button_label, button_class,
+                     rows=None):
         context = {
             **self.admin_site.each_context(request),
             "title": title,
             "opts": self.model._meta,
             "form": form,
             "message": message,
+            "rows": rows or [],
             "button_label": button_label,
             "button_class": button_class,
             "back_url": self._change_url(po),
@@ -886,3 +976,40 @@ class ReceiptDiscrepancyAdmin(ModelAdmin):
             "back_url": back_url,
         }
         return TemplateResponse(request, "admin/purchases/po_action.html", context)
+
+
+@admin.register(BookedQuantityChange)
+class BookedQuantityChangeAdmin(ModelAdmin):
+    """Append-only history of vendor-confirmed booked totals. Rows are
+    written only by services.set_confirmed_booked_quantity."""
+
+    list_display = (
+        "purchase_order", "purchase_order_line", "old_quantity", "new_quantity",
+        "performed_by", "created_at",
+    )
+    list_filter = ("purchase_order_line__purchase_order__supplier",)
+    search_fields = (
+        "purchase_order_line__purchase_order__po_number", "purchase_order_line__variant__sku",
+        "note",
+    )
+    list_select_related = (
+        "purchase_order_line__purchase_order", "purchase_order_line__variant", "performed_by",
+    )
+    fields = (
+        "purchase_order_line", "old_quantity", "new_quantity", "note", "performed_by",
+        "created_at",
+    )
+    readonly_fields = fields
+
+    @admin.display(description="Purchase order")
+    def purchase_order(self, obj):
+        return obj.purchase_order_line.purchase_order.po_number
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

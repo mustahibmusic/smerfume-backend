@@ -44,11 +44,11 @@ class PurchaseOrder(BaseModel):
     # Never selectable by hand. partially_received / received are set only
     # by services.refresh_po_receipt_status() from posted receipts, and
     # issued -> cancelled is further blocked once anything is received.
-    # Closing arrives in a later phase.
+    # partially_received -> closed is services.close_purchase_order().
     ALLOWED_TRANSITIONS = {
         STATUS_DRAFT: {STATUS_ISSUED, STATUS_CANCELLED},
         STATUS_ISSUED: {STATUS_CANCELLED, STATUS_PARTIALLY_RECEIVED, STATUS_RECEIVED},
-        STATUS_PARTIALLY_RECEIVED: {STATUS_RECEIVED},
+        STATUS_PARTIALLY_RECEIVED: {STATUS_RECEIVED, STATUS_CLOSED},
     }
     RECEIVABLE_STATUSES = (STATUS_ISSUED, STATUS_PARTIALLY_RECEIVED)
 
@@ -106,8 +106,7 @@ class PurchaseOrder(BaseModel):
     )
     cancelled_at = models.DateTimeField(null=True, blank=True)
     cancel_reason = models.TextField(blank=True)
-    # Closing arrives with goods receipts; the audit fields exist now so
-    # the schema does not change for it.
+    # Set by services.close_purchase_order().
     closed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
     )
@@ -119,6 +118,7 @@ class PurchaseOrder(BaseModel):
         permissions = [
             ("issue_purchaseorder", "Can issue purchase order"),
             ("cancel_purchaseorder", "Can cancel purchase order"),
+            ("close_purchaseorder", "Can close purchase order"),
         ]
 
     def __str__(self):
@@ -474,3 +474,151 @@ class GoodsReceiptLine(BaseModel):
         if self.receipt.is_draft:
             self.apply_po_line_snapshot()
         super().save(*args, **kwargs)
+
+
+class ReceiptDiscrepancy(BaseModel):
+    """Something about a delivery that did not match the order: short,
+    damaged, wrong item or excess. Descriptive workflow data only: it never
+    changes inventory or received quantities.
+
+    Staff record short / wrong_item / excess on a draft goods receipt.
+    Damaged discrepancies are created automatically when a receipt with
+    damaged stock is posted. After posting, only resolving is allowed."""
+
+    TYPE_SHORT = "short"
+    TYPE_DAMAGED = "damaged"
+    TYPE_WRONG_ITEM = "wrong_item"
+    TYPE_EXCESS = "excess"
+
+    TYPE_CHOICES = (
+        (TYPE_SHORT, "Short"),
+        (TYPE_DAMAGED, "Damaged"),
+        (TYPE_WRONG_ITEM, "Wrong item"),
+        (TYPE_EXCESS, "Excess"),
+    )
+    # Types staff enter by hand; damaged comes from damaged receipt lines.
+    STAFF_TYPES = (TYPE_SHORT, TYPE_WRONG_ITEM, TYPE_EXCESS)
+
+    STATUS_OPEN = "open"
+    STATUS_RESOLVED = "resolved"
+
+    STATUS_CHOICES = (
+        (STATUS_OPEN, "Open"),
+        (STATUS_RESOLVED, "Resolved"),
+    )
+
+    # Operational outcomes only. vendor_credit_expected creates no
+    # accounting entry (Zoho owns that); return_planned moves no stock
+    # (supplier returns are a later phase).
+    RESOLUTION_CHOICES = (
+        ("accepted", "Accepted"),
+        ("replacement_expected", "Replacement expected"),
+        ("vendor_credit_expected", "Vendor credit expected"),
+        ("written_off", "Written off"),
+        ("return_planned", "Return planned"),
+    )
+
+    receipt = models.ForeignKey(
+        GoodsReceipt, on_delete=models.CASCADE, related_name="discrepancies"
+    )
+    po_line = models.ForeignKey(
+        PurchaseOrderLine, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="discrepancies", verbose_name="PO line",
+    )
+    receipt_line = models.ForeignKey(
+        GoodsReceiptLine, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="discrepancies",
+    )
+    variant = models.ForeignKey(
+        "catalog.ProductVariant", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="receipt_discrepancies",
+        help_text="For a wrong item: what actually arrived, if it is in the catalogue.",
+    )
+    observed_item_description = models.CharField(
+        max_length=255, blank=True,
+        help_text="For a wrong item not in the catalogue: describe what arrived.",
+    )
+    discrepancy_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    quantity = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    notes = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_OPEN)
+    resolution = models.CharField(max_length=30, choices=RESOLUTION_CHOICES, blank=True)
+    resolution_notes = models.TextField(blank=True)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    resolved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-id"]
+        verbose_name = "receipt discrepancy"
+        verbose_name_plural = "receipt discrepancies"
+        permissions = [("resolve_receiptdiscrepancy", "Can resolve receipt discrepancy")]
+        constraints = [
+            models.CheckConstraint(condition=Q(quantity__gt=0), name="discrepancy_quantity_gt_0"),
+            models.CheckConstraint(
+                condition=~Q(discrepancy_type="damaged") | Q(receipt_line__isnull=False),
+                name="discrepancy_damaged_has_receipt_line",
+            ),
+            models.CheckConstraint(
+                condition=~Q(discrepancy_type__in=["short", "excess"]) | Q(po_line__isnull=False),
+                name="discrepancy_short_excess_has_po_line",
+            ),
+            models.CheckConstraint(
+                condition=~Q(discrepancy_type="wrong_item")
+                | Q(variant__isnull=False) | ~Q(observed_item_description=""),
+                name="discrepancy_wrong_item_described",
+            ),
+            models.CheckConstraint(
+                condition=Q(status="open", resolution="", resolved_at__isnull=True)
+                | Q(status="resolved", resolved_at__isnull=False) & ~Q(resolution=""),
+                name="discrepancy_resolution_matches_status",
+            ),
+            # One damaged discrepancy per damaged receipt line.
+            models.UniqueConstraint(
+                fields=["receipt_line", "discrepancy_type"],
+                condition=Q(receipt_line__isnull=False),
+                name="unique_discrepancy_per_receipt_line_type",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.get_discrepancy_type_display()} x {self.quantity}"
+
+    @property
+    def item_label(self):
+        if self.variant_id:
+            return self.variant.sku
+        if self.observed_item_description:
+            return self.observed_item_description
+        if self.po_line_id:
+            return self.po_line.variant.sku
+        return "-"
+
+    def clean(self):
+        super().clean()
+        errors = {}
+        receipt = self.receipt if self.receipt_id else None
+        if self.po_line_id and receipt and self.po_line.purchase_order_id != receipt.purchase_order_id:
+            errors["po_line"] = "This line belongs to a different purchase order."
+        if self.discrepancy_type in (self.TYPE_SHORT, self.TYPE_EXCESS) and not self.po_line_id:
+            errors["po_line"] = "Choose the purchase order line this relates to."
+        if self.discrepancy_type == self.TYPE_WRONG_ITEM:
+            if not self.variant_id and not self.observed_item_description.strip():
+                errors["observed_item_description"] = (
+                    "Choose the item that arrived or describe it."
+                )
+            elif self.po_line_id and self.variant_id == self.po_line.variant_id:
+                errors["variant"] = "A wrong item must differ from the ordered item."
+        if self.discrepancy_type == self.TYPE_DAMAGED:
+            line = self.receipt_line if self.receipt_line_id else None
+            if line is None or line.stock_type != "damaged" or (
+                receipt and line.receipt_id != receipt.pk
+            ):
+                errors["receipt_line"] = "A damaged discrepancy needs a damaged line of this receipt."
+        if errors:
+            raise ValidationError(errors)

@@ -8,6 +8,7 @@ Tests for apps.purchases (P1B — purchase orders).
     PurchaseOrderAdminTests       — editability, actions, permissions, nav
     GoodsReceipt*Tests            — P1C receipts: posting, ledger, PO status,
                                     lifecycle, admin, concurrency
+    Discrepancy*/POClose*Tests    — P1D discrepancies, resolve, PO close
 """
 
 import threading
@@ -33,7 +34,13 @@ from apps.purchases.admin import (
     PurchaseOrderAdmin,
     PurchaseOrderLineInline,
 )
-from apps.purchases.models import GoodsReceipt, GoodsReceiptLine, PurchaseOrder, PurchaseOrderLine
+from apps.purchases.models import (
+    GoodsReceipt,
+    GoodsReceiptLine,
+    PurchaseOrder,
+    PurchaseOrderLine,
+    ReceiptDiscrepancy,
+)
 
 User = get_user_model()
 
@@ -466,7 +473,10 @@ class PurchaseOrderAdminTests(_POBase):
     def test_purchase_orders_in_navigation(self):
         groups = {g.get("title"): g["items"] for g in settings.UNFOLD["SIDEBAR"]["navigation"]}
         items = {item["title"]: item for item in groups["Purchases"]}
-        self.assertEqual(list(items), ["Vendors", "Purchase Orders", "Goods Receipts"])
+        self.assertEqual(
+            list(items),
+            ["Vendors", "Purchase Orders", "Goods Receipts", "Receipt Discrepancies"],
+        )
         self.assertEqual(
             str(items["Goods Receipts"]["link"]),
             reverse("admin:purchases_goodsreceipt_changelist"),
@@ -793,6 +803,8 @@ class GoodsReceiptAdminTests(_GRNBase):
             "received_date": "2026-09-26", "vendor_document_reference": "", "notes": "",
             "lines-TOTAL_FORMS": str(len(rows)), "lines-INITIAL_FORMS": "0",
             "lines-MIN_NUM_FORMS": "0", "lines-MAX_NUM_FORMS": "1000", "_continue": "1",
+            "discrepancies-TOTAL_FORMS": "0", "discrepancies-INITIAL_FORMS": "0",
+            "discrepancies-MIN_NUM_FORMS": "0", "discrepancies-MAX_NUM_FORMS": "1000",
         }
         for index, row in enumerate(rows):
             for key, value in row.items():
@@ -998,3 +1010,344 @@ class GoodsReceiptConcurrencyTests(TransactionTestCase):
         stock = self._retail()
         self.assertEqual(stock.quantity, Decimal("9"))
         self.assertEqual(stock.quantity_reserved, Decimal("3"))
+
+
+# --- P1D: receipt discrepancies and PO close ---
+
+
+class _DiscrepancyBase(_GRNBase):
+    def _discrepancy(self, receipt, discrepancy_type, quantity, **kwargs):
+        kwargs.setdefault("po_line", self.po_line)
+        return ReceiptDiscrepancy.objects.create(
+            receipt=receipt, discrepancy_type=discrepancy_type, quantity=quantity,
+            created_by=self.user, **kwargs,
+        )
+
+    def _ledger(self):
+        return (
+            StockMovement.objects.count(),
+            StockTransaction.objects.count(),
+            list(InventoryStock.objects.order_by("pk").values_list("pk", "quantity", "quantity_reserved")),
+        )
+
+    def _partial_receipt(self):
+        """Case A: 10 ordered, 8 retail + 1 damaged arrive, 1 short."""
+        receipt = self._receipt()
+        self._grn_line(receipt, 8)
+        self._grn_line(receipt, 1, "damaged")
+        self._discrepancy(receipt, ReceiptDiscrepancy.TYPE_SHORT, 1)
+        return self._post(receipt)
+
+
+class DiscrepancyReceivingTests(_DiscrepancyBase):
+    def test_a_partial_with_damaged_and_short(self):
+        receipt = self._partial_receipt()
+        self.po.refresh_from_db()
+        self.assertEqual(selectors.received_quantity(self.po_line), 9)
+        self.assertEqual(selectors.outstanding_quantity(self.po_line), 1)
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_PARTIALLY_RECEIVED)
+        damaged = receipt.discrepancies.get(discrepancy_type="damaged")
+        self.assertEqual(damaged.quantity, 1)
+        self.assertEqual(damaged.receipt_line.stock_type, "damaged")
+        self.assertEqual(damaged.status, ReceiptDiscrepancy.STATUS_OPEN)
+        self.assertEqual(damaged.created_by, self.user)
+        self.assertEqual(receipt.discrepancies.get(discrepancy_type="short").quantity, 1)
+        self.assertEqual(self._stock("retail"), Decimal("8"))
+        self.assertEqual(self._stock("damaged"), Decimal("1"))
+
+    def test_b_short_changes_no_stock_or_received(self):
+        receipt = self._receipt()
+        self._grn_line(receipt, 5)
+        self._post(receipt)
+        before = self._ledger()
+        received_before = selectors.received_quantity(self.po_line)
+        second = self._receipt()
+        self._grn_line(second, 1)
+        self._discrepancy(second, ReceiptDiscrepancy.TYPE_SHORT, 2)
+        self._post(second)
+        self.assertEqual(selectors.received_quantity(self.po_line), received_before + 1)
+        movements, transactions, _ = self._ledger()
+        self.assertEqual((movements, transactions), (before[0] + 1, before[1] + 1))
+        self.assertEqual(self._stock(), Decimal("6"))
+
+    def test_short_cannot_exceed_remaining_outstanding(self):
+        receipt = self._receipt()
+        self._grn_line(receipt, 8)
+        self._discrepancy(receipt, ReceiptDiscrepancy.TYPE_SHORT, 3)
+        with self.assertRaisesMessage(services.GoodsReceiptError, "still outstanding"):
+            self._post(receipt)
+        self.assertIsNone(self._stock())
+
+    def test_c_wrong_item_creates_no_stock(self):
+        other = _variant("SKU-PO-WRONG")
+        receipt = self._receipt()
+        self._grn_line(receipt, 2)
+        self._discrepancy(receipt, ReceiptDiscrepancy.TYPE_WRONG_ITEM, 3, variant=other)
+        self._discrepancy(
+            receipt, ReceiptDiscrepancy.TYPE_WRONG_ITEM, 1, po_line=None,
+            observed_item_description="Unbranded 50ml bottle",
+        )
+        self._post(receipt)
+        self.assertFalse(InventoryStock.objects.filter(variant=other).exists())
+        self.assertFalse(StockMovement.objects.filter(variant=other).exists())
+        self.assertEqual(StockMovement.objects.count(), 1)
+        self.assertEqual(selectors.received_quantity(self.po_line), 2)
+
+    def test_d_excess_creates_no_stock_and_over_receipt_still_blocked(self):
+        receipt = self._receipt()
+        self._grn_line(receipt, 10)
+        self._discrepancy(receipt, ReceiptDiscrepancy.TYPE_EXCESS, 2)
+        self._post(receipt)
+        self.assertEqual(self._stock(), Decimal("10"))
+        self.assertEqual(StockMovement.objects.count(), 1)
+        self.assertEqual(selectors.received_quantity(self.po_line), 10)
+
+        over = self._receipt(self._po_issued(quantity=3))
+        self._grn_line(over, 4, po_line=over.purchase_order.lines.get())
+        self._discrepancy(
+            over, ReceiptDiscrepancy.TYPE_EXCESS, 1, po_line=over.purchase_order.lines.get()
+        )
+        with self.assertRaisesMessage(services.GoodsReceiptError, "Over-receipt"):
+            self._post(over)
+
+    def _po_issued(self, quantity):
+        po = self._po()
+        self._line(po, quantity_ordered=quantity)
+        return services.issue_purchase_order(po, self.user)
+
+    def test_posting_rejects_staff_entered_damaged_discrepancy(self):
+        receipt = self._receipt()
+        line = self._grn_line(receipt, 1, "damaged")
+        self._discrepancy(receipt, ReceiptDiscrepancy.TYPE_DAMAGED, 1, receipt_line=line)
+        with self.assertRaisesMessage(services.GoodsReceiptError, "damaged receipt line"):
+            self._post(receipt)
+
+    def test_validation_by_type(self):
+        receipt = self._receipt()
+        retail_line = self._grn_line(receipt, 1)
+        cases = [
+            {"discrepancy_type": "short", "quantity": 1},
+            {"discrepancy_type": "excess", "quantity": 1},
+            {"discrepancy_type": "wrong_item", "quantity": 1, "po_line": self.po_line},
+            {"discrepancy_type": "wrong_item", "quantity": 1, "variant": self.variant,
+             "po_line": self.po_line},
+            {"discrepancy_type": "damaged", "quantity": 1, "receipt_line": retail_line},
+            {"discrepancy_type": "short", "quantity": 0, "po_line": self.po_line},
+        ]
+        for fields in cases:
+            with self.subTest(fields=fields), self.assertRaises(ValidationError):
+                ReceiptDiscrepancy(receipt=receipt, **fields).full_clean()
+
+    def test_db_constraints(self):
+        receipt = self._receipt()
+        bad = [
+            {"discrepancy_type": "damaged", "quantity": 1},
+            {"discrepancy_type": "short", "quantity": 1},
+            {"discrepancy_type": "wrong_item", "quantity": 1},
+            {"discrepancy_type": "short", "quantity": 1, "po_line": self.po_line,
+             "status": "resolved"},
+        ]
+        for fields in bad:
+            with self.subTest(fields=fields), self.assertRaises(IntegrityError), transaction.atomic():
+                ReceiptDiscrepancy.objects.create(receipt=receipt, **fields)
+
+    def test_g_damaged_discrepancy_not_duplicated_on_double_post(self):
+        receipt = self._receipt()
+        line = self._grn_line(receipt, 2, "damaged")
+        self._post(receipt)
+        with self.assertRaises(services.GoodsReceiptAlreadyPosted):
+            self._post(receipt)
+        self.assertEqual(ReceiptDiscrepancy.objects.filter(receipt_line=line).count(), 1)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            ReceiptDiscrepancy.objects.create(
+                receipt=receipt, receipt_line=line, discrepancy_type="damaged", quantity=2,
+            )
+
+    def test_discrepancies_on_failed_post_roll_back(self):
+        receipt = self._receipt()
+        self._grn_line(receipt, 1, "damaged")
+        with mock.patch(
+            "apps.purchases.services.refresh_po_receipt_status", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                self._post(receipt)
+        self.assertFalse(ReceiptDiscrepancy.objects.filter(discrepancy_type="damaged").exists())
+
+
+class DiscrepancyResolveTests(_DiscrepancyBase):
+    def test_f_resolve_once_with_audit(self):
+        receipt = self._partial_receipt()
+        short = receipt.discrepancies.get(discrepancy_type="short")
+        before = self._ledger()
+        with self.assertRaises(services.ReceiptDiscrepancyError):
+            services.resolve_discrepancy(short, self.user, "not-a-resolution")
+        short = services.resolve_discrepancy(
+            short, self.user, "vendor_credit_expected", "Vendor to credit 1 unit"
+        )
+        self.assertEqual(short.status, ReceiptDiscrepancy.STATUS_RESOLVED)
+        self.assertEqual(short.resolved_by, self.user)
+        self.assertIsNotNone(short.resolved_at)
+        with self.assertRaisesMessage(services.ReceiptDiscrepancyError, "already resolved"):
+            services.resolve_discrepancy(short, self.user, "accepted")
+        self.assertEqual(self._ledger(), before)
+
+    def test_draft_receipt_discrepancy_cannot_be_resolved(self):
+        receipt = self._receipt()
+        short = self._discrepancy(receipt, ReceiptDiscrepancy.TYPE_SHORT, 1)
+        with self.assertRaises(services.ReceiptDiscrepancyError):
+            services.resolve_discrepancy(short, self.user, "accepted")
+
+
+class POCloseTests(_DiscrepancyBase):
+    def test_e_close_partially_received(self):
+        self._partial_receipt()
+        discrepancies_before = ReceiptDiscrepancy.objects.count()
+        before = self._ledger()
+        with self.assertRaisesMessage(services.PurchaseOrderError, "reason"):
+            services.close_purchase_order(self.po, self.user, " ")
+        po = services.close_purchase_order(self.po, self.user, "Vendor discontinued it")
+        self.assertEqual(po.status, PurchaseOrder.STATUS_CLOSED)
+        self.assertEqual(po.closed_by, self.user)
+        self.assertIsNotNone(po.closed_at)
+        self.assertEqual(po.close_reason, "Vendor discontinued it")
+        self.assertEqual(ReceiptDiscrepancy.objects.count(), discrepancies_before)
+        self.assertEqual(self._ledger(), before)
+        self.po_line.refresh_from_db()
+        self.assertEqual(selectors.closed_short_quantity(self.po_line), 1)
+        self.assertEqual(selectors.received_quantity(self.po_line), 9)
+
+        with self.assertRaises(services.GoodsReceiptError):
+            self._receipt()
+        with self.assertRaises(services.PurchaseOrderError):
+            services.cancel_purchase_order(po, self.user, "x")
+
+    def test_close_only_from_partially_received(self):
+        with self.assertRaises(services.PurchaseOrderError):
+            services.close_purchase_order(self.po, self.user, "issued, nothing received")
+        receipt = self._receipt()
+        self._grn_line(receipt, 10)
+        self._post(receipt)
+        with self.assertRaises(services.PurchaseOrderError):
+            services.close_purchase_order(self.po, self.user, "already received")
+
+    def test_draft_receipt_cannot_post_after_close(self):
+        self._partial_receipt()
+        draft = self._receipt()
+        self._grn_line(draft, 1)
+        services.close_purchase_order(self.po, self.user, "stop")
+        with self.assertRaises(services.GoodsReceiptError):
+            self._post(draft)
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_CLOSED)
+
+
+class DiscrepancyAdminTests(_DiscrepancyBase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.user)
+
+    def test_close_action_get_safe_post_closes(self):
+        self._partial_receipt()
+        url = reverse("admin:purchases_purchaseorder_close_po", args=[self.po.pk])
+        self.assertEqual(self.client.get(url).status_code, 200)
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_PARTIALLY_RECEIVED)
+        self.client.post(url, {"reason": ""})
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_PARTIALLY_RECEIVED)
+        self.client.post(url, {"reason": "Stop waiting"})
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_CLOSED)
+        response = self.client.get(reverse("admin:purchases_purchaseorder_change", args=[self.po.pk]))
+        self.assertContains(response, "closed, 1 not received")
+
+    def test_close_hidden_unless_partially_received_and_permitted(self):
+        model_admin = django_admin.site._registry[PurchaseOrder]
+        request = RequestFactory().get("/admin/")
+        request.user = self.user
+        self.assertFalse(model_admin.has_close_permission(request, self.po.pk))
+        self._partial_receipt()
+        self.assertTrue(model_admin.has_close_permission(request, self.po.pk))
+        staff = User.objects.create_user(
+            username="noclose", email="noclose@example.com", password="testpass123", is_staff=True,
+        )
+        staff.user_permissions.add(*Permission.objects.filter(
+            content_type__app_label="purchases", codename__in=["view_purchaseorder"],
+        ))
+        request.user = staff
+        self.assertFalse(model_admin.has_close_permission(request, self.po.pk))
+
+    def test_po_shows_open_discrepancy_count(self):
+        self._partial_receipt()
+        self.assertEqual(selectors.open_discrepancy_count(self.po), 2)
+        response = self.client.get(reverse("admin:purchases_purchaseorder_change", args=[self.po.pk]))
+        self.assertContains(response, "Open receipt discrepancies")
+        link = reverse("admin:purchases_receiptdiscrepancy_changelist") + (
+            f"?receipt__purchase_order__id__exact={self.po.pk}&status__exact=open"
+        )
+        self.assertContains(response, f"receipt__purchase_order__id__exact={self.po.pk}")
+        listing = self.client.get(link)
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(listing.context["cl"].result_count, 2)
+
+    def test_discrepancy_admin_no_add_delete_and_read_only(self):
+        receipt = self._partial_receipt()
+        discrepancy = receipt.discrepancies.first()
+        model_admin = django_admin.site._registry[ReceiptDiscrepancy]
+        request = RequestFactory().get("/admin/")
+        request.user = self.user
+        self.assertFalse(model_admin.has_add_permission(request))
+        self.assertFalse(model_admin.has_delete_permission(request, discrepancy))
+        self.assertEqual(set(model_admin.get_readonly_fields(request, discrepancy)), set(model_admin.fields))
+        self.assertEqual(
+            self.client.get(reverse("admin:purchases_receiptdiscrepancy_changelist")).status_code, 200
+        )
+
+    def test_resolve_action_get_safe_post_resolves(self):
+        receipt = self._partial_receipt()
+        short = receipt.discrepancies.get(discrepancy_type="short")
+        url = reverse("admin:purchases_receiptdiscrepancy_resolve", args=[short.pk])
+        self.assertEqual(self.client.get(url).status_code, 200)
+        short.refresh_from_db()
+        self.assertEqual(short.status, ReceiptDiscrepancy.STATUS_OPEN)
+        self.client.post(url, {"resolution": "replacement_expected", "notes": "Next delivery"})
+        short.refresh_from_db()
+        self.assertEqual(short.status, ReceiptDiscrepancy.STATUS_RESOLVED)
+        self.assertEqual(self.client.post(url, {"resolution": "accepted"}).status_code, 403)
+
+    def test_grn_draft_records_discrepancies_via_admin(self):
+        receipt = self._receipt()
+        url = reverse("admin:purchases_goodsreceipt_change", args=[receipt.pk])
+        self.client.get(url)
+        data = {
+            "received_date": "2026-09-26", "vendor_document_reference": "", "notes": "",
+            "lines-TOTAL_FORMS": "1", "lines-INITIAL_FORMS": "0",
+            "lines-MIN_NUM_FORMS": "0", "lines-MAX_NUM_FORMS": "1000",
+            "lines-0-po_line": self.po_line.pk, "lines-0-stock_type": "retail",
+            "lines-0-quantity": "9",
+            "discrepancies-TOTAL_FORMS": "1", "discrepancies-INITIAL_FORMS": "0",
+            "discrepancies-MIN_NUM_FORMS": "0", "discrepancies-MAX_NUM_FORMS": "1000",
+            "discrepancies-0-discrepancy_type": "short", "discrepancies-0-po_line": self.po_line.pk,
+            "discrepancies-0-quantity": "1", "discrepancies-0-notes": "Box missing",
+            "_continue": "1",
+        }
+        response = self.client.post(url, data)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(receipt.discrepancies.get().discrepancy_type, "short")
+        post_page = self.client.get(reverse("admin:purchases_goodsreceipt_post_grn", args=[receipt.pk]))
+        self.assertContains(post_page, "Short 1 x")
+        self.assertContains(post_page, "no stock change")
+
+    def test_discrepancy_resolve_requires_permission(self):
+        receipt = self._partial_receipt()
+        short = receipt.discrepancies.get(discrepancy_type="short")
+        staff = User.objects.create_user(
+            username="noresolve", email="noresolve@example.com", password="testpass123",
+            is_staff=True,
+        )
+        staff.user_permissions.add(*Permission.objects.filter(
+            content_type__app_label="purchases", codename__in=["view_receiptdiscrepancy"],
+        ))
+        self.client.force_login(staff)
+        url = reverse("admin:purchases_receiptdiscrepancy_resolve", args=[short.pk])
+        self.assertEqual(self.client.post(url, {"resolution": "accepted"}).status_code, 403)

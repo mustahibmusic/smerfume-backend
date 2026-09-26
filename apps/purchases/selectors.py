@@ -10,7 +10,7 @@ must subtract posted reversal lines.
 
 from django.db.models import Sum
 
-from .models import GoodsReceipt, GoodsReceiptLine
+from .models import GoodsReceipt, GoodsReceiptLine, PurchaseOrder, ReceiptDiscrepancy
 
 
 def _posted_standard_lines():
@@ -44,3 +44,20 @@ def outstanding_quantity(po_line, received=None):
 
 def po_has_posted_receipts(po):
     return _posted_standard_lines().filter(po_line__purchase_order=po).exists()
+
+
+def closed_short_quantity(po_line, received=None):
+    """Units Smerfume stopped waiting for when the PO was closed: ordered
+    minus physically received. 0 unless the PO is closed."""
+    if po_line.purchase_order.status != PurchaseOrder.STATUS_CLOSED:
+        return 0
+    return outstanding_quantity(po_line, received)
+
+
+def open_discrepancy_count(po):
+    """Open discrepancies on posted receipts of this PO."""
+    return ReceiptDiscrepancy.objects.filter(
+        receipt__purchase_order=po,
+        receipt__status=GoodsReceipt.STATUS_POSTED,
+        status=ReceiptDiscrepancy.STATUS_OPEN,
+    ).count()

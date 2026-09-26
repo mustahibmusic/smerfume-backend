@@ -8,17 +8,29 @@ from django.urls import reverse
 from django.utils import timezone
 from unfold.admin import ModelAdmin, TabularInline
 from unfold.decorators import action, display
-from unfold.widgets import UnfoldAdminDateWidget, UnfoldAdminTextareaWidget, UnfoldAdminTextInputWidget
+from unfold.widgets import (
+    UnfoldAdminDateWidget,
+    UnfoldAdminSelectWidget,
+    UnfoldAdminTextareaWidget,
+    UnfoldAdminTextInputWidget,
+)
 
 from apps.inventory.models import Supplier
 
 from . import selectors
 from . import services as po_services
-from .models import GoodsReceipt, GoodsReceiptLine, PurchaseOrder, PurchaseOrderLine
+from .models import (
+    GoodsReceipt,
+    GoodsReceiptLine,
+    PurchaseOrder,
+    PurchaseOrderLine,
+    ReceiptDiscrepancy,
+)
 
 AUDIT_FIELDS = (
     "created_by", "created_at", "issued_by", "issued_at",
     "cancelled_by", "cancelled_at", "cancel_reason",
+    "closed_by", "closed_at", "close_reason",
 )
 
 
@@ -69,11 +81,27 @@ class PurchaseOrderLineInline(TabularInline):
 
     @admin.display(description="Outstanding")
     def outstanding(self, line):
-        return selectors.outstanding_quantity(line) if line.pk else "-"
+        if not line.pk:
+            return "-"
+        closed_short = selectors.closed_short_quantity(line)
+        if closed_short:
+            return f"0 (closed, {closed_short} not received)"
+        return selectors.outstanding_quantity(line)
 
 
 class CancelPurchaseOrderForm(forms.Form):
     reason = forms.CharField(widget=UnfoldAdminTextareaWidget, label="Reason for cancelling")
+
+
+class ClosePurchaseOrderForm(forms.Form):
+    reason = forms.CharField(widget=UnfoldAdminTextareaWidget, label="Reason for closing")
+
+
+class ResolveDiscrepancyForm(forms.Form):
+    resolution = forms.ChoiceField(
+        choices=ReceiptDiscrepancy.RESOLUTION_CHOICES, widget=UnfoldAdminSelectWidget
+    )
+    notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget, label="Notes")
 
 
 class ReceiveGoodsForm(forms.Form):
@@ -100,13 +128,14 @@ class PurchaseOrderAdmin(ModelAdmin):
         "vendor_reference", "lines__variant__sku",
     )
     list_select_related = ("supplier", "warehouse", "created_by")
-    actions_detail = ["issue_po", "receive_goods", "cancel_po"]
+    actions_detail = ["issue_po", "receive_goods", "close_po", "cancel_po"]
     fieldsets = (
         ("Purchase order", {"fields": (
             "number", "status", "supplier", "warehouse", "order_date", "expected_date",
         )}),
         ("Vendor terms", {"fields": ("vendor_reference", "amounts_include_tax")}),
         ("Notes", {"fields": ("notes",)}),
+        ("Receiving", {"fields": ("open_discrepancies",)}),
         ("Totals", {"fields": (
             "total_gross_amount", "total_discount_amount",
             "total_discounted_amount", "total_taxable_value",
@@ -130,7 +159,7 @@ class PurchaseOrderAdmin(ModelAdmin):
         return False
 
     def get_readonly_fields(self, request, obj=None):
-        always = ("number", "status", *self.TOTAL_FIELDS, *AUDIT_FIELDS)
+        always = ("number", "status", "open_discrepancies", *self.TOTAL_FIELDS, *AUDIT_FIELDS)
         if obj is None:
             return always
         editable = set(obj.editable_fields())
@@ -174,6 +203,19 @@ class PurchaseOrderAdmin(ModelAdmin):
     def order_value(self, obj):
         return obj.total_discounted_amount
 
+    @admin.display(description="Open receipt discrepancies")
+    def open_discrepancies(self, obj):
+        if not obj.pk:
+            return "-"
+        count = selectors.open_discrepancy_count(obj)
+        if not count:
+            return 0
+        url = reverse("admin:purchases_receiptdiscrepancy_changelist")
+        return format_html(
+            '<a href="{}?receipt__purchase_order__id__exact={}&status__exact=open">{}</a>',
+            url, obj.pk, count,
+        )
+
     @admin.display(description="PO number")
     def number(self, obj):
         return obj.po_number if obj.pk else "Assigned on save"
@@ -212,6 +254,11 @@ class PurchaseOrderAdmin(ModelAdmin):
     def has_cancel_permission(self, request, object_id=None):
         return request.user.has_perm("purchases.cancel_purchaseorder") and self._po_in_status(
             object_id, [PurchaseOrder.STATUS_DRAFT, PurchaseOrder.STATUS_ISSUED]
+        )
+
+    def has_close_permission(self, request, object_id=None):
+        return request.user.has_perm("purchases.close_purchaseorder") and self._po_in_status(
+            object_id, [PurchaseOrder.STATUS_PARTIALLY_RECEIVED]
         )
 
     def has_receive_permission(self, request, object_id=None):
@@ -271,6 +318,27 @@ class PurchaseOrderAdmin(ModelAdmin):
             f"Issue purchase order {po.po_number} to {po.supplier}. After issuing, "
             "prices, quantities and lines can no longer be changed.",
             "Issue purchase order", "bg-primary-600",
+        )
+
+    @action(description="Close", url_path="close", permissions=["close"], icon="lock")
+    def close_po(self, request, object_id):
+        """GET shows the reason form; only POST closes."""
+        po = get_object_or_404(PurchaseOrder, pk=object_id)
+        form = ClosePurchaseOrderForm(request.POST or None)
+        if request.method == "POST" and form.is_valid():
+            try:
+                po_services.close_purchase_order(po, request.user, form.cleaned_data["reason"])
+            except po_services.PurchaseOrderError as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+            else:
+                self.message_user(request, f"{po.po_number} closed.", level=messages.SUCCESS)
+            return redirect(self._change_url(po))
+        return self._action_page(
+            request, po, f"Close {po.po_number}", form,
+            f"Close purchase order {po.po_number}. Smerfume stops waiting for the quantity "
+            "not yet received. No more goods can be received against it and it cannot be "
+            "cancelled. Received stock is not affected.",
+            "Close purchase order", "bg-red-600",
         )
 
     @action(description="Cancel", url_path="cancel", permissions=["cancel"], icon="cancel")
@@ -378,13 +446,63 @@ class GoodsReceiptLineInline(TabularInline):
         return selectors.outstanding_quantity(line.po_line) if line.pk and line.po_line_id else "-"
 
 
+class ReceiptDiscrepancyInline(TabularInline):
+    """Short / wrong item / excess observations entered on a draft goods
+    receipt. They never change stock. Damaged discrepancies appear here
+    after posting (created automatically)."""
+
+    model = ReceiptDiscrepancy
+    extra = 0
+    fk_name = "receipt"
+    autocomplete_fields = ("variant",)
+    fields = (
+        "discrepancy_type", "po_line", "quantity", "variant",
+        "observed_item_description", "notes", "status", "resolution",
+    )
+    readonly_fields = ("status", "resolution")
+    verbose_name = "discrepancy (short / wrong item / excess)"
+    verbose_name_plural = "discrepancies (short / wrong item / excess)"
+
+    def _is_draft(self, obj):
+        return obj is None or obj.is_draft
+
+    def has_add_permission(self, request, obj=None):
+        return self._is_draft(obj) and super().has_add_permission(request, obj)
+
+    def has_change_permission(self, request, obj=None):
+        return self._is_draft(obj) and super().has_change_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        return self._is_draft(obj) and super().has_delete_permission(request, obj)
+
+    def formfield_for_choice_field(self, db_field, request, **kwargs):
+        if db_field.name == "discrepancy_type":
+            kwargs["choices"] = [
+                choice for choice in ReceiptDiscrepancy.TYPE_CHOICES
+                if choice[0] in ReceiptDiscrepancy.STAFF_TYPES
+            ]
+        return super().formfield_for_choice_field(db_field, request, **kwargs)
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name == "po_line":
+            kwargs["queryset"] = PurchaseOrderLine.objects.filter(
+                purchase_order_id=getattr(request, "_grn_po_id", None)
+            ).select_related("variant")
+        field = super().formfield_for_foreignkey(db_field, request, **kwargs)
+        if db_field.name == "po_line":
+            field.label_from_instance = lambda line: (
+                f"{line.variant.sku} - ordered {line.quantity_ordered} @ {line.unit_price}"
+            )
+        return field
+
+
 @admin.register(GoodsReceipt)
 class GoodsReceiptAdmin(ModelAdmin):
     """Goods receipt business screen. Receipts start from a purchase order
     ("Receive goods"); status changes only through Post / Cancel, which
     call apps.purchases.services. Posted receipts are read-only."""
 
-    inlines = [GoodsReceiptLineInline]
+    inlines = [GoodsReceiptLineInline, ReceiptDiscrepancyInline]
     list_display = (
         "grn_number", "receipt_type", "supplier", "purchase_order", "warehouse",
         "received_date", "status_label", "line_count", "total_units", "posted_at",
@@ -544,7 +662,12 @@ class GoodsReceiptAdmin(ModelAdmin):
             return redirect(self._change_url(receipt))
         rows = [
             f"{line.variant.sku}: +{line.quantity} to {line.get_stock_type_display().lower()} stock"
+            + (" (damaged discrepancy recorded)" if line.stock_type == "damaged" else "")
             for line in receipt.lines.select_related("variant")
+        ] + [
+            f"{d.get_discrepancy_type_display()} {d.quantity} x {d.item_label}: recorded only, "
+            "no stock change"
+            for d in receipt.discrepancies.select_related("variant", "po_line__variant")
         ]
         return self._action_page(
             request, receipt, f"Post {receipt.grn_number}", forms.Form(),
@@ -570,3 +693,104 @@ class GoodsReceiptAdmin(ModelAdmin):
             f"Cancel draft goods receipt {receipt.grn_number}. No stock is affected.",
             "Cancel goods receipt", "bg-red-600",
         )
+
+
+@admin.register(ReceiptDiscrepancy)
+class ReceiptDiscrepancyAdmin(ModelAdmin):
+    """Follow-up list of delivery problems. Created from goods receipts
+    only; descriptive fields are read-only. The only action is Resolve."""
+
+    list_display = (
+        "id", "receipt", "purchase_order", "vendor", "discrepancy_type", "item",
+        "quantity", "status_label", "resolution", "created_at",
+    )
+    list_filter = (
+        "status", "discrepancy_type", "resolution", "receipt__supplier",
+        "receipt__purchase_order",
+    )
+    search_fields = (
+        "receipt__grn_number", "receipt__purchase_order__po_number", "variant__sku",
+        "po_line__variant__sku", "observed_item_description",
+    )
+    list_select_related = (
+        "receipt__purchase_order", "receipt__supplier", "variant", "po_line__variant",
+    )
+    actions_detail = ["resolve"]
+    fields = (
+        "receipt", "po_line", "receipt_line", "discrepancy_type", "variant",
+        "observed_item_description", "quantity", "notes", "status", "resolution",
+        "resolution_notes", "created_by", "created_at", "resolved_by", "resolved_at",
+    )
+
+    def get_queryset(self, request):
+        # Drafts are edited on their goods receipt; the list shows posted ones.
+        return super().get_queryset(request).filter(receipt__status=GoodsReceipt.STATUS_POSTED)
+
+    def get_readonly_fields(self, request, obj=None):
+        return self.fields
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    @display(description="Status", label={"Open": "warning", "Resolved": "success"})
+    def status_label(self, obj):
+        return obj.get_status_display()
+
+    @admin.display(description="Item")
+    def item(self, obj):
+        return obj.item_label
+
+    @admin.display(description="Purchase order")
+    def purchase_order(self, obj):
+        return obj.receipt.purchase_order
+
+    @admin.display(description="Vendor")
+    def vendor(self, obj):
+        return obj.receipt.supplier
+
+    def has_resolve_permission(self, request, object_id=None):
+        if not request.user.has_perm("purchases.resolve_receiptdiscrepancy"):
+            return False
+        if object_id is None:
+            return True
+        return ReceiptDiscrepancy.objects.filter(
+            pk=object_id, status=ReceiptDiscrepancy.STATUS_OPEN,
+            receipt__status=GoodsReceipt.STATUS_POSTED,
+        ).exists()
+
+    @action(description="Resolve", url_path="resolve", permissions=["resolve"], icon="task_alt")
+    def resolve(self, request, object_id):
+        """GET shows the form; only POST resolves."""
+        discrepancy = get_object_or_404(self.get_queryset(request), pk=object_id)
+        back_url = reverse("admin:purchases_receiptdiscrepancy_change", args=[discrepancy.pk])
+        form = ResolveDiscrepancyForm(request.POST or None)
+        if request.method == "POST" and form.is_valid():
+            try:
+                po_services.resolve_discrepancy(
+                    discrepancy, request.user, form.cleaned_data["resolution"],
+                    form.cleaned_data["notes"],
+                )
+            except po_services.ReceiptDiscrepancyError as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+            else:
+                self.message_user(request, "Discrepancy resolved.", level=messages.SUCCESS)
+            return redirect(back_url)
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Resolve discrepancy {discrepancy.pk}",
+            "opts": self.model._meta,
+            "form": form,
+            "message": (
+                f"{discrepancy.get_discrepancy_type_display()} {discrepancy.quantity} x "
+                f"{discrepancy.item_label} on {discrepancy.receipt}. Resolving records the "
+                "outcome only: it does not move stock or create any accounting entry."
+            ),
+            "rows": (),
+            "button_label": "Resolve",
+            "button_class": "bg-primary-600",
+            "back_url": back_url,
+        }
+        return TemplateResponse(request, "admin/purchases/po_action.html", context)

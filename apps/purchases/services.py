@@ -3,20 +3,27 @@ Purchase order and goods receipt workflow. The only legitimate way to
 change PurchaseOrder.status or GoodsReceipt.status. Every operation locks
 its rows, checks the move and stamps who/when.
 
-Lock order, always: PurchaseOrder -> GoodsReceipt -> PurchaseOrderLine
-(by id) -> InventoryStock (by variant, stock type). Only posting a goods
-receipt changes inventory.
+Lock order, always: PurchaseOrder -> GoodsReceipt -> ReceiptDiscrepancy
+-> PurchaseOrderLine (by id) -> InventoryStock (by variant, stock type).
+Only posting a goods receipt changes inventory; discrepancies never do.
 """
 
 from collections import defaultdict
 
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
 
 from apps.inventory.services.receipt import receive_purchased_stock
 
 from . import selectors
-from .models import GoodsReceipt, GoodsReceiptLine, PurchaseOrder, PurchaseOrderLine
+from .models import (
+    GoodsReceipt,
+    GoodsReceiptLine,
+    PurchaseOrder,
+    PurchaseOrderLine,
+    ReceiptDiscrepancy,
+)
 
 
 class PurchaseOrderError(Exception):
@@ -181,11 +188,37 @@ def _receipt_problems(receipt, po, lines, po_lines):
     return problems
 
 
-def _over_receipt_problems(lines, po_lines):
+def _discrepancy_problems(po, discrepancies, po_lines):
+    """Staff-recorded observations on a draft: short / wrong_item / excess.
+    Damaged discrepancies are created by posting, never entered."""
+    problems = []
+    for number, discrepancy in enumerate(discrepancies, start=1):
+        label = f"Discrepancy {number}"
+        if discrepancy.discrepancy_type not in ReceiptDiscrepancy.STAFF_TYPES:
+            problems.append(f"{label}: damaged stock is recorded as a damaged receipt line.")
+            continue
+        if discrepancy.po_line_id and discrepancy.po_line_id not in po_lines:
+            problems.append(f"{label}: choose a line from {po.po_number}.")
+            continue
+        try:
+            discrepancy.clean()
+        except ValidationError as exc:
+            problems.extend(f"{label}: {message}" for message in exc.messages)
+    return problems
+
+
+def _over_receipt_problems(lines, po_lines, discrepancies=()):
+    """Received units may never exceed the ordered quantity. A recorded
+    shortage must also fit in what is still outstanding after this
+    receipt. Excess and wrong-item records never count as received."""
     incoming = defaultdict(int)
     for line in lines:
         incoming[line.po_line_id] += line.quantity
-    already = selectors.received_quantities(incoming)
+    short = defaultdict(int)
+    for discrepancy in discrepancies:
+        if discrepancy.discrepancy_type == ReceiptDiscrepancy.TYPE_SHORT:
+            short[discrepancy.po_line_id] += discrepancy.quantity
+    already = selectors.received_quantities(set(incoming) | set(short))
     problems = []
     for po_line_id, quantity in incoming.items():
         po_line = po_lines[po_line_id]
@@ -194,6 +227,16 @@ def _over_receipt_problems(lines, po_lines):
             problems.append(
                 f"{po_line.variant.sku}: ordered {po_line.quantity_ordered}, already received "
                 f"{received}, this receipt {quantity}. Over-receipt is not allowed."
+            )
+    for po_line_id, quantity in short.items():
+        po_line = po_lines[po_line_id]
+        remaining = (
+            po_line.quantity_ordered - already.get(po_line_id, 0) - incoming.get(po_line_id, 0)
+        )
+        if quantity > remaining:
+            problems.append(
+                f"{po_line.variant.sku}: short {quantity} recorded but only {max(remaining, 0)} "
+                "is still outstanding after this receipt."
             )
     return problems
 
@@ -214,7 +257,11 @@ def post_goods_receipt(receipt, user):
         raise GoodsReceiptError(f"{receipt.grn_number} is not a draft and cannot be posted.")
 
     lines = list(receipt.lines.order_by("pk"))
-    po_line_ids = sorted({line.po_line_id for line in lines if line.po_line_id})
+    discrepancies = list(receipt.discrepancies.select_for_update(of=("self",)).order_by("pk"))
+    po_line_ids = sorted(
+        {line.po_line_id for line in lines if line.po_line_id}
+        | {d.po_line_id for d in discrepancies if d.po_line_id}
+    )
     # of=("self",): lock only the PO line rows. Without it the joined
     # ProductVariant rows are locked FOR UPDATE too, which deadlocks with
     # checkout (it holds the stock row, then inserts rows referencing the
@@ -227,8 +274,9 @@ def post_goods_receipt(receipt, user):
         .order_by("pk")
     }
     problems = _receipt_problems(receipt, po, lines, po_lines)
+    problems += _discrepancy_problems(po, discrepancies, po_lines)
     if not problems:
-        problems = _over_receipt_problems(lines, po_lines)
+        problems = _over_receipt_problems(lines, po_lines, discrepancies)
     if problems:
         raise GoodsReceiptError(" ".join(problems))
 
@@ -260,6 +308,19 @@ def post_goods_receipt(receipt, user):
     receipt.posted_at = timezone.now()
     receipt.save(update_fields=["status", "stock_transaction", "posted_by", "posted_at", "updated_at"])
 
+    # Damaged units arrived and count as received; record them for
+    # follow-up. One per damaged line (unique constraint); a receipt posts
+    # only once, so retries never duplicate them.
+    ReceiptDiscrepancy.objects.bulk_create([
+        ReceiptDiscrepancy(
+            receipt=receipt, po_line_id=line.po_line_id, receipt_line=line,
+            discrepancy_type=ReceiptDiscrepancy.TYPE_DAMAGED,
+            quantity=line.quantity, created_by=user,
+        )
+        for line in lines
+        if line.stock_type == "damaged"
+    ])
+
     refresh_po_receipt_status(po)
     return receipt
 
@@ -284,3 +345,56 @@ def cancel_goods_receipt(receipt, user, reason):
     receipt.cancel_reason = reason
     receipt.save(update_fields=["status", "cancelled_by", "cancelled_at", "cancel_reason", "updated_at"])
     return receipt
+
+
+@transaction.atomic
+def close_purchase_order(po, user, reason):
+    """Partially received -> closed: Smerfume stops waiting for the rest.
+    The unreceived quantity is derived (ordered minus received), not
+    written as another short discrepancy. A closed PO receives nothing
+    more and cannot be cancelled."""
+    reason = (reason or "").strip()
+    if not reason:
+        raise PurchaseOrderError("A reason for closing is required.")
+    po = _lock(po)
+    _check_transition(po, PurchaseOrder.STATUS_CLOSED)
+    po.status = PurchaseOrder.STATUS_CLOSED
+    po.closed_by = user
+    po.closed_at = timezone.now()
+    po.close_reason = reason
+    po.save(update_fields=["status", "closed_by", "closed_at", "close_reason", "updated_at"])
+    return po
+
+
+# --- Receipt discrepancies ---
+
+
+class ReceiptDiscrepancyError(Exception):
+    """Raised when a discrepancy cannot be resolved."""
+
+
+@transaction.atomic
+def resolve_discrepancy(discrepancy, user, resolution, notes=""):
+    """Open -> resolved, once. Operational only: no stock, receipt or
+    accounting change."""
+    valid = {value for value, _ in ReceiptDiscrepancy.RESOLUTION_CHOICES}
+    if resolution not in valid:
+        raise ReceiptDiscrepancyError("Choose a valid resolution.")
+    discrepancy = (
+        ReceiptDiscrepancy.objects.select_for_update(of=("self",))
+        .select_related("receipt")
+        .get(pk=discrepancy.pk)
+    )
+    if discrepancy.receipt.status != GoodsReceipt.STATUS_POSTED:
+        raise ReceiptDiscrepancyError("Only discrepancies on posted goods receipts can be resolved.")
+    if discrepancy.status != ReceiptDiscrepancy.STATUS_OPEN:
+        raise ReceiptDiscrepancyError("This discrepancy is already resolved.")
+    discrepancy.status = ReceiptDiscrepancy.STATUS_RESOLVED
+    discrepancy.resolution = resolution
+    discrepancy.resolution_notes = (notes or "").strip()
+    discrepancy.resolved_by = user
+    discrepancy.resolved_at = timezone.now()
+    discrepancy.save(update_fields=[
+        "status", "resolution", "resolution_notes", "resolved_by", "resolved_at", "updated_at",
+    ])
+    return discrepancy

@@ -714,6 +714,9 @@ class StockReservationAllocation(BaseModel):
                 name="alloc_active_incoming_line_idx",
             ),
         ]
+        permissions = [
+            ("reallocate_incoming_allocation", "Can reallocate incoming (booked) allocations"),
+        ]
 
     def __str__(self):
         if self.allocation_type == self.ALLOCATION_RETAIL_UNIT:

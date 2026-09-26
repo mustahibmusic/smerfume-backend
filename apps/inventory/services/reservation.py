@@ -15,12 +15,16 @@ elsewhere):
 """
 
 import datetime
+import logging
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from .. import models as inv_models
+
+logger = logging.getLogger(__name__)
 
 
 class InsufficientStockError(Exception):
@@ -117,12 +121,23 @@ def _incoming_capacity(variant_ids, warehouse):
 
     The parent PO status is re-read after the line lock, so a PO closed or
     cancelled meanwhile drops out (race with P2C close/cancel guards)."""
+    lines = _lock_candidate_lines(variant_ids, warehouse)
+    capacity = {}
+    for line, units in _bookable_by_priority(lines):
+        capacity.setdefault(line.variant_id, []).append([line, units])
+    return capacity
+
+
+def _bookable_by_priority(lines):
+    """[(line, incoming units left)] for already-locked PO lines, in
+    allocation priority order: expected_date (nulls last), PO id, line id.
+    The parent PO status is re-read after the line lock; lines of a PO that
+    is no longer issued/partially received, or with nothing left, drop out."""
     from apps.purchases import selectors as purchase_selectors
     from apps.purchases.models import PurchaseOrder
 
-    lines = _lock_candidate_lines(variant_ids, warehouse)
     if not lines:
-        return {}
+        return []
     po_rows = {
         pk: (status, expected_date)
         for pk, status, expected_date in PurchaseOrder.objects.filter(
@@ -142,11 +157,7 @@ def _incoming_capacity(variant_ids, warehouse):
             line.purchase_order_id, line.pk,
         )
 
-    capacity = {}
-    for line in sorted(lines, key=priority):
-        if amounts[line.pk] > 0:
-            capacity.setdefault(line.variant_id, []).append([line, amounts[line.pk]])
-    return capacity
+    return [(line, amounts[line.pk]) for line in sorted(lines, key=priority) if amounts[line.pk] > 0]
 
 
 _ACTIVE_RESERVATION_STATUSES = (
@@ -281,6 +292,111 @@ def convert_incoming_allocations(allocations, receipt_lines, warehouse):
     for stock in stocks.values():
         _check_reserved_fits(stock)
         stock.save(update_fields=["quantity_reserved", "updated_at"])
+
+
+@transaction.atomic
+def reallocate_incoming_allocation(allocation, performed_by):
+    """Move an active incoming allocation off a PO line that will not
+    deliver (spec §5.6). Covers its units with free physical stock first,
+    then other confirmed incoming lines in checkout priority; the current
+    line is never a source. All or nothing: if the units cannot be fully
+    covered, raises InsufficientStockError and changes nothing. The order
+    is never cancelled here.
+
+    The first source becomes `replacement`; further incoming pieces are new
+    active rows with split_from = the original (lineage only, possibly on
+    another PO line). The original becomes `reallocated`.
+
+    Lock order (spec §8): candidate PO lines by id (PO rows are not locked;
+    their status is re-read after the line lock) -> reservation ->
+    allocation -> retail stock."""
+    from apps.purchases import selectors as purchase_selectors
+    from apps.purchases.models import PurchaseOrder, PurchaseOrderLine
+
+    Allocation = inv_models.StockReservationAllocation
+    row = Allocation.objects.filter(pk=allocation.pk).values(
+        "allocation_type", "purchase_order_line_id", "reservation_id",
+        "reservation__warehouse_id", "purchase_order_line__variant_id",
+    ).get()
+    if row["allocation_type"] != Allocation.ALLOCATION_INCOMING_PO_LINE:
+        raise InvalidReservationStateError("Only incoming allocations can be reallocated.")
+    current_line_id = row["purchase_order_line_id"]
+    variant_id = row["purchase_order_line__variant_id"]
+    warehouse_id = row["reservation__warehouse_id"]
+
+    lines = list(
+        PurchaseOrderLine.objects.select_for_update(of=("self",))
+        .filter(
+            Q(pk=current_line_id)
+            | Q(
+                variant_id=variant_id,
+                purchase_order__warehouse_id=warehouse_id,
+                purchase_order__status__in=PurchaseOrder.BOOKABLE_STATUSES,
+                confirmed_booked_quantity__gt=0,
+            )
+        )
+        .order_by("pk")
+    )
+    reservation = _lock_reservations([row["reservation_id"]])[row["reservation_id"]]
+    allocation = Allocation.objects.select_for_update().get(pk=allocation.pk)
+    if (
+        allocation.incoming_status != Allocation.INCOMING_ACTIVE
+        or allocation.purchase_order_line_id != current_line_id
+    ):
+        raise InvalidReservationStateError(
+            "Only an active incoming allocation can be reallocated."
+        )
+    allocation.reservation = reservation
+    stock = _lock_retail_stock(variant_id, reservation.warehouse)
+
+    needed = allocation.units
+    on_hand = max(stock.available, Decimal("0")).to_integral_value(rounding=ROUND_FLOOR)
+    physical = min(on_hand, needed)
+    remaining = needed - physical
+    sources = []
+    others = [line for line in lines if line.pk != current_line_id]
+    for line, units in _bookable_by_priority(others):
+        if remaining <= 0:
+            break
+        take = min(units, remaining)
+        sources.append((line, take))
+        remaining -= take
+    if remaining > 0:
+        fmt = purchase_selectors.format_units
+        raise InsufficientStockError(
+            f"Cannot reallocate {reservation.variant} for order item "
+            f"{reservation.order_item_id}: {fmt(remaining)} of {fmt(needed)} unit(s) "
+            "could not be covered by free stock or other confirmed incoming stock."
+        )
+
+    replacement = None
+    if physical > 0:
+        replacement = _physical_replacement(reservation, stock, physical)
+        _check_reserved_fits(stock)
+        stock.save(update_fields=["quantity_reserved", "updated_at"])
+    for line, units in sources:
+        if replacement is None:
+            replacement = Allocation.objects.create(
+                reservation=reservation,
+                allocation_type=Allocation.ALLOCATION_INCOMING_PO_LINE,
+                purchase_order_line=line,
+                units=units,
+                incoming_status=Allocation.INCOMING_ACTIVE,
+            )
+        else:
+            _split_remainder(allocation, units, purchase_order_line_id=line.pk)
+
+    allocation.incoming_status = Allocation.INCOMING_REALLOCATED
+    allocation.replacement = replacement
+    allocation.incoming_resolved_at = timezone.now()
+    allocation.save(update_fields=[
+        "incoming_status", "replacement", "incoming_resolved_at", "updated_at",
+    ])
+    logger.info(
+        "Incoming allocation %s reallocated by user %s (replacement %s).",
+        allocation.pk, getattr(performed_by, "pk", None), replacement.pk,
+    )
+    return allocation
 
 
 @transaction.atomic

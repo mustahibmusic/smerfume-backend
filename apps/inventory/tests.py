@@ -27,10 +27,12 @@ from unittest.mock import patch
 
 from django.contrib import admin as django_admin
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Permission
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, transaction
 from django.test import RequestFactory, TestCase, TransactionTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
+from django.urls import reverse
 from django.utils import timezone
 
 from apps.catalog.models import Brand, Category, Product, ProductEdition, ProductVariant
@@ -1607,3 +1609,205 @@ class ReserveOrderItemsIncomingTests(_ReserveOrderItemsBase):
             return len([q for q in ctx.captured_queries if "purchases_" in q["sql"]])
 
         self.assertEqual(purchases_queries(1), purchases_queries(3))
+
+
+class ReallocateIncomingTests(_ReserveOrderItemsBase):
+    """reallocate_incoming_allocation (spec §5.6): physical first, then
+    other confirmed incoming lines; all or nothing; never cancels orders."""
+
+    def _allocate(self, variant, quantity):
+        [reservation] = reservation_service.reserve_order_items(
+            self._items((variant, quantity)), self.warehouse, allow_incoming=True,
+        )
+        return reservation.allocations.get(incoming_status="active")
+
+    def _set_stock(self, variant, quantity):
+        InventoryStock.objects.filter(
+            variant=variant, warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL,
+        ).update(quantity=Decimal(quantity))
+
+    def _reallocate(self, allocation):
+        return reservation_service.reallocate_incoming_allocation(allocation, self.buyer)
+
+    def test_reallocates_to_free_physical_stock(self):
+        variant = self._variant("P2C-RA-PHY", stock=0)
+        line = self._book(variant, 3)
+        allocation = self._allocate(variant, 2)
+        self._set_stock(variant, 5)
+        self._reallocate(allocation)
+        allocation.refresh_from_db()
+        self.assertEqual(allocation.incoming_status, "reallocated")
+        self.assertIsNotNone(allocation.incoming_resolved_at)
+        self.assertIsNone(allocation.converted_by_receipt_line)
+        self.assertEqual(allocation.replacement.allocation_type, "retail_unit")
+        self.assertEqual(allocation.replacement.units, Decimal("2"))
+        self.assertEqual(self._stock(variant).quantity_reserved, Decimal("2"))
+        self.assertFalse(self._incoming_rows(incoming_status="active").exists())
+        self.assertFalse(self._incoming_rows(purchase_order_line=line, incoming_status="active").exists())
+        reservation_service.consume_reservation(allocation.reservation)
+        self.assertEqual(self._stock(variant).quantity, Decimal("3"))
+
+    def test_reallocates_to_other_po_line(self):
+        variant = self._variant("P2C-RA-PO", stock=0)
+        self._book(variant, 3)
+        allocation = self._allocate(variant, 2)
+        other = self._book(variant, 2)
+        self._reallocate(allocation)
+        allocation.refresh_from_db()
+        replacement = allocation.replacement
+        self.assertEqual(allocation.incoming_status, "reallocated")
+        self.assertEqual(
+            (replacement.purchase_order_line, replacement.units, replacement.incoming_status),
+            (other, Decimal("2"), "active"),
+        )
+        self.assertIsNone(replacement.split_from)
+
+    def test_mixed_physical_then_incoming_uses_split_from(self):
+        variant = self._variant("P2C-RA-MIX", stock=0)
+        self._book(variant, 3)
+        allocation = self._allocate(variant, 3)
+        self._set_stock(variant, 1)
+        other = self._book(variant, 5)
+        self._reallocate(allocation)
+        allocation.refresh_from_db()
+        self.assertEqual(allocation.replacement.allocation_type, "retail_unit")
+        self.assertEqual(allocation.replacement.units, Decimal("1"))
+        [piece] = allocation.split_remainders.all()
+        self.assertEqual(
+            (piece.purchase_order_line, piece.units, piece.incoming_status),
+            (other, Decimal("2"), "active"),
+        )
+        self.assertEqual(self._stock(variant).quantity_reserved, Decimal("1"))
+
+    def test_multiple_incoming_sources_follow_priority(self):
+        variant = self._variant("P2C-RA-PRI", stock=0)
+        self._book(variant, 2, expected_date=datetime.date(2026, 10, 1))
+        allocation = self._allocate(variant, 2)
+        late = self._book(variant, 1, expected_date=datetime.date(2026, 12, 1))
+        early = self._book(variant, 1, expected_date=datetime.date(2026, 11, 1))
+        self._reallocate(allocation)
+        allocation.refresh_from_db()
+        self.assertEqual(allocation.replacement.purchase_order_line, early)
+        [piece] = allocation.split_remainders.all()
+        self.assertEqual((piece.purchase_order_line, piece.split_from), (late, allocation))
+
+    def test_impossible_reallocation_changes_nothing(self):
+        variant = self._variant("P2C-RA-NONE", stock=0)
+        self._book(variant, 5)
+        allocation = self._allocate(variant, 2)
+        self._set_stock(variant, 1)
+        before = StockReservationAllocation.objects.count()
+        with self.assertRaises(reservation_service.InsufficientStockError) as ctx:
+            self._reallocate(allocation)
+        self.assertIn("1 of 2", str(ctx.exception))
+        allocation.refresh_from_db()
+        self.assertEqual(allocation.incoming_status, "active")
+        self.assertEqual(StockReservationAllocation.objects.count(), before)
+        self.assertEqual(self._stock(variant).quantity_reserved, Decimal("0"))
+        allocation.reservation.refresh_from_db()
+        self.assertEqual(allocation.reservation.status, StockReservation.STATUS_HELD)
+
+    def test_current_line_is_never_a_source(self):
+        variant = self._variant("P2C-RA-SELF", stock=0)
+        self._book(variant, 10)
+        allocation = self._allocate(variant, 2)
+        with self.assertRaises(reservation_service.InsufficientStockError):
+            self._reallocate(allocation)
+
+    def test_closed_or_other_warehouse_po_is_not_a_source(self):
+        variant = self._variant("P2C-RA-CLOSED", stock=0)
+        self._book(variant, 2)
+        allocation = self._allocate(variant, 2)
+        self._book(variant, 5, status=PurchaseOrder.STATUS_CLOSED)
+        self._book(variant, 5, warehouse=Warehouse.objects.create(name="P2C Other"))
+        with self.assertRaises(reservation_service.InsufficientStockError):
+            self._reallocate(allocation)
+
+    def test_only_active_incoming_rows_can_be_reallocated(self):
+        variant = self._variant("P2C-RA-STATE", stock=5)
+        self._book(variant, 3)
+        [reservation] = reservation_service.reserve_order_items(
+            self._items((variant, 1)), self.warehouse, allow_incoming=True,
+        )
+        physical = reservation.allocations.get()
+        with self.assertRaises(reservation_service.InvalidReservationStateError):
+            self._reallocate(physical)
+
+        other = self._variant("P2C-RA-STATE-B", stock=0)
+        self._book(other, 3)
+        incoming = self._allocate(other, 1)
+        reservation_service.release_reservation(incoming.reservation)
+        with self.assertRaises(reservation_service.InvalidReservationStateError):
+            self._reallocate(incoming)
+
+
+class ReallocateIncomingAdminTests(_ReserveOrderItemsBase):
+    """Staff confirmation page for reallocate_incoming_allocation. GET never
+    changes state; POST needs inventory.reallocate_incoming_allocation."""
+
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_superuser(username="p2c-admin", email="p2c-admin@example.com", password="x")
+        self.variant = self._variant("P2C-RA-ADMIN", stock=0)
+        self._book(self.variant, 3)
+        [reservation] = reservation_service.reserve_order_items(
+            self._items((self.variant, 2)), self.warehouse, allow_incoming=True,
+        )
+        self.allocation = reservation.allocations.get()
+        self.url = reverse(
+            "admin:inventory_stockreservationallocation_reallocate", args=[self.allocation.pk]
+        )
+
+    def _status(self):
+        self.allocation.refresh_from_db()
+        return self.allocation.incoming_status
+
+    def test_permission_exists(self):
+        self.assertTrue(
+            Permission.objects.filter(
+                codename="reallocate_incoming_allocation", content_type__app_label="inventory",
+            ).exists()
+        )
+
+    def test_get_shows_page_without_change(self):
+        self.client.force_login(self.staff)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Reallocate")
+        self.assertEqual(self._status(), "active")
+
+    def test_post_reallocates_and_returns_to_order(self):
+        InventoryStock.objects.filter(variant=self.variant).update(quantity=Decimal("5"))
+        self.client.force_login(self.staff)
+        response = self.client.post(self.url)
+        order = self.allocation.reservation.order_item.order
+        self.assertRedirects(
+            response, reverse("admin:orders_order_change", args=[order.pk]),
+            fetch_redirect_response=False,
+        )
+        self.assertEqual(self._status(), "reallocated")
+
+    def test_failure_shows_uncovered_quantity_and_changes_nothing(self):
+        self.client.force_login(self.staff)
+        response = self.client.post(self.url, follow=True)
+        self.assertContains(response, "2 of 2 unit(s)")
+        self.assertEqual(self._status(), "active")
+
+    def test_staff_without_permission_is_refused(self):
+        clerk = User.objects.create_user(
+            username="p2c-clerk", email="p2c-clerk@example.com", password="x", is_staff=True,
+        )
+        clerk.user_permissions.add(
+            Permission.objects.get(codename="view_stockreservationallocation")
+        )
+        InventoryStock.objects.filter(variant=self.variant).update(quantity=Decimal("5"))
+        self.client.force_login(clerk)
+        self.assertEqual(self.client.post(self.url).status_code, 403)
+        self.assertEqual(self._status(), "active")
+
+    def test_order_breakdown_links_active_incoming_rows(self):
+        order = self.allocation.reservation.order_item.order
+        self.client.force_login(self.staff)
+        response = self.client.get(reverse("admin:orders_order_change", args=[order.pk]))
+        self.assertContains(response, self.url)

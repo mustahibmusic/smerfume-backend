@@ -2324,6 +2324,29 @@ class IncomingConversionTests(_BookingBase):
             sum(r.units for r in self._physical_rows(allocation.reservation)), Decimal("3")
         )
 
+    def test_split_chain_through_conversion_and_reallocation(self):
+        original = self._incoming_allocation(4)
+        self._receive(retail=1)
+        remainder = original.split_remainders.get()
+        other_po = self._po()
+        other_line = self._line(other_po)
+        services.issue_purchase_order(other_po, self.user)
+        self._book(5, other_line)
+        InventoryStock.objects.filter(pk=self._retail_stock().pk).update(quantity=Decimal("2"))
+        reservation_service.reallocate_incoming_allocation(remainder, self.user)
+        remainder.refresh_from_db()
+        self.assertEqual(remainder.incoming_status, "reallocated")
+        self.assertEqual(remainder.replacement.units, Decimal("1"))
+        [last] = self._active_incoming(original.reservation)
+        self.assertEqual((last.purchase_order_line, last.units), (other_line, Decimal("2")))
+        self.assertEqual(last.split_from, remainder)
+        self.assertEqual(remainder.split_from, original)
+        self.assertEqual(
+            sum(r.units for r in self._physical_rows(original.reservation))
+            + last.units,
+            Decimal("4"),
+        )
+
     @override_settings(BOOKED_INCOMING_SALES_ENABLED=True)
     def test_no_double_count_after_conversion(self):
         self._incoming_allocation(6)
@@ -2465,3 +2488,15 @@ class IncomingPOGuardTests(_BookingBase):
         other_line = self._line(other_po)
         self._incoming_allocation(1, line=other_line, number="BK-3")
         self.assertEqual(list(selectors.active_incoming_allocations(self.po)), [first])
+
+    def test_po_page_lists_awaiting_orders(self):
+        allocation = self._incoming_allocation(2, number="BK-AWAIT")
+        self._incoming_allocation(1, status="released", number="BK-GONE")
+        self.client.force_login(self.user)
+        response = self.client.get(reverse("admin:purchases_purchaseorder_change", args=[self.po.pk]))
+        self.assertContains(response, "BK-AWAIT")
+        self.assertNotContains(response, "BK-GONE")
+        self.assertContains(
+            response,
+            reverse("admin:inventory_stockreservationallocation_reallocate", args=[allocation.pk]),
+        )

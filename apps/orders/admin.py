@@ -240,11 +240,20 @@ class OrderAdmin(ModelAdmin):
         )
         rows = []
         for allocation in allocations:
+            action_link = "—"
             if allocation.allocation_type == StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE:
                 source = "Incoming"
                 po_number = allocation.purchase_order_line.purchase_order.po_number
                 amount = f"{allocation.units} pcs"
                 state = allocation.get_incoming_status_display()
+                if allocation.incoming_status == StockReservationAllocation.INCOMING_ACTIVE:
+                    action_link = format_html(
+                        '<a href="{}">Reallocate</a>',
+                        reverse(
+                            "admin:inventory_stockreservationallocation_reallocate",
+                            args=[allocation.pk],
+                        ),
+                    )
             else:
                 source = "Physical"
                 po_number = "—"
@@ -255,14 +264,16 @@ class OrderAdmin(ModelAdmin):
                 state = allocation.reservation.get_status_display()
             rows.append((
                 allocation.reservation.order_item.variant, source, po_number, amount, state,
+                action_link,
             ))
         if not rows:
             return "—"
         return format_html(
             "<table><thead><tr><th>Item</th><th>Source</th><th>PO</th><th>Quantity</th>"
-            "<th>Status</th></tr></thead><tbody>{}</tbody></table>",
+            "<th>Status</th><th>Action</th></tr></thead><tbody>{}</tbody></table>",
             format_html_join(
-                "", "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>", rows,
+                "", "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                rows,
             ),
         )
 

@@ -1191,13 +1191,48 @@ class IncomingAllocationSchemaTests(_IncomingAllocationBase):
 
 
 class IncomingAllocationGuardTests(_IncomingAllocationBase):
-    """P2A has no incoming handling in release/consume; they must refuse
-    clearly instead of crashing or skipping."""
+    """Release frees active incoming rows (P2B); consume still refuses them
+    until they are converted or reallocated (P2C)."""
 
-    def test_release_refuses_reservation_with_incoming_row(self):
-        self._incoming()
-        with self.assertRaises(reservation_service.InvalidReservationStateError):
-            reservation_service.release_reservation(self.reservation)
+    def test_release_marks_active_incoming_row_released(self):
+        row = self._incoming()
+        reservation_service.release_reservation(self.reservation)
+        row.refresh_from_db()
+        self.reservation.refresh_from_db()
+        self.assertEqual(row.incoming_status, StockReservationAllocation.INCOMING_RELEASED)
+        self.assertIsNotNone(row.incoming_resolved_at)
+        self.assertEqual(self.reservation.status, StockReservation.STATUS_RELEASED)
+        stock = InventoryStock.objects.get(pk=self.stock.pk)
+        self.assertEqual((stock.quantity, stock.quantity_reserved), (5, 0))
+
+    def test_release_returns_units_to_incoming_sellable(self):
+        from apps.purchases import selectors as purchase_selectors
+        PurchaseOrderLine.objects.filter(pk=self.po_line.pk).update(confirmed_booked_quantity=10)
+        PurchaseOrder.objects.filter(pk=self.po_line.purchase_order_id).update(
+            status=PurchaseOrder.STATUS_ISSUED
+        )
+        self._incoming(units=Decimal("4"))
+        line = PurchaseOrderLine.objects.get(pk=self.po_line.pk)
+        self.assertEqual(purchase_selectors.incoming_sellable(line), 6)
+        reservation_service.release_reservation(self.reservation)
+        self.assertEqual(purchase_selectors.incoming_sellable(line), 10)
+
+    def test_release_mixed_physical_and_incoming(self):
+        self._physical(units=Decimal("1"))
+        InventoryStock.objects.filter(pk=self.stock.pk).update(quantity_reserved=1)
+        row = self._incoming(units=Decimal("1"))
+        reservation_service.release_reservation(self.reservation)
+        row.refresh_from_db()
+        self.assertEqual(row.incoming_status, StockReservationAllocation.INCOMING_RELEASED)
+        self.assertEqual(InventoryStock.objects.get(pk=self.stock.pk).quantity_reserved, 0)
+
+    def test_release_leaves_historical_incoming_rows_untouched(self):
+        resolved_at = timezone.now() - timezone.timedelta(days=1)
+        old = self._incoming(incoming_status="released", incoming_resolved_at=resolved_at)
+        self._incoming(units=Decimal("1"))
+        reservation_service.release_reservation(self.reservation)
+        old.refresh_from_db()
+        self.assertEqual(old.incoming_resolved_at, resolved_at)
 
     def test_consume_refuses_reservation_with_incoming_row(self):
         self._incoming()

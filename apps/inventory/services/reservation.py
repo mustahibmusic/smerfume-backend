@@ -31,23 +31,45 @@ class InvalidReservationStateError(Exception):
 
 
 def _refuse_active_incoming_allocations(reservation):
-    """Active incoming (booked) allocations are released/converted from
-    P2B/P2C on. Until then, refuse clearly rather than mis-handle them.
-    Historical (converted/reallocated/released) incoming rows are skipped."""
+    """Active incoming (booked) units are not on the shelf yet, so they can
+    never be consumed; GRN conversion or reallocation (P2C) resolves them
+    first. Historical (converted/reallocated/released) rows are skipped."""
     Allocation = inv_models.StockReservationAllocation
     if reservation.allocations.filter(
         allocation_type=Allocation.ALLOCATION_INCOMING_PO_LINE,
         incoming_status=Allocation.INCOMING_ACTIVE,
     ).exists():
         raise InvalidReservationStateError(
-            "This reservation has active incoming (booked) allocations, which are not "
-            "handled yet."
+            "This reservation has active incoming (booked) allocations that have not "
+            "arrived yet."
+        )
+
+
+def _release_active_incoming_allocations(reservation):
+    """Mark active incoming rows released. They hold no stock, so nothing
+    else changes; their units count as incoming sellable again."""
+    Allocation = inv_models.StockReservationAllocation
+    ids = list(
+        reservation.allocations.filter(
+            allocation_type=Allocation.ALLOCATION_INCOMING_PO_LINE,
+            incoming_status=Allocation.INCOMING_ACTIVE,
+        )
+        .select_for_update()
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
+    if ids:
+        now = timezone.now()
+        Allocation.objects.filter(pk__in=ids).update(
+            incoming_status=Allocation.INCOMING_RELEASED,
+            incoming_resolved_at=now,
+            updated_at=now,
         )
 
 
 def _physical_allocations(reservation):
-    """Locked physical allocation rows. After the guard above, any incoming
-    row left is historical and holds no capacity."""
+    """Locked physical allocation rows. Incoming rows are never physical
+    capacity, whatever their status."""
     return reservation.allocations.exclude(
         allocation_type=inv_models.StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE
     ).select_for_update()
@@ -187,15 +209,16 @@ def confirm_reservation(reservation):
 def release_reservation(reservation):
     """Release a held/confirmed reservation, restoring exactly the capacity
     recorded on its StockReservationAllocation rows. Never recalculates
-    what should be released — only reverses what was actually recorded."""
+    what should be released — only reverses what was actually recorded.
+    Active incoming (booked) rows become `released`, with no stock change."""
     reservation = inv_models.StockReservation.objects.select_for_update().get(pk=reservation.pk)
     if reservation.status not in (
         inv_models.StockReservation.STATUS_HELD,
         inv_models.StockReservation.STATUS_CONFIRMED,
     ):
         raise InvalidReservationStateError(f"Cannot release a reservation in status={reservation.status}")
-    _refuse_active_incoming_allocations(reservation)
 
+    _release_active_incoming_allocations(reservation)
     for allocation in _physical_allocations(reservation):
         if allocation.allocation_type == inv_models.StockReservationAllocation.ALLOCATION_RETAIL_UNIT:
             stock = inv_models.InventoryStock.objects.select_for_update().get(pk=allocation.inventory_stock_id)

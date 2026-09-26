@@ -52,7 +52,9 @@ from apps.inventory.models import (
 from apps.inventory.services import reservation as reservation_service
 from apps.inventory.services import adjustment as adjustment_service
 from apps.orders.models import Order, OrderItem
-from apps.purchases.models import PurchaseOrder, PurchaseOrderLine
+from apps.purchases.models import (
+    GoodsReceipt, GoodsReceiptLine, PurchaseOrder, PurchaseOrderLine,
+)
 
 User = get_user_model()
 
@@ -1220,3 +1222,63 @@ class IncomingAllocationGuardTests(_IncomingAllocationBase):
         self._incoming(incoming_status="released", incoming_resolved_at=timezone.now())
         reservation_service.release_reservation(self.reservation)
         self.assertEqual(InventoryStock.objects.get(pk=self.stock.pk).quantity_reserved, 0)
+
+    def _resolved_with_replacement(self, status):
+        """A converted/reallocated incoming row whose replacement is the
+        physical row that now holds the units."""
+        replacement = self._physical(units=Decimal("2"))
+        InventoryStock.objects.filter(pk=self.stock.pk).update(quantity_reserved=2)
+        extra = {}
+        if status == StockReservationAllocation.INCOMING_CONVERTED:
+            po = self.po_line.purchase_order
+            receipt = GoodsReceipt.objects.create(
+                warehouse=self.warehouse, receipt_type="standard",
+                purchase_order=po, supplier=po.supplier,
+            )
+            extra["converted_by_receipt_line"] = GoodsReceiptLine.objects.create(
+                receipt=receipt, po_line=self.po_line, quantity=2,
+            )
+        self._incoming(
+            incoming_status=status, replacement=replacement,
+            incoming_resolved_at=timezone.now(), **extra,
+        )
+
+    def test_converted_and_reallocated_rows_consume_replacement_once(self):
+        for status in (
+            StockReservationAllocation.INCOMING_CONVERTED,
+            StockReservationAllocation.INCOMING_REALLOCATED,
+        ):
+            with self.subTest(status=status), transaction.atomic():
+                self._resolved_with_replacement(status)
+                reservation_service.consume_reservation(self.reservation)
+                stock = InventoryStock.objects.get(pk=self.stock.pk)
+                self.assertEqual((stock.quantity, stock.quantity_reserved), (3, 0))
+                self.assertEqual(
+                    StockMovement.objects.filter(source_order_item=self.reservation.order_item)
+                    .count(), 1,
+                )
+                transaction.set_rollback(True)
+
+    def test_converted_and_reallocated_rows_release_replacement_once(self):
+        for status in (
+            StockReservationAllocation.INCOMING_CONVERTED,
+            StockReservationAllocation.INCOMING_REALLOCATED,
+        ):
+            with self.subTest(status=status), transaction.atomic():
+                self._resolved_with_replacement(status)
+                reservation_service.release_reservation(self.reservation)
+                stock = InventoryStock.objects.get(pk=self.stock.pk)
+                self.assertEqual((stock.quantity, stock.quantity_reserved), (5, 0))
+                transaction.set_rollback(True)
+
+    def test_historical_incoming_row_skipped_for_decant_reservation(self):
+        StockReservation.objects.filter(pk=self.reservation.pk).update(
+            purpose=StockReservation.PURPOSE_DECANT_FULFILLMENT
+        )
+        self._incoming(incoming_status="released", incoming_resolved_at=timezone.now())
+        reservation_service.consume_reservation(self.reservation)
+        self.reservation.refresh_from_db()
+        self.assertEqual(self.reservation.status, StockReservation.STATUS_CONSUMED)
+        self.assertFalse(
+            StockMovement.objects.filter(source_order_item=self.reservation.order_item).exists()
+        )

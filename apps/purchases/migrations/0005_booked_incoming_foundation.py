@@ -9,7 +9,6 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('catalog', '0008_productedition_release_year_attar'),
         ('purchases', '0004_grn_reversal'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]

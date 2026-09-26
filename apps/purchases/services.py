@@ -538,8 +538,6 @@ def set_confirmed_booked_quantity(line, quantity, performed_by, note):
     the active incoming allocations of customer orders: those must be
     reallocated or released first."""
     note = (note or "").strip()
-    if not note:
-        raise BookedQuantityError("A note about the vendor confirmation is required.")
     if isinstance(quantity, bool) or not isinstance(quantity, int):
         raise BookedQuantityError("Booked quantity must be a whole number.")
 
@@ -556,6 +554,8 @@ def set_confirmed_booked_quantity(line, quantity, performed_by, note):
         )
     if quantity == line.confirmed_booked_quantity:
         return line, None
+    if not note:
+        raise BookedQuantityError("A note about the vendor confirmation is required.")
 
     received = selectors.received_quantities([line.pk], stock_type="retail").get(line.pk, 0)
     allocated = selectors.active_incoming_allocated_quantities([line.pk]).get(line.pk, 0)

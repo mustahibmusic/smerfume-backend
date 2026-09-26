@@ -95,23 +95,30 @@ class PurchaseOrderLineInline(TabularInline):
     def confirmed_booked(self, line):
         return line.confirmed_booked_quantity if line.pk else "-"
 
-    @admin.display(description="Received (net retail)")
-    def received_net_retail(self, line):
+    def get_formset(self, request, obj=None, **kwargs):
+        # Booking columns for every line in a fixed number of queries.
+        self._booking = selectors.booking_figures(obj) if obj else {}
+        return super().get_formset(request, obj, **kwargs)
+
+    def _booking_figure(self, line, key):
         if not line.pk:
             return "-"
-        return selectors.received_quantities([line.pk], stock_type="retail").get(line.pk, 0)
+        figures = getattr(self, "_booking", {}).get(line.pk)
+        if figures is None:
+            figures = selectors.booking_figures(line.purchase_order, [line])[line.pk]
+        return figures[key]
+
+    @admin.display(description="Received (net retail)")
+    def received_net_retail(self, line):
+        return self._booking_figure(line, "received")
 
     @admin.display(description="Allocated to customer orders (awaiting arrival)")
     def allocated_awaiting(self, line):
-        if not line.pk:
-            return "-"
-        return selectors.active_incoming_allocated_quantities([line.pk]).get(
-            line.pk, selectors.ZERO
-        )
+        return self._booking_figure(line, "allocated")
 
     @admin.display(description="Incoming available to sell")
     def incoming_available(self, line):
-        return selectors.incoming_sellable(line) if line.pk else "-"
+        return self._booking_figure(line, "incoming")
 
 
 class CancelPurchaseOrderForm(forms.Form):
@@ -136,7 +143,9 @@ class ConfirmBookedQuantityForm(forms.Form):
 
     def __init__(self, *args, po, **kwargs):
         super().__init__(*args, **kwargs)
-        self.fields["line"].queryset = po.lines.select_related("variant")
+        self.fields["line"].queryset = po.lines.select_related(
+            "variant__edition__product__brand"
+        )
 
 
 class ReverseGoodsReceiptForm(forms.Form):
@@ -403,12 +412,14 @@ class PurchaseOrderAdmin(ModelAdmin):
                     level=messages.SUCCESS,
                 )
             return redirect(self._change_url(po))
+        lines = list(po.lines.select_related("variant__edition__product__brand"))
+        figures = selectors.booking_figures(po, lines)
         rows = [
             f"{line.variant} — ordered {line.quantity_ordered}, vendor-confirmed total "
             f"{line.confirmed_booked_quantity}, received (net retail) "
-            f"{selectors.received_quantities([line.pk], stock_type='retail').get(line.pk, 0)}, "
-            f"incoming available to sell {selectors.format_units(selectors.incoming_sellable(line))}"
-            for line in po.lines.select_related("variant")
+            f"{figures[line.pk]['received']}, incoming available to sell "
+            f"{selectors.format_units(figures[line.pk]['incoming'])}"
+            for line in lines
         ]
         return self._action_page(
             request, po, f"Confirm booked quantity for {po.po_number}", form,

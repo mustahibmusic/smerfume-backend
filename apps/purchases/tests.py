@@ -22,6 +22,7 @@ from django.contrib.auth.models import Permission
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, transaction
 from django.test import RequestFactory, TestCase, TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 
@@ -1992,6 +1993,13 @@ class SetConfirmedBookedQuantityTests(_BookingBase):
         with self.assertRaises(services.BookedQuantityError):
             self._set(3, note="   ")
 
+    def test_unchanged_quantity_with_blank_note_is_a_no_op(self):
+        self._set(4)
+        line, change = self._set(4, note="  ")
+        self.assertIsNone(change)
+        self.assertEqual(line.confirmed_booked_quantity, 4)
+        self.assertEqual(BookedQuantityChange.objects.count(), 1)
+
     def test_lowering_below_active_allocations_is_blocked(self):
         self._set(5)
         self._incoming_allocation(3)
@@ -2098,3 +2106,78 @@ class BookedQuantityAdminTests(_BookingBase):
             self.client.get(reverse("admin:purchases_bookedquantitychange_changelist")).status_code,
             200,
         )
+
+
+class BookingQueryCountTests(_BookingBase):
+    """Booking figures stay a fixed number of queries whatever the number
+    of PO lines or variants (no per-line / per-variant N+1)."""
+
+    def _add_lines(self, count):
+        variants = []
+        for number in range(count):
+            variant = _variant(f"SKU-QC-{number}")
+            self._book(5, self._line(self.po, variant=variant, quantity_ordered=5))
+            self._book(5, self._line(self.po, variant=variant, quantity_ordered=5))
+            variants.append(variant)
+        return variants
+
+    def _count(self, func):
+        with CaptureQueriesContext(connection) as context:
+            func()
+        return len(context.captured_queries)
+
+    @override_settings(BOOKED_INCOMING_SALES_ENABLED=True)
+    def test_sellable_quantities_query_count_is_fixed(self):
+        self._book(5)
+        with self.assertNumQueries(4):
+            selectors.sellable_quantities([self.variant.pk], self.warehouse)
+        ids = [self.variant.pk] + [v.pk for v in self._add_lines(3)]
+        with self.assertNumQueries(4):
+            result = selectors.sellable_quantities(ids, self.warehouse)
+        self.assertEqual(result[ids[-1]], Decimal("10"))
+
+    def test_incoming_sellable_by_line_query_count_is_fixed(self):
+        self._book(5)
+        with self.assertNumQueries(3):
+            selectors.incoming_sellable_by_line([self.variant.pk], self.warehouse)
+        ids = [self.variant.pk] + [v.pk for v in self._add_lines(3)]
+        with self.assertNumQueries(3):
+            selectors.incoming_sellable_by_line(ids, self.warehouse)
+
+    def test_booking_figures_query_count_is_fixed(self):
+        self._book(5)
+        with self.assertNumQueries(3):
+            selectors.booking_figures(self.po)
+        self._add_lines(3)
+        with self.assertNumQueries(3):
+            figures = selectors.booking_figures(self.po)
+        self.assertEqual(len(figures), 7)
+
+    def test_booking_figures_zero_incoming_outside_bookable_status(self):
+        self._book(5)
+        PurchaseOrder.objects.filter(pk=self.po.pk).update(status=PurchaseOrder.STATUS_CLOSED)
+        self.po.refresh_from_db()
+        self.assertEqual(selectors.booking_figures(self.po)[self.po_line.pk]["incoming"], Decimal("0"))
+
+    def test_inline_booking_columns_use_cached_figures(self):
+        self._add_lines(2)
+        self._incoming_allocation(2)
+        inline = PurchaseOrderLineInline(PurchaseOrder, django_admin.site)
+        request = RequestFactory().get("/admin/")
+        request.user = self.user
+        inline.get_formset(request, self.po)
+        lines = list(self.po.lines.all())
+        with self.assertNumQueries(0):
+            for line in lines:
+                inline.received_net_retail(line)
+                inline.allocated_awaiting(line)
+                inline.incoming_available(line)
+        self.assertEqual(inline.allocated_awaiting(self.po_line), Decimal("2"))
+
+    def test_confirm_page_query_count_does_not_grow_with_lines(self):
+        self.client.force_login(self.user)
+        url = reverse("admin:purchases_purchaseorder_confirm_booked", args=[self.po.pk])
+        one_line = self._count(lambda: self.client.get(url))
+        self._add_lines(2)
+        four_lines = self._count(lambda: self.client.get(url))
+        self.assertEqual(one_line, four_lines)

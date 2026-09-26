@@ -223,12 +223,6 @@ if os.getenv("USE_S3") == "True":
 #   Current provider: MSG91 (apps.accounts.providers.msg91.MSG91SMSBackend)
 #   To switch to another: create provider class, set SMS_BACKEND to its path.
 SEND_REAL_OTP = os.getenv("SEND_REAL_OTP", "False") == "True"
-
-# BOOKED_INCOMING_SALES_ENABLED (bool env var, default False):
-#   When True, storefront availability and online checkout may use
-#   vendor-confirmed booked incoming stock (DEC-009). Must stay False until
-#   P2C (GRN conversion and shortfall protection) is merged and validated.
-BOOKED_INCOMING_SALES_ENABLED = os.getenv("BOOKED_INCOMING_SALES_ENABLED", "False") == "True"
 SMS_BACKEND = os.getenv(
     "SMS_BACKEND",
     "apps.accounts.providers.msg91.MSG91SMSBackend",
@@ -237,6 +231,14 @@ SMS_BACKEND = os.getenv(
 MSG91_AUTH_KEY = os.getenv("MSG91_AUTH_KEY", "")
 MSG91_TEMPLATE_ID = os.getenv("MSG91_TEMPLATE_ID", "")
 MSG91_SENDER_ID = os.getenv("MSG91_SENDER_ID", "SMRFME")
+
+
+# ── Booked incoming inventory (DEC-009) ───────────────────────────────────────
+# BOOKED_INCOMING_SALES_ENABLED (bool env var, default False):
+#   When True, storefront availability and online checkout may use
+#   vendor-confirmed booked incoming stock. Must stay False until P2C
+#   (GRN conversion and shortfall protection) is merged and validated.
+BOOKED_INCOMING_SALES_ENABLED = os.getenv("BOOKED_INCOMING_SALES_ENABLED", "False") == "True"
 
 
 # ── Parfumly catalogue import ──────────────────────────────────────────────────

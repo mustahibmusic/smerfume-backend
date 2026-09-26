@@ -133,19 +133,41 @@ def active_incoming_allocated_quantities(po_line_ids):
     return {row["purchase_order_line_id"]: row["total"] for row in rows}
 
 
+def _incoming_amount(line, received, allocated):
+    """max(confirmed_booked_quantity - net retail received - active allocated, 0)."""
+    return max(
+        Decimal(line.confirmed_booked_quantity)
+        - received.get(line.pk, 0)
+        - allocated.get(line.pk, ZERO),
+        ZERO,
+    )
+
+
 def _incoming_amounts(lines):
-    """{line_id: incoming sellable} for already-filtered bookable lines:
-    max(confirmed_booked_quantity - net retail received - active allocated, 0)."""
+    """{line_id: incoming sellable} for already-filtered bookable lines."""
     ids = [line.pk for line in lines]
     received = received_quantities(ids, stock_type="retail")
     allocated = active_incoming_allocated_quantities(ids)
+    return {line.pk: _incoming_amount(line, received, allocated) for line in lines}
+
+
+def booking_figures(po, lines=None):
+    """{line_id: {"received", "allocated", "incoming"}} for the lines of one
+    PO: net retail received, active incoming allocated and incoming sellable.
+    A fixed number of queries, whatever the line count (admin display)."""
+    if lines is None:
+        lines = po.lines.all()
+    lines = list(lines)
+    ids = [line.pk for line in lines]
+    received = received_quantities(ids, stock_type="retail")
+    allocated = active_incoming_allocated_quantities(ids)
+    bookable = po.status in PurchaseOrder.BOOKABLE_STATUSES
     return {
-        line.pk: max(
-            Decimal(line.confirmed_booked_quantity)
-            - received.get(line.pk, 0)
-            - allocated.get(line.pk, ZERO),
-            ZERO,
-        )
+        line.pk: {
+            "received": received.get(line.pk, 0),
+            "allocated": allocated.get(line.pk, ZERO),
+            "incoming": _incoming_amount(line, received, allocated) if bookable else ZERO,
+        }
         for line in lines
     }
 

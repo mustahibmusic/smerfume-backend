@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 from django.templatetags.static import static
+from django.urls import reverse_lazy
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -241,16 +242,122 @@ PARFUMLY_REQUEST_DELAY_SECONDS = float(os.getenv("PARFUMLY_REQUEST_DELAY_SECONDS
 PARFUMLY_TIMEOUT_SECONDS = float(os.getenv("PARFUMLY_TIMEOUT_SECONDS", "20"))
 
 
+# Admin environment badge (e.g. LOCAL, DEV, UAT, STAGING). Empty = no badge,
+# so production shows nothing unless explicitly configured.
+ADMIN_ENVIRONMENT = os.getenv("ADMIN_ENVIRONMENT", "")
+
+# Target of the admin's "View site" link (the storefront, not this backend).
+ADMIN_SITE_URL = os.getenv("ADMIN_SITE_URL", "https://smerfume.com")
+
+
+def admin_environment_callback(request):
+    """Return Unfold's [label, colour] pair for the header badge, or None."""
+    from django.conf import settings
+
+    label = (settings.ADMIN_ENVIRONMENT or "").strip().upper()
+    if not label:
+        return None
+    return [label, "info" if label in ("LOCAL", "DEV") else "warning"]
+
+
+def _nav_item(title, icon, url_name, perm):
+    return {
+        "title": title,
+        "icon": icon,
+        "link": reverse_lazy(url_name),
+        "permission": lambda request: request.user.has_perm(perm),
+    }
+
+
 UNFOLD = {
     "SITE_TITLE": "Smerfume Admin",
     "SITE_HEADER": "Smerfume Backend",
     "SITE_SYMBOL": "local_mall",
+    "SITE_URL": ADMIN_SITE_URL,
     "SHOW_HISTORY": True,
     "SHOW_VIEW_ON_SITE": True,
+    "ENVIRONMENT": admin_environment_callback,
     "SIDEBAR": {
         "show_search": True,
-        "command_search": False,
-        "show_all_applications": True,
+        "command_search": True,
+        "show_all_applications": False,
+        "navigation": [
+            {
+                "items": [
+                    {
+                        "title": "Dashboard",
+                        "icon": "dashboard",
+                        "link": reverse_lazy("admin:index"),
+                    },
+                ],
+            },
+            {
+                "title": "Sales",
+                "items": [
+                    _nav_item("Orders", "receipt_long", "admin:orders_order_changelist", "orders.view_order"),
+                    _nav_item(
+                        "New In-store Sale", "point_of_sale",
+                        "admin:orders_order_new_in_store_sale", "orders.add_order",
+                    ),
+                    _nav_item("Returns", "assignment_return", "admin:orders_return_changelist", "orders.view_return"),
+                    _nav_item("Refunds", "currency_exchange", "admin:orders_refund_changelist", "orders.view_refund"),
+                ],
+            },
+            {
+                "title": "Catalog",
+                "items": [
+                    _nav_item("Products", "inventory_2", "admin:catalog_product_changelist", "catalog.view_product"),
+                    _nav_item(
+                        "Editions", "collections_bookmark",
+                        "admin:catalog_productedition_changelist", "catalog.view_productedition",
+                    ),
+                    _nav_item(
+                        "Variants", "style",
+                        "admin:catalog_productvariant_changelist", "catalog.view_productvariant",
+                    ),
+                    _nav_item("Brands", "sell", "admin:catalog_brand_changelist", "catalog.view_brand"),
+                    _nav_item(
+                        "Perfume Notes", "spa",
+                        "admin:catalog_perfumenote_changelist", "catalog.view_perfumenote",
+                    ),
+                ],
+            },
+            {
+                "title": "Inventory",
+                "items": [
+                    _nav_item(
+                        "Stock", "warehouse",
+                        "admin:inventory_inventorystock_changelist", "inventory.view_inventorystock",
+                    ),
+                    _nav_item(
+                        "Partial Bottles", "water_drop",
+                        "admin:inventory_partialbottlelot_changelist", "inventory.view_partialbottlelot",
+                    ),
+                    _nav_item(
+                        "Stock Movements", "swap_horiz",
+                        "admin:inventory_stockmovement_changelist", "inventory.view_stockmovement",
+                    ),
+                    _nav_item(
+                        "Reservations", "bookmark_added",
+                        "admin:inventory_stockreservation_changelist", "inventory.view_stockreservation",
+                    ),
+                    _nav_item(
+                        "Warehouses", "store",
+                        "admin:inventory_warehouse_changelist", "inventory.view_warehouse",
+                    ),
+                ],
+            },
+            {
+                "title": "Customers",
+                "items": [
+                    _nav_item(
+                        "Customers", "groups",
+                        "admin:accounts_customerprofile_changelist", "accounts.view_customerprofile",
+                    ),
+                    _nav_item("Users", "manage_accounts", "admin:accounts_user_changelist", "accounts.view_user"),
+                ],
+            },
+        ],
     },
     "SITE_ICON": {
         "light": lambda request: static("images/brand/smerfume_bottle_trans_logo.svg"),

@@ -359,6 +359,10 @@ UNFOLD = {
                         "Purchase Orders", "shopping_cart",
                         "admin:purchases_purchaseorder_changelist", "purchases.view_purchaseorder",
                     ),
+                    _nav_item(
+                        "Goods Receipts", "inventory",
+                        "admin:purchases_goodsreceipt_changelist", "purchases.view_goodsreceipt",
+                    ),
                 ],
             },
             {

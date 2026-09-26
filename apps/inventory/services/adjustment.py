@@ -1,9 +1,10 @@
 """
 Manual inventory adjustment service — the only legitimate path to change
 InventoryStock.quantity or PartialBottleLot.remaining_ml outside of the
-reservation/consumption (apps.inventory.services.reservation) and return-
+reservation/consumption (apps.inventory.services.reservation), return-
 disposition (apps.orders.services._apply_return_disposition_inventory)
-flows. Every adjustment is atomic, row-locked, and produces a real
+and purchase receipt (apps.inventory.services.receipt) flows. Purchased
+stock is received through a goods receipt, not an adjustment. Every adjustment is atomic, row-locked, and produces a real
 StockMovement — there is no way to change these fields without a
 corresponding ledger entry, and a zero-delta adjustment is rejected rather
 than producing a fake audit-only movement.

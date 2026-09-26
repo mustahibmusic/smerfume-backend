@@ -1,18 +1,22 @@
 """
-Purchase order workflow. The only legitimate way to change
-PurchaseOrder.status. Every operation locks the PO row, checks the move
-against PurchaseOrder.ALLOWED_TRANSITIONS and stamps who/when.
+Purchase order and goods receipt workflow. The only legitimate way to
+change PurchaseOrder.status or GoodsReceipt.status. Every operation locks
+its rows, checks the move and stamps who/when.
 
-Nothing here touches inventory: stock only moves when a goods receipt is
-posted. Receipt-derived statuses (partially_received, received) and
-closing are added with goods receipts; their services must lock the PO
-row first, then its lines, in the same order as below.
+Lock order, always: PurchaseOrder -> GoodsReceipt -> PurchaseOrderLine
+(by id) -> InventoryStock (by variant, stock type). Only posting a goods
+receipt changes inventory.
 """
+
+from collections import defaultdict
 
 from django.db import transaction
 from django.utils import timezone
 
-from .models import PurchaseOrder
+from apps.inventory.services.receipt import receive_purchased_stock
+
+from . import selectors
+from .models import GoodsReceipt, GoodsReceiptLine, PurchaseOrder, PurchaseOrderLine
 
 
 class PurchaseOrderError(Exception):
@@ -59,7 +63,8 @@ def issue_purchase_order(po, user):
     this moment; later deactivation never invalidates an issued PO."""
     po = _lock(po)
     _check_transition(po, PurchaseOrder.STATUS_ISSUED)
-    lines = list(po.lines.select_for_update().select_related("variant"))
+    # Lock only the line rows, not the joined variants (see posting).
+    lines = list(po.lines.select_for_update(of=("self",)).select_related("variant"))
     problems = _issue_problems(po, lines)
     if problems:
         raise PurchaseOrderError(" ".join(problems))
@@ -73,13 +78,17 @@ def issue_purchase_order(po, user):
 
 @transaction.atomic
 def cancel_purchase_order(po, user, reason):
-    """Draft or issued -> cancelled. A reason is required. Goods receipts
-    will add a check that nothing has been received yet."""
+    """Draft or issued -> cancelled. A reason is required. Blocked once any
+    goods receipt against the PO has been posted."""
     reason = (reason or "").strip()
     if not reason:
         raise PurchaseOrderError("A cancellation reason is required.")
     po = _lock(po)
     _check_transition(po, PurchaseOrder.STATUS_CANCELLED)
+    if selectors.po_has_posted_receipts(po):
+        raise PurchaseOrderError(
+            f"{po.po_number} has posted goods receipts and cannot be cancelled."
+        )
 
     po.status = PurchaseOrder.STATUS_CANCELLED
     po.cancelled_by = user
@@ -87,3 +96,191 @@ def cancel_purchase_order(po, user, reason):
     po.cancel_reason = reason
     po.save(update_fields=["status", "cancelled_by", "cancelled_at", "cancel_reason", "updated_at"])
     return po
+
+
+# --- Goods receipts ---
+
+
+class GoodsReceiptError(Exception):
+    """Raised when a goods receipt operation is not allowed."""
+
+
+class GoodsReceiptAlreadyPosted(GoodsReceiptError):
+    """Posting a receipt that is already posted (e.g. a double click)."""
+
+
+def refresh_po_receipt_status(po):
+    """Set issued / partially_received / received from posted receipts.
+    The caller must hold the PO lock. Closed and cancelled POs are left
+    alone. A missing (short) unit never counts as received."""
+    if po.status not in PurchaseOrder.RECEIVABLE_STATUSES:
+        return po
+    lines = list(po.lines.all())
+    received = selectors.received_quantities(line.pk for line in lines)
+    total_received = sum(received.values())
+    if lines and all(received.get(line.pk, 0) >= line.quantity_ordered for line in lines):
+        new_status = PurchaseOrder.STATUS_RECEIVED
+    elif total_received > 0:
+        new_status = PurchaseOrder.STATUS_PARTIALLY_RECEIVED
+    else:
+        new_status = PurchaseOrder.STATUS_ISSUED
+    if new_status != po.status:
+        _check_transition(po, new_status)
+        po.status = new_status
+        po.save(update_fields=["status", "updated_at"])
+    return po
+
+
+@transaction.atomic
+def create_receipt_from_po(po, user, received_date=None, vendor_document_reference=""):
+    """Start an empty draft receipt for an issued or partially received PO.
+    Staff then enter only the quantities that physically arrived; nothing
+    is assumed received."""
+    po = _lock(po)
+    if po.status not in PurchaseOrder.RECEIVABLE_STATUSES:
+        raise GoodsReceiptError(
+            f"{po.po_number} is {po.get_status_display().lower()}; goods can only be "
+            "received against an issued or partially received purchase order."
+        )
+    receipt = GoodsReceipt(
+        receipt_type=GoodsReceipt.TYPE_STANDARD,
+        supplier_id=po.supplier_id,
+        warehouse_id=po.warehouse_id,
+        purchase_order=po,
+        vendor_document_reference=(vendor_document_reference or "").strip(),
+        created_by=user,
+    )
+    if received_date:
+        receipt.received_date = received_date
+    receipt.save()
+    return receipt
+
+
+def _receipt_problems(receipt, po, lines, po_lines):
+    problems = []
+    if receipt.receipt_type != GoodsReceipt.TYPE_STANDARD:
+        problems.append("Only standard purchase order receipts can be posted.")
+    if po.status not in PurchaseOrder.RECEIVABLE_STATUSES:
+        problems.append(f"{po.po_number} is {po.get_status_display().lower()}.")
+    if receipt.supplier_id != po.supplier_id:
+        problems.append("The receipt vendor does not match the purchase order.")
+    if receipt.warehouse_id != po.warehouse_id:
+        problems.append("The receipt warehouse does not match the purchase order.")
+    if not lines:
+        problems.append("Add at least one received line before posting.")
+    allowed_types = {value for value, _ in GoodsReceiptLine.STOCK_TYPE_CHOICES}
+    for number, line in enumerate(lines, start=1):
+        po_line = po_lines.get(line.po_line_id)
+        if po_line is None:
+            problems.append(f"Line {number}: choose a line from {po.po_number}.")
+            continue
+        if line.quantity <= 0:
+            problems.append(f"Line {number}: quantity must be more than 0.")
+        if line.stock_type not in allowed_types:
+            problems.append(f"Line {number}: stock type must be retail or damaged.")
+    return problems
+
+
+def _over_receipt_problems(lines, po_lines):
+    incoming = defaultdict(int)
+    for line in lines:
+        incoming[line.po_line_id] += line.quantity
+    already = selectors.received_quantities(incoming)
+    problems = []
+    for po_line_id, quantity in incoming.items():
+        po_line = po_lines[po_line_id]
+        received = already.get(po_line_id, 0)
+        if received + quantity > po_line.quantity_ordered:
+            problems.append(
+                f"{po_line.variant.sku}: ordered {po_line.quantity_ordered}, already received "
+                f"{received}, this receipt {quantity}. Over-receipt is not allowed."
+            )
+    return problems
+
+
+@transaction.atomic
+def post_goods_receipt(receipt, user):
+    """Draft -> posted. Freezes each line's cost from its PO line, adds
+    the units to stock through one StockTransaction, then updates the PO
+    status. All or nothing; posting twice is refused."""
+    po_id = GoodsReceipt.objects.values_list("purchase_order_id", flat=True).get(pk=receipt.pk)
+    if po_id is None:
+        raise GoodsReceiptError("Only purchase order receipts can be posted.")
+    po = PurchaseOrder.objects.select_for_update().get(pk=po_id)
+    receipt = GoodsReceipt.objects.select_for_update().get(pk=receipt.pk)
+    if receipt.status == GoodsReceipt.STATUS_POSTED:
+        raise GoodsReceiptAlreadyPosted(f"{receipt.grn_number} is already posted.")
+    if receipt.status != GoodsReceipt.STATUS_DRAFT or receipt.purchase_order_id != po.pk:
+        raise GoodsReceiptError(f"{receipt.grn_number} is not a draft and cannot be posted.")
+
+    lines = list(receipt.lines.order_by("pk"))
+    po_line_ids = sorted({line.po_line_id for line in lines if line.po_line_id})
+    # of=("self",): lock only the PO line rows. Without it the joined
+    # ProductVariant rows are locked FOR UPDATE too, which deadlocks with
+    # checkout (it holds the stock row, then inserts rows referencing the
+    # variant).
+    po_lines = {
+        po_line.pk: po_line
+        for po_line in PurchaseOrderLine.objects.select_for_update(of=("self",))
+        .filter(pk__in=po_line_ids, purchase_order=po)
+        .select_related("variant")
+        .order_by("pk")
+    }
+    problems = _receipt_problems(receipt, po, lines, po_lines)
+    if not problems:
+        problems = _over_receipt_problems(lines, po_lines)
+    if problems:
+        raise GoodsReceiptError(" ".join(problems))
+
+    # Freeze the authoritative cost, tax rate and variant from the locked
+    # PO line; never trust draft values.
+    for line in lines:
+        po_line = po_lines[line.po_line_id]
+        po_line.purchase_order = po
+        line.po_line = po_line
+        line.apply_po_line_snapshot()
+        if line.unit_cost is None:
+            raise GoodsReceiptError(f"{po_line.variant.sku}: unit cost cannot be worked out.")
+    now = timezone.now()
+    for line in lines:
+        line.updated_at = now
+    GoodsReceiptLine.objects.bulk_update(lines, ["variant", "unit_cost", "tax_rate", "updated_at"])
+
+    stock_transaction = receive_purchased_stock(
+        warehouse=receipt.warehouse,
+        supplier=receipt.supplier,
+        lines=lines,
+        performed_by=user,
+        notes=f"Goods receipt {receipt.grn_number} for {po.po_number}",
+    )
+
+    receipt.status = GoodsReceipt.STATUS_POSTED
+    receipt.stock_transaction = stock_transaction
+    receipt.posted_by = user
+    receipt.posted_at = timezone.now()
+    receipt.save(update_fields=["status", "stock_transaction", "posted_by", "posted_at", "updated_at"])
+
+    refresh_po_receipt_status(po)
+    return receipt
+
+
+@transaction.atomic
+def cancel_goods_receipt(receipt, user, reason):
+    """Draft -> cancelled. Posted receipts are never cancelled."""
+    reason = (reason or "").strip()
+    if not reason:
+        raise GoodsReceiptError("A cancellation reason is required.")
+    po_id = GoodsReceipt.objects.values_list("purchase_order_id", flat=True).get(pk=receipt.pk)
+    if po_id is not None:
+        PurchaseOrder.objects.select_for_update().get(pk=po_id)
+    receipt = GoodsReceipt.objects.select_for_update().get(pk=receipt.pk)
+    if receipt.status != GoodsReceipt.STATUS_DRAFT:
+        raise GoodsReceiptError(
+            f"{receipt.grn_number} is {receipt.get_status_display().lower()} and cannot be cancelled."
+        )
+    receipt.status = GoodsReceipt.STATUS_CANCELLED
+    receipt.cancelled_by = user
+    receipt.cancelled_at = timezone.now()
+    receipt.cancel_reason = reason
+    receipt.save(update_fields=["status", "cancelled_by", "cancelled_at", "cancel_reason", "updated_at"])
+    return receipt

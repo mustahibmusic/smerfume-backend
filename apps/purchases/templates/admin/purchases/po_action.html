@@ -5,6 +5,11 @@
 {% block content %}
 <div class="max-w-2xl">
     <p class="mb-6 text-sm">{{ message }}</p>
+    {% if rows %}
+        <ul class="list-disc mb-6 ml-6 text-sm">
+            {% for row in rows %}<li>{{ row }}</li>{% endfor %}
+        </ul>
+    {% endif %}
 
     <form method="post" novalidate>
         {% csrf_token %}

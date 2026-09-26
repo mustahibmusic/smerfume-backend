@@ -445,6 +445,15 @@ class StockMovement(BaseModel):
         blank=True,
         related_name="stock_movements",
     )
+    # Set only on purchase receipt movements: the goods receipt line whose
+    # frozen unit cost this stock came in at.
+    source_receipt_line = models.ForeignKey(
+        "purchases.GoodsReceiptLine",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="stock_movements",
+    )
     performed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,

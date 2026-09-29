@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+from urllib.parse import urlsplit
 from django.core.exceptions import ImproperlyConfigured
 from django.templatetags.static import static
 from django.urls import reverse_lazy
@@ -71,9 +72,42 @@ def require_env(name):
     return value
 
 
+def parse_num_proxies(raw):
+    """NUM_PROXIES must be a non-negative integer. The value itself is
+    environment-specific and must match the real proxy topology."""
+    value = str(raw).strip()
+    if not value.isdigit():
+        raise ImproperlyConfigured("NUM_PROXIES must be a non-negative integer.")
+    return int(value)
+
+
+def _validate_redis_url(url):
+    """Check REDIS_URL syntax only; Redis need not be reachable at startup.
+    The error never echoes the URL, which may contain a password."""
+    error = ImproperlyConfigured(
+        "REDIS_URL is malformed. Expected redis://host[:port][/db], "
+        "rediss://host[:port][/db] or unix:///path."
+    )
+    parts = urlsplit(url)
+    if parts.scheme == "unix":
+        if not parts.path:
+            raise error
+        return
+    if parts.scheme not in ("redis", "rediss") or not parts.hostname:
+        raise error
+    try:
+        parts.port
+    except ValueError:
+        raise error from None
+    db = parts.path.lstrip("/")
+    if db and not db.isdigit():
+        raise error
+
+
 def redis_cache(url):
     """Default cache on Redis. Used only for DRF throttle counters.
     Short socket timeouts stop a dead Redis from blocking requests."""
+    _validate_redis_url(url)
     return {
         "default": {
             "BACKEND": "django.core.cache.backends.redis.RedisCache",
@@ -108,7 +142,7 @@ REST_FRAMEWORK = {
         "otp_verify": "10/minute",
     },
     # Must match the deployment's real proxy count; required outside local.
-    "NUM_PROXIES": int(os.getenv("NUM_PROXIES", "").strip() or "0"),
+    "NUM_PROXIES": parse_num_proxies(os.getenv("NUM_PROXIES", "").strip() or "0"),
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 24,
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",

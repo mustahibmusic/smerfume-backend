@@ -10,7 +10,7 @@ from django.test import SimpleTestCase, TestCase
 from redis.exceptions import RedisError
 from rest_framework.test import APIClient
 
-from config.settings.base import redis_cache, require_env
+from config.settings.base import parse_num_proxies, redis_cache, require_env
 
 
 class SettingsHelperTests(SimpleTestCase):
@@ -35,6 +35,43 @@ class SettingsHelperTests(SimpleTestCase):
         self.assertEqual(default["LOCATION"], "redis://cache:6379/1")
         self.assertEqual(default["KEY_PREFIX"], "smerfume")
         self.assertEqual(default["OPTIONS"], {"socket_connect_timeout": 0.5, "socket_timeout": 0.5})
+
+    def test_redis_cache_accepts_supported_urls(self):
+        for url in (
+            "redis://cache:6379/0",
+            "rediss://user:secret@cache.example.com:6380/1",
+            "unix:///var/run/redis.sock",
+        ):
+            with self.subTest(url):
+                self.assertEqual(redis_cache(url)["default"]["LOCATION"], url)
+
+    def test_redis_cache_rejects_malformed_urls(self):
+        for url in (
+            "cache:6379",
+            "http://cache:6379/0",
+            "redis://",
+            "redis://:6379/0",
+            "redis://cache:port/0",
+            "redis://cache:6379/db",
+            "unix://",
+        ):
+            with self.subTest(url), self.assertRaises(ImproperlyConfigured):
+                redis_cache(url)
+
+    def test_redis_cache_error_hides_credentials(self):
+        with self.assertRaises(ImproperlyConfigured) as ctx:
+            redis_cache("http://user:secret@cache:6379/0")
+        self.assertNotIn("secret", str(ctx.exception))
+
+    def test_parse_num_proxies_accepts_non_negative_integers(self):
+        for raw, expected in (("0", 0), ("1", 1), (" 2 ", 2)):
+            with self.subTest(raw):
+                self.assertEqual(parse_num_proxies(raw), expected)
+
+    def test_parse_num_proxies_rejects_invalid_values(self):
+        for raw in ("-1", "abc", "1.5", "one", "+-1"):
+            with self.subTest(raw), self.assertRaises(ImproperlyConfigured):
+                parse_num_proxies(raw)
 
     def test_default_rate_settings(self):
         self.assertEqual(settings.OTP_MAX_SENDS_PER_MOBILE_PER_HOUR, 5)
@@ -76,6 +113,16 @@ class DeployedSettingsFailFastTests(SimpleTestCase):
         for name in self.DEPLOYED:
             with self.subTest(name), self.assertRaises(ImproperlyConfigured):
                 self._import(name, {"REDIS_URL": "", "NUM_PROXIES": ""})
+
+    def test_invalid_values_refuse_to_start(self):
+        for name in self.DEPLOYED:
+            for env, needle in (
+                ({"REDIS_URL": "redis://cache:6379/0", "NUM_PROXIES": "-1"}, "NUM_PROXIES"),
+                ({"REDIS_URL": "redis://cache:6379/0", "NUM_PROXIES": "abc"}, "NUM_PROXIES"),
+                ({"REDIS_URL": "cache:6379", "NUM_PROXIES": "1"}, "REDIS_URL"),
+            ):
+                with self.subTest(name=name, env=env),                         self.assertRaisesMessage(ImproperlyConfigured, needle):
+                    self._import(name, env)
 
     def test_valid_config_uses_redis_and_proxy_count(self):
         for name in self.DEPLOYED:

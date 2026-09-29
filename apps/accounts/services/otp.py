@@ -10,11 +10,16 @@ import logging
 import secrets
 from datetime import timedelta
 
+from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import check_password, make_password
+from django.db import transaction
+from django.db.models import Sum
 from django.utils import timezone
 from django.utils.module_loading import import_string
 
 from apps.accounts.models import OTPVerification
+
+User = get_user_model()
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,44 @@ def _generate_otp() -> str:
 
 # ── Public service functions ─────────────────────────────────────────────────
 
+class OTPRateLimitError(Exception):
+    """A mobile number has reached its hourly OTP send limit."""
+
+    message = "Too many OTP requests for this number. Please try again later."
+
+    def __init__(self):
+        super().__init__(self.message)
+
+
+def _recent_send_count(user) -> int:
+    """SMS sends for this user in the last hour: one per row created in the
+    window plus resend_count of rows resent in the window. Resend updates a
+    row in place, so rows alone undercount. This never undercounts; it can
+    overcount older resends on a row resent inside the window."""
+    cutoff = timezone.now() - timedelta(hours=1)
+    rows = OTPVerification.objects.filter(user=user)
+    initial = rows.filter(created_at__gte=cutoff).count()
+    resends = rows.filter(last_resend_at__gte=cutoff).aggregate(
+        total=Sum("resend_count")
+    )["total"] or 0
+    return initial + resends
+
+
+def _lock_user(user_pk):
+    """Serialize OTP sends per mobile. Caller must be inside a transaction."""
+    return User.objects.select_for_update().get(pk=user_pk)
+
+
+def _check_mobile_send_limit(user) -> None:
+    """Raise OTPRateLimitError at the per-mobile limit. The user row must
+    already be locked so concurrent senders cannot share a stale count."""
+    from django.conf import settings  # local import, as in _get_sms_backend
+
+    if _recent_send_count(user) >= settings.OTP_MAX_SENDS_PER_MOBILE_PER_HOUR:
+        raise OTPRateLimitError()
+
+
+@transaction.atomic
 def create_otp_record(user, *, is_new_user: bool = False, purpose: str = "login"):
     """Create and send an OTP for the given user.
 
@@ -65,7 +108,13 @@ def create_otp_record(user, *, is_new_user: bool = False, purpose: str = "login"
 
     Returns:
         Tuple of (OTPVerification instance, sms_sent: bool).
+
+    Raises:
+        OTPRateLimitError: The mobile number reached its hourly send limit.
     """
+    _lock_user(user.pk)
+    _check_mobile_send_limit(user)
+
     otp_code = _generate_otp()
     otp_hash = make_password(otp_code)
 
@@ -131,6 +180,7 @@ def verify_otp_record(otp_session_token: str, otp_submitted: str) -> "OTPVerific
     return record
 
 
+@transaction.atomic
 def resend_otp(otp_session_token: str):
     """Generate and send a new OTP on the same session.
 
@@ -146,14 +196,19 @@ def resend_otp(otp_session_token: str):
 
     Raises:
         ValueError: With a user-safe message on limit/cooldown violations.
+        OTPRateLimitError: The mobile number reached its hourly send limit.
     """
-    try:
-        record = OTPVerification.objects.select_related("user").get(
-            otp_session_token=otp_session_token,
-            is_active=True,
-        )
-    except OTPVerification.DoesNotExist:
+    session = OTPVerification.objects.filter(
+        otp_session_token=otp_session_token, is_active=True
+    ).values_list("user_id", flat=True).first()
+    if session is None:
         raise ValueError("Invalid or expired session. Please request a new OTP.")
+    _lock_user(session)  # same lock as create_otp_record, taken first
+    record = (
+        OTPVerification.objects.select_related("user")
+        .select_for_update(of=("self",))
+        .get(otp_session_token=otp_session_token, is_active=True)
+    )
 
     if record.is_verified:
         raise ValueError("This OTP has already been verified.")
@@ -166,6 +221,8 @@ def resend_otp(otp_session_token: str):
         raise ValueError(
             f"Please wait {seconds_left} second(s) before requesting another OTP."
         )
+
+    _check_mobile_send_limit(record.user)
 
     # Generate fresh OTP and update the existing record
     otp_code = _generate_otp()

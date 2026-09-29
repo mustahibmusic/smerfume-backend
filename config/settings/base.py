@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+from django.core.exceptions import ImproperlyConfigured
 from django.templatetags.static import static
 from django.urls import reverse_lazy
 
@@ -62,6 +63,30 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
+def require_env(name):
+    """Return a required environment variable, or refuse to start."""
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise ImproperlyConfigured(f"{name} must be set in this environment.")
+    return value
+
+
+def redis_cache(url):
+    """Default cache on Redis. Used only for DRF throttle counters.
+    Short socket timeouts stop a dead Redis from blocking requests."""
+    return {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": url,
+            "KEY_PREFIX": "smerfume",
+            "OPTIONS": {
+                "socket_connect_timeout": 0.5,
+                "socket_timeout": 0.5,
+            },
+        }
+    }
+
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework_simplejwt.authentication.JWTAuthentication",
@@ -74,16 +99,23 @@ REST_FRAMEWORK = {
         "rest_framework.throttling.AnonRateThrottle",
         "rest_framework.throttling.UserRateThrottle",
     ),
+    # Initial defaults, tune from production traffic. See the Redis
+    # throttling spec §6 for what each limit protects.
     "DEFAULT_THROTTLE_RATES": {
-        "anon": "100/day",
-        "user": "1000/day",
-        "otp_request": "5/hour",
+        "anon": "120/min",
+        "user": "300/min",
+        "otp_request": "20/hour",
         "otp_verify": "10/minute",
     },
+    # Must match the deployment's real proxy count; required outside local.
+    "NUM_PROXIES": int(os.getenv("NUM_PROXIES", "").strip() or "0"),
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 24,
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
 }
+
+# Per-mobile OTP send limit (request + resend), enforced in PostgreSQL.
+OTP_MAX_SENDS_PER_MOBILE_PER_HOUR = int(os.getenv("OTP_MAX_SENDS_PER_MOBILE_PER_HOUR", "").strip() or "5")
 
 # ── API Documentation (drf-spectacular) ───────────────────────────────────────
 SPECTACULAR_SETTINGS = {

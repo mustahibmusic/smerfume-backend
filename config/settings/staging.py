@@ -39,3 +39,8 @@ SECURE_HSTS_INCLUDE_SUBDOMAINS = True
 SECURE_SSL_REDIRECT = True
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True
+
+# Shared throttle counters. Required: no LocMemCache fallback here.
+CACHES = redis_cache(require_env("REDIS_URL"))
+# Must match this environment's proxy topology (0 is a valid explicit value).
+REST_FRAMEWORK = {**REST_FRAMEWORK, "NUM_PROXIES": int(require_env("NUM_PROXIES"))}

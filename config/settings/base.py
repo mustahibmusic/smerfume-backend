@@ -1,5 +1,7 @@
 from pathlib import Path
 import os
+from urllib.parse import urlsplit
+from django.core.exceptions import ImproperlyConfigured
 from django.templatetags.static import static
 from django.urls import reverse_lazy
 
@@ -62,6 +64,63 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
+def require_env(name):
+    """Return a required environment variable, or refuse to start."""
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise ImproperlyConfigured(f"{name} must be set in this environment.")
+    return value
+
+
+def parse_num_proxies(raw):
+    """NUM_PROXIES must be a non-negative integer. The value itself is
+    environment-specific and must match the real proxy topology."""
+    value = str(raw).strip()
+    if not value.isdigit():
+        raise ImproperlyConfigured("NUM_PROXIES must be a non-negative integer.")
+    return int(value)
+
+
+def _validate_redis_url(url):
+    """Check REDIS_URL syntax only; Redis need not be reachable at startup.
+    The error never echoes the URL, which may contain a password."""
+    error = ImproperlyConfigured(
+        "REDIS_URL is malformed. Expected redis://host[:port][/db], "
+        "rediss://host[:port][/db] or unix:///path."
+    )
+    parts = urlsplit(url)
+    if parts.scheme == "unix":
+        if not parts.path:
+            raise error
+        return
+    if parts.scheme not in ("redis", "rediss") or not parts.hostname:
+        raise error
+    try:
+        parts.port
+    except ValueError:
+        raise error from None
+    db = parts.path.lstrip("/")
+    if db and not db.isdigit():
+        raise error
+
+
+def redis_cache(url):
+    """Default cache on Redis. Used only for DRF throttle counters.
+    Short socket timeouts stop a dead Redis from blocking requests."""
+    _validate_redis_url(url)
+    return {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": url,
+            "KEY_PREFIX": "smerfume",
+            "OPTIONS": {
+                "socket_connect_timeout": 0.5,
+                "socket_timeout": 0.5,
+            },
+        }
+    }
+
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework_simplejwt.authentication.JWTAuthentication",
@@ -71,19 +130,26 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.IsAuthenticated",
     ),
     "DEFAULT_THROTTLE_CLASSES": (
-        "rest_framework.throttling.AnonRateThrottle",
-        "rest_framework.throttling.UserRateThrottle",
+        "apps.core.throttling.FailOpenAnonRateThrottle",
+        "apps.core.throttling.FailOpenUserRateThrottle",
     ),
+    # Initial defaults, tune from production traffic. See the Redis
+    # throttling spec §6 for what each limit protects.
     "DEFAULT_THROTTLE_RATES": {
-        "anon": "100/day",
-        "user": "1000/day",
-        "otp_request": "5/hour",
+        "anon": "120/min",
+        "user": "300/min",
+        "otp_request": "20/hour",
         "otp_verify": "10/minute",
     },
+    # Must match the deployment's real proxy count; required outside local.
+    "NUM_PROXIES": parse_num_proxies(os.getenv("NUM_PROXIES", "").strip() or "0"),
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 24,
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
 }
+
+# Per-mobile OTP send limit (request + resend), enforced in PostgreSQL.
+OTP_MAX_SENDS_PER_MOBILE_PER_HOUR = int(os.getenv("OTP_MAX_SENDS_PER_MOBILE_PER_HOUR", "").strip() or "5")
 
 # ── API Documentation (drf-spectacular) ───────────────────────────────────────
 SPECTACULAR_SETTINGS = {

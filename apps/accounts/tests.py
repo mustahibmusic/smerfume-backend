@@ -13,18 +13,26 @@ Test groups:
 All tests mock _get_sms_backend so no real SMS is ever dispatched.
 """
 
+import threading
+import time
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.core.cache import cache
+from django.db import connection
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient
+from redis.exceptions import RedisError
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.accounts.models import OTPVerification
+from apps.accounts.services import otp as otp_service
 from apps.accounts.services.otp import (
+    OTPRateLimitError,
     _generate_otp,
     create_otp_record,
     resend_otp,
@@ -508,3 +516,236 @@ class CartMergeOnLoginTests(TestCase):
         resp = self._do_otp_verify(self.user, "333333")
         self.assertEqual(resp.status_code, 200)
         self.assertIn("access", resp.data)
+
+
+# ── Redis throttle failure policy ─────────────────────────────────────────────
+
+def _broken_cache():
+    broken = MagicMock()
+    broken.get.side_effect = RedisError("connection refused")
+    broken.set.side_effect = RedisError("connection refused")
+    return broken
+
+
+_OTP_THROTTLE = "apps.core.throttling.FailClosedScopedRateThrottle"
+
+
+class OTPThrottleFailClosedTests(TestCase):
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+
+    def _assert_503(self, resp, logs, scope):
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.data["detail"], "Login is temporarily unavailable. Please try again shortly.")
+        self.assertIn(f"scope={scope}", logs.output[0])
+        self.assertNotIn("connection refused", resp.content.decode())
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_request_fails_closed(self, sms):
+        with patch(f"{_OTP_THROTTLE}.cache", _broken_cache()):
+            with self.assertLogs("apps.core.throttling", "ERROR") as logs:
+                resp = self.client.post(reverse("otp_request"), {"mobile_number": "9000000101"})
+        self._assert_503(resp, logs, "otp_request")
+        self.assertEqual(OTPVerification.objects.count(), 0)
+        sms.assert_not_called()
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_resend_fails_closed(self, sms):
+        user = _make_user(mobile="+919000000102")
+        record, _ = create_otp_record(user)
+        sms.reset_mock()
+        with patch(f"{_OTP_THROTTLE}.cache", _broken_cache()):
+            with self.assertLogs("apps.core.throttling", "ERROR") as logs:
+                resp = self.client.post(
+                    reverse("otp_resend"), {"otp_session_token": str(record.otp_session_token)}
+                )
+        self._assert_503(resp, logs, "otp_request")
+        record.refresh_from_db()
+        self.assertEqual(record.resend_count, 0)
+        sms.assert_not_called()
+
+    def test_verify_fails_closed(self):
+        with patch(f"{_OTP_THROTTLE}.cache", _broken_cache()):
+            with self.assertLogs("apps.core.throttling", "ERROR") as logs:
+                resp = self.client.post(
+                    reverse("otp_verify"),
+                    {"otp_session_token": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "otp": "123456"},
+                )
+        self._assert_503(resp, logs, "otp_verify")
+
+
+class OTPThrottleSharingTests(TestCase):
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+        rates = {**settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"], "otp_request": "1/hour"}
+        patcher = patch(f"{_OTP_THROTTLE}.THROTTLE_RATES", rates)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_resend_shares_request_counter(self, _sms):
+        resp = self.client.post(reverse("otp_request"), {"mobile_number": "9000000103"})
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.post(
+            reverse("otp_resend"), {"otp_session_token": resp.data["otp_session_token"]}
+        )
+        self.assertEqual(resp.status_code, 429)
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_num_proxies_separates_clients(self, _sms):
+        url = reverse("otp_request")
+        with override_settings(REST_FRAMEWORK={**settings.REST_FRAMEWORK, "NUM_PROXIES": 1}):
+            first = self.client.post(url, {"mobile_number": "9000000104"}, HTTP_X_FORWARDED_FOR="1.1.1.1")
+            other = self.client.post(url, {"mobile_number": "9000000105"}, HTTP_X_FORWARDED_FOR="2.2.2.2")
+            again = self.client.post(url, {"mobile_number": "9000000106"}, HTTP_X_FORWARDED_FOR="1.1.1.1")
+        self.assertEqual((first.status_code, other.status_code, again.status_code), (200, 200, 429))
+
+
+# ── Per-mobile OTP send limit ─────────────────────────────────────────────────
+
+_LIMIT_MESSAGE = "Too many OTP requests for this number. Please try again later."
+
+
+def _sent_row(user, *, created_ago=None, resend_count=0, resent_ago=None):
+    """OTPVerification row with explicit send timestamps (created_at is auto_now_add)."""
+    now = timezone.now()
+    row = OTPVerification.objects.create(
+        user=user, otp_hash="x", expires_at=now + timedelta(minutes=5),
+        resend_count=resend_count,
+        last_resend_at=(now - resent_ago) if resent_ago is not None else None,
+    )
+    if created_ago is not None:
+        OTPVerification.objects.filter(pk=row.pk).update(created_at=now - created_ago)
+    return row
+
+
+class MobileSendLimitTests(TestCase):
+
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user(mobile="+919333333333")
+
+    def test_counts_initial_sends_and_resends(self):
+        _sent_row(self.user, resend_count=2, resent_ago=timedelta(minutes=1))
+        _sent_row(self.user)
+        self.assertEqual(otp_service._recent_send_count(self.user), 4)
+
+    def test_ignores_sends_older_than_one_hour(self):
+        _sent_row(self.user, created_ago=timedelta(hours=2), resend_count=3,
+                  resent_ago=timedelta(minutes=90))
+        self.assertEqual(otp_service._recent_send_count(self.user), 0)
+
+    def test_recent_resend_on_old_row_counts(self):
+        _sent_row(self.user, created_ago=timedelta(hours=2), resend_count=1,
+                  resent_ago=timedelta(minutes=10))
+        self.assertEqual(otp_service._recent_send_count(self.user), 1)
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_sixth_request_is_refused(self, sms):
+        for _ in range(5):
+            create_otp_record(self.user)
+        sms.reset_mock()
+        with self.assertRaises(OTPRateLimitError):
+            create_otp_record(self.user)
+        self.assertEqual(OTPVerification.objects.filter(user=self.user).count(), 5)
+        sms.assert_not_called()
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_resends_count_toward_limit(self, _sms):
+        _sent_row(self.user)
+        row = _sent_row(self.user, resend_count=2, resent_ago=timedelta(minutes=1))
+        _sent_row(self.user)  # 1 + 3 + 1 = 5 sends
+        with self.assertRaises(OTPRateLimitError):
+            resend_otp(str(row.otp_session_token))
+        row.refresh_from_db()
+        self.assertEqual(row.resend_count, 2)
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_other_number_not_affected(self, _sms):
+        for _ in range(5):
+            create_otp_record(self.user)
+        other = _make_user(mobile="+919333333334", username="u_other")
+        create_otp_record(other)  # does not raise
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_views_return_generic_429(self, _sms):
+        for _ in range(5):
+            create_otp_record(self.user)
+        client = APIClient()
+        resp = client.post(reverse("otp_request"), {"mobile_number": "9333333333"})
+        self.assertEqual(resp.status_code, 429)
+        self.assertEqual(resp.data["error"], _LIMIT_MESSAGE)
+        token = OTPVerification.objects.filter(user=self.user).first().otp_session_token
+        resp = client.post(reverse("otp_resend"), {"otp_session_token": str(token)})
+        self.assertEqual(resp.status_code, 429)
+        self.assertEqual(resp.data["error"], _LIMIT_MESSAGE)
+
+
+class MobileSendLimitConcurrencyTests(TransactionTestCase):
+    """Concurrent sends for one mobile must serialize on the user-row lock
+    before counting, deciding, writing OTP state and sending the SMS.
+    _recent_send_count is slowed so that, without the lock, both threads
+    would read the same stale count and both pass."""
+
+    def setUp(self):
+        self.user = _make_user(mobile="+919444444444")
+
+    def _run_parallel(self, *calls):
+        results = [None] * len(calls)
+        barrier = threading.Barrier(len(calls))
+
+        def _run(index, call):
+            barrier.wait()
+            try:
+                call()
+                results[index] = "ok"
+            except OTPRateLimitError as exc:
+                results[index] = type(exc).__name__
+            except Exception as exc:  # deadlock/serialization must surface
+                results[index] = f"db:{type(exc).__name__}: {exc}"
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=_run, args=(i, c)) for i, c in enumerate(calls)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return results
+
+    def _slow_count(self):
+        real = otp_service._recent_send_count
+
+        def slow(user):
+            count = real(user)
+            time.sleep(0.3)  # widen the stale-read window
+            return count
+
+        return patch("apps.accounts.services.otp._recent_send_count", side_effect=slow)
+
+    def test_two_requests_at_limit_minus_one(self):
+        _sent_row(self.user, resend_count=3, resent_ago=timedelta(minutes=1))  # 4 sends
+        with patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend) as sms, self._slow_count():
+            results = self._run_parallel(
+                lambda: create_otp_record(self.user),
+                lambda: create_otp_record(self.user),
+            )
+        self.assertEqual(sorted(results), ["OTPRateLimitError", "ok"], results)
+        self.assertEqual(otp_service._recent_send_count(self.user), 5)
+        self.assertEqual(sms.call_count, 1)
+
+    def test_request_and_resend_at_limit_minus_one(self):
+        row = _sent_row(self.user, resend_count=2, resent_ago=timedelta(minutes=1))  # 3 sends
+        _sent_row(self.user)  # 4 sends
+        with patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend) as sms, self._slow_count():
+            results = self._run_parallel(
+                lambda: create_otp_record(self.user),
+                lambda: resend_otp(str(row.otp_session_token)),
+            )
+        self.assertEqual(sorted(results), ["OTPRateLimitError", "ok"], results)
+        self.assertEqual(otp_service._recent_send_count(self.user), 5)
+        self.assertEqual(sms.call_count, 1)

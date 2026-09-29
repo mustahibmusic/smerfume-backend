@@ -15,7 +15,6 @@ from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -28,8 +27,14 @@ from .serializers import (
     VerifyOTPSerializer,
 )
 from apps.cart.services import merge_guest_cart
+from apps.core.throttling import FailClosedScopedRateThrottle
 
-from .services.otp import create_otp_record, resend_otp, verify_otp_record
+from .services.otp import (
+    OTPRateLimitError,
+    create_otp_record,
+    resend_otp,
+    verify_otp_record,
+)
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -37,7 +42,7 @@ User = get_user_model()
 
 class RequestOTPView(APIView):
     permission_classes = [AllowAny]
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = [FailClosedScopedRateThrottle]
     throttle_scope = "otp_request"
 
     @extend_schema(
@@ -65,7 +70,8 @@ class RequestOTPView(APIView):
                 ],
             ),
             400: OpenApiResponse(description="Invalid mobile number format."),
-            429: OpenApiResponse(description="Rate limit exceeded (5 requests/hour)."),
+            429: OpenApiResponse(description="Rate limit exceeded (per IP or per mobile number)."),
+            503: OpenApiResponse(description="Login temporarily unavailable (rate-limit store down)."),
         },
         auth=[],  # public endpoint — no JWT required
     )
@@ -89,7 +95,10 @@ class RequestOTPView(APIView):
             user.set_unusable_password()
             user.save(update_fields=["password"])
 
-        record, sms_sent = create_otp_record(user, is_new_user=created, purpose="login")
+        try:
+            record, sms_sent = create_otp_record(user, is_new_user=created, purpose="login")
+        except OTPRateLimitError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
 
         response_data = {
             "otp_session_token": str(record.otp_session_token),
@@ -106,7 +115,7 @@ class RequestOTPView(APIView):
 
 class VerifyOTPView(APIView):
     permission_classes = [AllowAny]
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = [FailClosedScopedRateThrottle]
     throttle_scope = "otp_verify"
 
     @extend_schema(
@@ -146,7 +155,8 @@ class VerifyOTPView(APIView):
             400: OpenApiResponse(
                 description="Incorrect OTP, expired session, or session locked.",
             ),
-            429: OpenApiResponse(description="Rate limit exceeded (10 requests/minute)."),
+            429: OpenApiResponse(description="Rate limit exceeded."),
+            503: OpenApiResponse(description="Login temporarily unavailable (rate-limit store down)."),
         },
         auth=[],  # public endpoint
     )
@@ -184,6 +194,9 @@ class VerifyOTPView(APIView):
 
 class ResendOTPView(APIView):
     permission_classes = [AllowAny]
+    # Every resend sends an SMS, so it shares the per-IP OTP counter.
+    throttle_classes = [FailClosedScopedRateThrottle]
+    throttle_scope = "otp_request"
 
     @extend_schema(
         tags=["Auth"],
@@ -207,9 +220,8 @@ class ResendOTPView(APIView):
             400: OpenApiResponse(
                 description="Cooldown active, resend limit reached, or invalid session token.",
             ),
-            429: OpenApiResponse(
-                description="Global anonymous/user request rate limit exceeded.",
-            ),
+            429: OpenApiResponse(description="Rate limit exceeded (per IP or per mobile number)."),
+            503: OpenApiResponse(description="Login temporarily unavailable (rate-limit store down)."),
         },
         auth=[],
     )
@@ -221,6 +233,8 @@ class ResendOTPView(APIView):
 
         try:
             record, _sms_sent = resend_otp(otp_session_token)
+        except OTPRateLimitError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
         except ValueError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 

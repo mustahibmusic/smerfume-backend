@@ -16,11 +16,14 @@ All tests mock _get_sms_backend so no real SMS is ever dispatched.
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.core.cache import cache
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient
+from redis.exceptions import RedisError
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.accounts.models import OTPVerification
@@ -508,3 +511,90 @@ class CartMergeOnLoginTests(TestCase):
         resp = self._do_otp_verify(self.user, "333333")
         self.assertEqual(resp.status_code, 200)
         self.assertIn("access", resp.data)
+
+
+# ── Redis throttle failure policy ─────────────────────────────────────────────
+
+def _broken_cache():
+    broken = MagicMock()
+    broken.get.side_effect = RedisError("connection refused")
+    broken.set.side_effect = RedisError("connection refused")
+    return broken
+
+
+_OTP_THROTTLE = "apps.core.throttling.FailClosedScopedRateThrottle"
+
+
+class OTPThrottleFailClosedTests(TestCase):
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+
+    def _assert_503(self, resp, logs, scope):
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.data["detail"], "Login is temporarily unavailable. Please try again shortly.")
+        self.assertIn(f"scope={scope}", logs.output[0])
+        self.assertNotIn("connection refused", resp.content.decode())
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_request_fails_closed(self, sms):
+        with patch(f"{_OTP_THROTTLE}.cache", _broken_cache()):
+            with self.assertLogs("apps.core.throttling", "ERROR") as logs:
+                resp = self.client.post(reverse("otp_request"), {"mobile_number": "9000000101"})
+        self._assert_503(resp, logs, "otp_request")
+        self.assertEqual(OTPVerification.objects.count(), 0)
+        sms.assert_not_called()
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_resend_fails_closed(self, sms):
+        user = _make_user(mobile="+919000000102")
+        record, _ = create_otp_record(user)
+        sms.reset_mock()
+        with patch(f"{_OTP_THROTTLE}.cache", _broken_cache()):
+            with self.assertLogs("apps.core.throttling", "ERROR") as logs:
+                resp = self.client.post(
+                    reverse("otp_resend"), {"otp_session_token": str(record.otp_session_token)}
+                )
+        self._assert_503(resp, logs, "otp_request")
+        record.refresh_from_db()
+        self.assertEqual(record.resend_count, 0)
+        sms.assert_not_called()
+
+    def test_verify_fails_closed(self):
+        with patch(f"{_OTP_THROTTLE}.cache", _broken_cache()):
+            with self.assertLogs("apps.core.throttling", "ERROR") as logs:
+                resp = self.client.post(
+                    reverse("otp_verify"),
+                    {"otp_session_token": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "otp": "123456"},
+                )
+        self._assert_503(resp, logs, "otp_verify")
+
+
+class OTPThrottleSharingTests(TestCase):
+
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient()
+        rates = {**settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"], "otp_request": "1/hour"}
+        patcher = patch(f"{_OTP_THROTTLE}.THROTTLE_RATES", rates)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_resend_shares_request_counter(self, _sms):
+        resp = self.client.post(reverse("otp_request"), {"mobile_number": "9000000103"})
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.post(
+            reverse("otp_resend"), {"otp_session_token": resp.data["otp_session_token"]}
+        )
+        self.assertEqual(resp.status_code, 429)
+
+    @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
+    def test_num_proxies_separates_clients(self, _sms):
+        url = reverse("otp_request")
+        with override_settings(REST_FRAMEWORK={**settings.REST_FRAMEWORK, "NUM_PROXIES": 1}):
+            first = self.client.post(url, {"mobile_number": "9000000104"}, HTTP_X_FORWARDED_FOR="1.1.1.1")
+            other = self.client.post(url, {"mobile_number": "9000000105"}, HTTP_X_FORWARDED_FOR="2.2.2.2")
+            again = self.client.post(url, {"mobile_number": "9000000106"}, HTTP_X_FORWARDED_FOR="1.1.1.1")
+        self.assertEqual((first.status_code, other.status_code, again.status_code), (200, 200, 429))

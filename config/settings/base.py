@@ -96,8 +96,8 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.IsAuthenticated",
     ),
     "DEFAULT_THROTTLE_CLASSES": (
-        "rest_framework.throttling.AnonRateThrottle",
-        "rest_framework.throttling.UserRateThrottle",
+        "apps.core.throttling.FailOpenAnonRateThrottle",
+        "apps.core.throttling.FailOpenUserRateThrottle",
     ),
     # Initial defaults, tune from production traffic. See the Redis
     # throttling spec §6 for what each limit protects.

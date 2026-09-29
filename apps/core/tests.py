@@ -1,11 +1,14 @@
 import importlib
 import os
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.conf import settings
+from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
+from redis.exceptions import RedisError
+from rest_framework.test import APIClient
 
 from config.settings.base import redis_cache, require_env
 
@@ -83,3 +86,26 @@ class DeployedSettingsFailFastTests(SimpleTestCase):
                     "django.core.cache.backends.redis.RedisCache",
                 )
                 self.assertEqual(module.REST_FRAMEWORK["NUM_PROXIES"], 1)
+
+
+def _broken_cache():
+    broken = MagicMock()
+    broken.get.side_effect = RedisError("connection refused")
+    broken.set.side_effect = RedisError("connection refused")
+    return broken
+
+
+class FailOpenThrottleTests(TestCase):
+
+    def setUp(self):
+        cache.clear()
+
+    def test_catalogue_stays_up_when_redis_is_down(self):
+        from apps.core.throttling import FailOpenAnonRateThrottle
+
+        with patch.object(FailOpenAnonRateThrottle, "cache", _broken_cache()):
+            with self.assertLogs("apps.core.throttling", "ERROR") as logs:
+                resp = APIClient().get("/api/catalog/products/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("scope=anon", logs.output[0])
+        self.assertNotIn("connection refused", resp.content.decode())

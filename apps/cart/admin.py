@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.db.models import Count
 from unfold.admin import ModelAdmin, TabularInline
 
 from .models import Cart, CartItem
@@ -25,12 +26,16 @@ class CartAdmin(ModelAdmin):
     list_display = ("id", "user", "session_key", "item_count", "created_at", "updated_at")
     search_fields = ("user__email", "user__mobile_number", "session_key")
     list_filter = ("created_at",)
+    list_select_related = ("user",)
     readonly_fields = ("public_id", "user", "session_key", "created_at", "updated_at")
     inlines = [CartItemInline]
 
-    @admin.display(description="Items")
+    def get_queryset(self, request):
+        return super().get_queryset(request).annotate(_item_count=Count("items"))
+
+    @admin.display(description="Items", ordering="_item_count")
     def item_count(self, obj):
-        return obj.items.count()
+        return obj._item_count
 
     def has_add_permission(self, request):
         return False

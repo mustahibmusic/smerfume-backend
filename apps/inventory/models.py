@@ -187,6 +187,7 @@ class InventoryStock(BaseModel):
     )
 
     class Meta:
+        permissions = [("transfer_stock_type", "Can transfer stock between stock types")]
         constraints = [
             models.UniqueConstraint(
                 fields=["variant", "warehouse", "stock_type"],
@@ -317,6 +318,8 @@ class StockTransaction(BaseModel):
     TYPE_RETURN_DISPOSITION = "return_disposition"
     TYPE_SALE = "sale"
     TYPE_PURCHASE_REVERSAL = "purchase_reversal"
+    TYPE_STOCK_TYPE_TRANSFER = "stock_type_transfer"
+    TYPE_OPENING_STOCK = "opening_stock"
 
     TYPE_CHOICES = (
         (TYPE_PURCHASE_RECEIPT, "Purchase Receipt"),
@@ -325,6 +328,8 @@ class StockTransaction(BaseModel):
         (TYPE_ADJUSTMENT, "Adjustment"),
         (TYPE_RETURN_DISPOSITION, "Return Disposition"),
         (TYPE_SALE, "Sale"),
+        (TYPE_STOCK_TYPE_TRANSFER, "Stock Type Transfer"),
+        (TYPE_OPENING_STOCK, "Opening Stock"),
     )
 
     transaction_type = models.CharField(max_length=30, choices=TYPE_CHOICES)
@@ -359,6 +364,9 @@ class StockMovement(BaseModel):
     MOVEMENT_RETURN_RESTOCKED_PARTIAL = "return_restocked_partial"
     MOVEMENT_RETURN_DAMAGED = "return_damaged"
     MOVEMENT_PURCHASE_REVERSAL_OUT = "purchase_reversal_out"
+    MOVEMENT_STOCK_TYPE_TRANSFER_OUT = "stock_type_transfer_out"
+    MOVEMENT_STOCK_TYPE_TRANSFER_IN = "stock_type_transfer_in"
+    MOVEMENT_OPENING_IN = "opening_in"
 
     MOVEMENT_TYPE_CHOICES = (
         (MOVEMENT_PURCHASE_IN, "Purchase In"),
@@ -371,6 +379,9 @@ class StockMovement(BaseModel):
         (MOVEMENT_RETURN_RESTOCKED_RETAIL, "Return Restocked - Retail"),
         (MOVEMENT_RETURN_RESTOCKED_PARTIAL, "Return Restocked - Partial"),
         (MOVEMENT_RETURN_DAMAGED, "Return Damaged"),
+        (MOVEMENT_STOCK_TYPE_TRANSFER_OUT, "Stock Type Transfer Out"),
+        (MOVEMENT_STOCK_TYPE_TRANSFER_IN, "Stock Type Transfer In"),
+        (MOVEMENT_OPENING_IN, "Opening Stock In"),
     )
 
     STOCK_TYPE_CHOICES = InventoryStock.STOCK_TYPE_CHOICES + (("partial", "Partial"),)
@@ -384,6 +395,7 @@ class StockMovement(BaseModel):
     REASON_STOCK_WRITTEN_OFF = "stock_written_off"
     REASON_STOCKTAKING_RESULTS = "stocktaking_results"
     REASON_MARKETING_USE = "marketing_use"
+    REASON_OPENING_STOCK = "opening_stock"
 
     REASON_CHOICES = (
         (REASON_PURCHASE, "Purchase"),
@@ -395,6 +407,7 @@ class StockMovement(BaseModel):
         (REASON_STOCK_WRITTEN_OFF, "Stock Written Off"),
         (REASON_STOCKTAKING_RESULTS, "Stocktaking Results"),
         (REASON_MARKETING_USE, "Marketing Use"),
+        (REASON_OPENING_STOCK, "Opening Stock"),
     )
 
     transaction_group = models.ForeignKey(

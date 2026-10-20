@@ -3,7 +3,6 @@ from unfold.admin import ModelAdmin, TabularInline
 from unfold.decorators import display
 from unfold.contrib.filters.admin import ChoicesDropdownFilter
 from unfold.paginator import InfinitePaginator
-from django.db.models import Case, When, Value, IntegerField
 from django.utils.safestring import mark_safe
 
 
@@ -211,6 +210,8 @@ class ProductEditionAdmin(ModelAdmin):
     readonly_fields = ("image_preview",)
     inlines = [EditionNoteInline]
 
+    list_select_related = ("product__brand",)
+
     def get_queryset(self, request):
         return (
             super()
@@ -225,23 +226,12 @@ class ProductEditionAdmin(ModelAdmin):
         return "—"
 
     def notes_summary(self, obj):
-        notes = (
-            obj.edition_notes
-            .annotate(
-                position_order=Case(
-                    When(position="top", then=Value(1)),
-                    When(position="heart", then=Value(2)),
-                    When(position="base", then=Value(3)),
-                    default=Value(99),
-                    output_field=IntegerField(),
-                )
-            )
-            .order_by("position_order", "note__name")
-        )
-
+        # Uses the prefetched notes (get_queryset); re-querying here would
+        # cost one query per row.
         grouped = {"top": [], "heart": [], "base": []}
-        for en in notes:
-            grouped[en.position].append(en.note.name)
+        for en in sorted(obj.edition_notes.all(), key=lambda en: en.note.name):
+            if en.position in grouped:
+                grouped[en.position].append(en.note.name)
 
         parts = []
         if grouped["top"]:

@@ -802,13 +802,23 @@ class InventoryAdminIntegrityTests(TestCase):
         form_class = admin_instance.get_form(self.request, self.stock)
         self.assertNotIn("quantity", form_class.base_fields)
 
-    def test_inventory_stock_quantity_is_editable_on_add_form(self):
-        # The one legitimate exception: bootstrapping a brand-new
-        # variant/warehouse/stock_type row needs an initial value.
+    def test_reorder_level_edit_is_saved_without_a_movement(self):
+        self.client.login(username="invadminstaff@example.com", password="testpass123")
+        url = f"/admin/inventory/inventorystock/{self.stock.pk}/change/"
+        before = StockMovement.objects.count()
+        self.client.post(url, data={
+            "reorder_level": "4", "quantity_delta": "", "reason": "", "notes": "", "_save": "Save",
+        })
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.reorder_level, Decimal("4"))
+        self.assertEqual(self.stock.quantity, Decimal("10"))
+        self.assertEqual(StockMovement.objects.count(), before)
+
+    def test_inventory_stock_has_no_add_path(self):
+        # Opening stock now comes from an opening goods receipt; new rows are
+        # created by receipts and transfers, never typed in.
         admin_instance = InventoryStockAdmin(InventoryStock, django_admin.site)
-        self.assertEqual(admin_instance.get_readonly_fields(self.request, None), [])
-        form_class = admin_instance.get_form(self.request, None)
-        self.assertIn("quantity", form_class.base_fields)
+        self.assertFalse(admin_instance.has_add_permission(self.request))
 
     def test_inventory_stock_admin_change_page_does_not_render_quantity_widget(self):
         self.client.login(username="invadminstaff@example.com", password="testpass123")
@@ -1828,3 +1838,286 @@ class ReallocateIncomingAdminTests(_ReserveOrderItemsBase):
         self.client.force_login(self.staff)
         response = self.client.get(reverse("admin:orders_order_change", args=[order.pk]))
         self.assertContains(response, self.url)
+
+
+# ── Admin ERP Phase 2: changelist query counts ───────────────────────────────
+
+from apps.core.test_utils import AdminQueryCountMixin  # noqa: E402
+
+
+class InventoryAdminQueryCountTests(AdminQueryCountMixin, TestCase):
+    def setUp(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="invquery", email="invquery@example.com", password="testpass123",
+        ))
+        self.warehouse = Warehouse.objects.get(is_default=True)
+
+    def _stock(self, i):
+        return InventoryStock.objects.create(
+            variant=_make_variant(f"SKU-QC-{i}"), warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal("5"),
+        )
+
+    def test_inventory_stock_changelist(self):
+        self.assertChangelistQueriesFlat("/admin/inventory/inventorystock/", self._stock)
+
+    def test_stock_movement_changelist(self):
+        def make(i):
+            StockMovement.objects.create(
+                variant=_make_variant(f"SKU-QM-{i}"), warehouse=self.warehouse,
+                stock_type=InventoryStock.STOCK_TYPE_RETAIL,
+                movement_type=StockMovement.MOVEMENT_ADJUSTMENT, quantity_delta=Decimal("1"),
+                reason=StockMovement.REASON_STOCKTAKING_RESULTS,
+            )
+        self.assertChangelistQueriesFlat("/admin/inventory/stockmovement/", make)
+
+    def test_partial_bottle_lot_changelist(self):
+        txn = StockTransaction.objects.create(transaction_type=StockTransaction.TYPE_ADJUSTMENT)
+
+        def make(i):
+            PartialBottleLot.objects.create(
+                variant=_make_variant(f"SKU-QL-{i}"), warehouse=self.warehouse,
+                remaining_ml=Decimal("50"), opened_at=timezone.now(), source_transaction=txn,
+            )
+        self.assertChangelistQueriesFlat("/admin/inventory/partialbottlelot/", make)
+
+    def test_stock_reservation_changelist(self):
+        def make(i):
+            variant = _make_variant(f"SKU-QR-{i}")
+            StockReservation.objects.create(
+                order_item=_make_order_item(variant), variant=variant, warehouse=self.warehouse,
+                purpose=StockReservation.PURPOSE_CHOICES[0][0], quantity=Decimal("1"),
+            )
+        self.assertChangelistQueriesFlat("/admin/inventory/stockreservation/", make)
+
+
+# ── Admin ERP Phase 2: operational filters and search ────────────────────────
+
+class InventoryAdminFilterTests(TestCase):
+    def setUp(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="invfilter", email="invfilter@example.com", password="testpass123",
+        ))
+        self.warehouse = Warehouse.objects.get(is_default=True)
+
+    def _stock(self, sku, quantity, reorder_level=None, reserved=0):
+        return InventoryStock.objects.create(
+            variant=_make_variant(sku), warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal(quantity),
+            quantity_reserved=Decimal(reserved), reorder_level=reorder_level,
+        )
+
+    def _results(self, url, params):
+        return set(self.client.get(url, params).context["cl"].result_list)
+
+    def test_low_stock_filter_uses_available_quantity(self):
+        low = self._stock("SKU-LOW-1", 3, reorder_level=5)
+        reserved_low = self._stock("SKU-LOW-2", 8, reorder_level=5, reserved=4)
+        self._stock("SKU-OK-1", 10, reorder_level=5)
+        self._stock("SKU-NOLEVEL", 0)
+        results = self._results("/admin/inventory/inventorystock/", {"low_stock": "yes"})
+        self.assertEqual(results, {low, reserved_low})
+
+    def test_stock_search_by_product_and_brand_name(self):
+        stock = self._stock("SKU-SEARCH-1", 3)
+        self.assertIn(stock, self._results("/admin/inventory/inventorystock/", {"q": "InvTestProduct"}))
+        self.assertIn(stock, self._results("/admin/inventory/inventorystock/", {"q": "InvTestBrand"}))
+
+    def test_active_reservation_filter(self):
+        held = StockReservation.objects.create(
+            order_item=_make_order_item(_make_variant("SKU-RES-1")), variant=_make_variant("SKU-RES-1B"),
+            warehouse=self.warehouse, purpose=StockReservation.PURPOSE_CHOICES[0][0],
+            quantity=Decimal("1"), status=StockReservation.STATUS_HELD,
+        )
+        confirmed = StockReservation.objects.create(
+            order_item=_make_order_item(_make_variant("SKU-RES-2")), variant=_make_variant("SKU-RES-2B"),
+            warehouse=self.warehouse, purpose=StockReservation.PURPOSE_CHOICES[0][0],
+            quantity=Decimal("1"), status=StockReservation.STATUS_CONFIRMED,
+        )
+        StockReservation.objects.create(
+            order_item=_make_order_item(_make_variant("SKU-RES-3")), variant=_make_variant("SKU-RES-3B"),
+            warehouse=self.warehouse, purpose=StockReservation.PURPOSE_CHOICES[0][0],
+            quantity=Decimal("1"), status=StockReservation.STATUS_RELEASED,
+        )
+        results = self._results("/admin/inventory/stockreservation/", {"active": "yes"})
+        self.assertEqual(results, {held, confirmed})
+
+    def test_stock_movement_date_hierarchy(self):
+        self.assertEqual(StockMovementAdmin.date_hierarchy, "created_at")
+
+
+# ── Admin ERP Phase 2: stock-type transfer ───────────────────────────────────
+
+class StockTypeTransferServiceTests(TestCase):
+    def setUp(self):
+        self.staff = User.objects.create_superuser(
+            username="transferstaff", email="transferstaff@example.com", password="testpass123",
+        )
+        self.warehouse = Warehouse.objects.get(is_default=True)
+        self.variant = _make_variant("SKU-XFER-100ML")
+
+    def _stock(self, stock_type, quantity, reserved=0):
+        return InventoryStock.objects.create(
+            variant=self.variant, warehouse=self.warehouse, stock_type=stock_type,
+            quantity=Decimal(quantity), quantity_reserved=Decimal(reserved),
+        )
+
+    def _transfer(self, stock, to_type, quantity):
+        return adjustment_service.transfer_stock_type(
+            stock, to_type=to_type, quantity=quantity,
+            reason=StockMovement.REASON_MARKETING_USE, notes="tester shelf", performed_by=self.staff,
+        )
+
+    def _qty(self, stock_type):
+        return InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type=stock_type,
+        ).quantity
+
+    def test_retail_to_tester_creates_target_and_paired_movements(self):
+        retail = self._stock("retail", 10)
+        txn = self._transfer(retail, "tester", 2)
+        self.assertEqual((self._qty("retail"), self._qty("tester")), (Decimal("8"), Decimal("2")))
+        self.assertEqual(txn.transaction_type, StockTransaction.TYPE_STOCK_TYPE_TRANSFER)
+        movements = {m.movement_type: m for m in StockMovement.objects.filter(transaction_group=txn)}
+        self.assertEqual(set(movements), {
+            StockMovement.MOVEMENT_STOCK_TYPE_TRANSFER_OUT, StockMovement.MOVEMENT_STOCK_TYPE_TRANSFER_IN,
+        })
+        out = movements[StockMovement.MOVEMENT_STOCK_TYPE_TRANSFER_OUT]
+        into = movements[StockMovement.MOVEMENT_STOCK_TYPE_TRANSFER_IN]
+        self.assertEqual((out.stock_type, out.quantity_delta), ("retail", Decimal("-2")))
+        self.assertEqual((into.stock_type, into.quantity_delta), ("tester", Decimal("2")))
+        self.assertEqual(out.performed_by, self.staff)
+        self.assertEqual(out.reason, StockMovement.REASON_MARKETING_USE)
+
+    def test_existing_target_row_is_incremented(self):
+        retail = self._stock("retail", 10)
+        self._stock("damaged", 1)
+        self._transfer(retail, "damaged", 3)
+        self.assertEqual(self._qty("damaged"), Decimal("4"))
+
+    def test_allowed_directions(self):
+        retail = self._stock("retail", 10)
+        for to_type in ("tester", "damaged", "promotional"):
+            self._transfer(retail, to_type, 1)
+        for from_type in ("tester", "promotional"):
+            self._transfer(InventoryStock.objects.get(variant=self.variant, stock_type=from_type), "damaged", 1)
+        self.assertEqual(self._qty("damaged"), Decimal("3"))
+
+    def test_blocked_directions(self):
+        stocks = {t: self._stock(t, 5) for t in ("retail", "tester", "damaged", "promotional")}
+        blocked = [
+            ("damaged", "retail"), ("damaged", "tester"), ("damaged", "promotional"),
+            ("tester", "retail"), ("promotional", "retail"), ("tester", "promotional"),
+            ("promotional", "tester"), ("retail", "retail"),
+        ]
+        for from_type, to_type in blocked:
+            with self.assertRaises(adjustment_service.InventoryAdjustmentError, msg=(from_type, to_type)):
+                self._transfer(stocks[from_type], to_type, 1)
+        for stock_type in stocks:
+            self.assertEqual(self._qty(stock_type), Decimal("5"))
+        self.assertFalse(StockTransaction.objects.filter(
+            transaction_type=StockTransaction.TYPE_STOCK_TYPE_TRANSFER,
+        ).exists())
+
+    def test_only_free_stock_moves(self):
+        retail = self._stock("retail", 10, reserved=8)
+        with self.assertRaises(adjustment_service.InventoryAdjustmentError):
+            self._transfer(retail, "damaged", 3)
+        self._transfer(retail, "damaged", 2)
+        retail.refresh_from_db()
+        self.assertEqual((retail.quantity, retail.quantity_reserved), (Decimal("8"), Decimal("8")))
+
+    def test_quantity_must_be_positive_whole_number(self):
+        retail = self._stock("retail", 10)
+        for quantity in (0, -1, Decimal("1.5")):
+            with self.assertRaises(adjustment_service.InventoryAdjustmentError):
+                self._transfer(retail, "tester", quantity)
+        self.assertEqual(self._qty("retail"), Decimal("10"))
+
+
+class StockTypeTransferConcurrencyTests(TransactionTestCase):
+    def setUp(self):
+        Warehouse.objects.filter(is_default=True).delete()
+        self.warehouse = Warehouse.objects.create(name="Smerfume Default", is_default=True)
+        self.variant = _make_variant("SKU-XFER-CONC")
+        self.stock = InventoryStock.objects.create(
+            variant=self.variant, warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal("10"),
+        )
+
+    def test_concurrent_transfers_cannot_move_more_than_free_stock(self):
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def _run(key, to_type):
+            barrier.wait()
+            try:
+                adjustment_service.transfer_stock_type(
+                    self.stock, to_type=to_type, quantity=6,
+                    reason=StockMovement.REASON_DAMAGED_GOODS,
+                )
+                results[key] = "ok"
+            except adjustment_service.InventoryAdjustmentError:
+                results[key] = "refused"
+            finally:
+                connection.close()
+
+        threads = [
+            threading.Thread(target=_run, args=("a", "damaged")),
+            threading.Thread(target=_run, args=("b", "tester")),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(results.values()), ["ok", "refused"])
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, Decimal("4"))
+
+
+class StockTypeTransferAdminTests(TestCase):
+    def setUp(self):
+        self.warehouse = Warehouse.objects.get(is_default=True)
+        self.stock = InventoryStock.objects.create(
+            variant=_make_variant("SKU-XFER-ADMIN"), warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal("10"),
+        )
+        self.url = reverse("admin:inventory_inventorystock_transfer_stock_type", args=[self.stock.pk])
+
+    def _staff(self, username, *codenames):
+        staff = User.objects.create_user(
+            username=username, email=f"{username}@example.com", password="testpass123", is_staff=True,
+        )
+        staff.user_permissions.add(*Permission.objects.filter(
+            content_type__app_label="inventory", codename__in=codenames,
+        ))
+        return staff
+
+    def _post(self, quantity="2", to_type="tester"):
+        return self.client.post(self.url, {
+            "to_type": to_type, "quantity": quantity,
+            "reason": StockMovement.REASON_MARKETING_USE, "notes": "",
+        }, follow=True)
+
+    def test_requires_transfer_permission(self):
+        self.client.force_login(self._staff("xferview", "view_inventorystock", "change_inventorystock"))
+        self.assertEqual(self.client.post(self.url, {}).status_code, 403)
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, Decimal("10"))
+
+    def test_get_changes_nothing_and_post_transfers(self):
+        self.client.force_login(self._staff("xferops", "view_inventorystock", "transfer_stock_type"))
+        resp = self.client.get(self.url)
+        self.assertContains(resp, 'name="to_type"')
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, Decimal("10"))
+        self._post()
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, Decimal("8"))
+
+    def test_service_error_shown(self):
+        self.client.force_login(self._staff("xferops2", "view_inventorystock", "transfer_stock_type"))
+        resp = self._post(quantity="20")
+        self.assertContains(resp, "free")
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, Decimal("10"))

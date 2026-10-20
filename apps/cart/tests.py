@@ -296,3 +296,19 @@ class CartOwnershipTests(TestCase):
         anon = APIClient()  # no X-Cart-Token at all
         patch_resp = anon.patch(f"/api/cart/items/{item_id}/", {"quantity": 2}, format="json")
         self.assertEqual(patch_resp.status_code, 404)
+
+
+# ── Admin ERP Phase 2: changelist query counts ───────────────────────────────
+
+from apps.core.test_utils import AdminQueryCountMixin  # noqa: E402
+
+
+class CartAdminQueryCountTests(AdminQueryCountMixin, TestCase):
+    def test_cart_changelist(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="cartquery", email="cartquery@example.com", password="testpass123",
+        ))
+        self.assertChangelistQueriesFlat(
+            "/admin/cart/cart/",
+            lambda i: Cart.objects.create(user=_make_user(mobile=f"+91981000{i:04d}")),
+        )

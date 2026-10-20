@@ -849,3 +849,168 @@ class UserAdminPrivilegeTests(TestCase):
         self.assertFalse(self.customer.is_superuser)
         self.assertFalse(self.customer.is_staff)
         self.assertEqual(self.customer.role, "customer")
+
+
+# ── Admin ERP Phase 2: changelist query counts ───────────────────────────────
+
+from apps.accounts.models import CustomerProfile  # noqa: E402
+from apps.core.test_utils import AdminQueryCountMixin  # noqa: E402
+
+
+class AccountsAdminQueryCountTests(AdminQueryCountMixin, TestCase):
+    def test_customer_profile_changelist(self):
+        self.client.force_login(get_user_model().objects.create_superuser(
+            username="acctquery", email="acctquery@example.com", password="testpass123",
+        ))
+
+        def make(i):
+            user = _make_user(mobile=f"+91982000{i:04d}", username=f"qprof{i}")
+            CustomerProfile.objects.get_or_create(user=user)
+        self.assertChangelistQueriesFlat("/admin/accounts/customerprofile/", make)
+
+
+# ── Admin ERP Phase 2: customer operations view ──────────────────────────────
+
+from decimal import Decimal  # noqa: E402
+
+from apps.orders.models import Order, Return, ShippingAddress  # noqa: E402
+
+
+class CustomerOperationsViewTests(TestCase):
+    def setUp(self):
+        self.client.force_login(get_user_model().objects.create_superuser(
+            username="custops", email="custops@example.com", password="testpass123",
+        ))
+        self.customer = _make_user(mobile="+919830000001", username="opscustomer")
+        self.order = Order.objects.create(
+            user=self.customer, order_number="SMR-CUST-000001",
+            subtotal=Decimal("900.00"), total=Decimal("900.00"), status=Order.STATUS_DELIVERED,
+        )
+        ShippingAddress.objects.create(
+            order=self.order, full_name="Ops Customer", mobile="9830000001",
+            address_line1="7 Hill Road", city="Nashik", state="MH", pincode="422001",
+        )
+        self.return_request = Return.objects.create(order=self.order)
+        other = _make_user(mobile="+919830000002", username="othercustomer")
+        self.other_order = Order.objects.create(
+            user=other, order_number="SMR-CUST-000002",
+            subtotal=Decimal("100.00"), total=Decimal("100.00"),
+        )
+
+    def _assert_panel(self, response):
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "SMR-CUST-000001")
+        self.assertContains(response, reverse("admin:orders_order_change", args=[self.order.pk]))
+        self.assertContains(response, reverse("admin:orders_return_change", args=[self.return_request.pk]))
+        self.assertContains(response, "Nashik")
+        self.assertContains(response, f"user__id__exact={self.customer.pk}")
+        self.assertNotContains(response, "SMR-CUST-000002")
+
+    def test_user_change_page_shows_customer_activity(self):
+        self._assert_panel(self.client.get(
+            reverse("admin:accounts_user_change", args=[self.customer.pk])
+        ))
+
+    def test_customer_profile_page_shows_customer_activity(self):
+        profile, _ = CustomerProfile.objects.get_or_create(user=self.customer)
+        self._assert_panel(self.client.get(
+            reverse("admin:accounts_customerprofile_change", args=[profile.pk])
+        ))
+
+    def test_view_all_orders_link_filters_by_customer(self):
+        response = self.client.get(
+            reverse("admin:orders_order_changelist"), {"user__id__exact": self.customer.pk}
+        )
+        self.assertEqual(set(response.context["cl"].result_list), {self.order})
+
+
+# ── Admin ERP Phase 2: staff groups ──────────────────────────────────────────
+
+from io import StringIO  # noqa: E402
+
+from django.contrib.auth.models import Group  # noqa: E402
+from django.core.management import CommandError, call_command  # noqa: E402
+
+from apps.accounts.management.commands import setup_staff_groups as groups_command  # noqa: E402
+
+
+def _group_codes(name):
+    return {
+        f"{p.content_type.app_label}.{p.codename}"
+        for p in Group.objects.get(name=name).permissions.select_related("content_type")
+    }
+
+
+class SetupStaffGroupsTests(TestCase):
+    def _run(self, *args):
+        call_command("setup_staff_groups", *args, stdout=StringIO())
+
+    def test_creates_four_groups_with_exact_permissions(self):
+        self._run()
+        self.assertEqual(
+            set(Group.objects.values_list("name", flat=True)),
+            {"Ops", "Warehouse", "Finance", "Manager"},
+        )
+        for name, codes in groups_command.group_permissions().items():
+            self.assertEqual(_group_codes(name), set(codes), name)
+
+    def test_least_privilege_boundaries(self):
+        self._run()
+        ops, warehouse, finance, manager = (
+            _group_codes(n) for n in ("Ops", "Warehouse", "Finance", "Manager")
+        )
+        self.assertIn("orders.process_return", ops)
+        self.assertNotIn("orders.receive_return", ops)
+        self.assertIn("orders.receive_return", warehouse)
+        self.assertNotIn("orders.process_return", warehouse)
+        self.assertNotIn("orders.complete_refund", ops | warehouse)
+        self.assertIn("orders.complete_refund", finance)
+        self.assertNotIn("purchases.reverse_goodsreceipt", warehouse)
+        self.assertIn("accounts.change_user", ops)
+        self.assertIn("orders.change_return", finance)
+        self.assertNotIn("orders.change_returnitem", finance)
+        self.assertTrue((ops | warehouse | finance) <= manager)
+
+    def test_never_grants_auth_admin_or_ledger_permissions(self):
+        self._run()
+        every = set().union(*(_group_codes(n) for n in ("Ops", "Warehouse", "Finance", "Manager")))
+        for code in every:
+            app_label, codename = code.split(".")
+            self.assertNotIn(app_label, ("auth", "admin", "contenttypes", "sessions"), code)
+            if codename.startswith("delete_"):
+                self.assertIn(code, groups_command.DRAFT_INLINE_DELETES, code)
+        for ledger in ("stockmovement", "stocktransaction", "stockreservation",
+                       "stockreservationallocation", "bookedquantitychange"):
+            for verb in ("add", "change", "delete"):
+                self.assertFalse(any(c.endswith(f".{verb}_{ledger}") for c in every), ledger)
+
+    def test_rerun_is_idempotent_and_removes_hand_added_permissions(self):
+        self._run()
+        ops = Group.objects.get(name="Ops")
+        before = _group_codes("Ops")
+        ops.permissions.add(Permission.objects.get(codename="complete_refund"))
+        self._run()
+        self.assertEqual(_group_codes("Ops"), before)
+        self.assertEqual(Group.objects.filter(name="Ops").count(), 1)
+
+    def test_users_are_not_touched(self):
+        user = _make_user(mobile="+919840000001", username="groupmember")
+        self._run()
+        Group.objects.get(name="Ops").user_set.add(user)
+        self._run()
+        user.refresh_from_db()
+        self.assertTrue(user.groups.filter(name="Ops").exists())
+        self.assertFalse(user.is_superuser)
+        self.assertFalse(user.is_staff)
+
+    def test_missing_permission_fails_and_changes_nothing(self):
+        broken = dict(groups_command.GROUP_PERMISSIONS)
+        broken["Ops"] = broken["Ops"] + ("orders.no_such_permission",)
+        with patch.object(groups_command, "GROUP_PERMISSIONS", broken):
+            with self.assertRaisesMessage(CommandError, "orders.no_such_permission"):
+                self._run()
+        self.assertFalse(Group.objects.exists())
+
+    def test_dry_run_changes_nothing(self):
+        self._run("--dry-run")
+        self.assertFalse(Group.objects.exists())

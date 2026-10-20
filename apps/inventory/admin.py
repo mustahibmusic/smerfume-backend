@@ -1,10 +1,17 @@
 from django import forms
 from django.contrib import admin, messages
 from django.core.exceptions import PermissionDenied
+from django.db.models import F
 from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from unfold.admin import ModelAdmin
+from unfold.decorators import action
+from unfold.widgets import (
+    UnfoldAdminIntegerFieldWidget,
+    UnfoldAdminSelectWidget,
+    UnfoldAdminTextareaWidget,
+)
 
 from .models import (
     DecantSource,
@@ -54,24 +61,90 @@ class SupplierAdmin(ModelAdmin):
         return False
 
 
+# Reasons a manual adjustment may record. Purchases come only from goods
+# receipts and opening stock only from opening receipts.
+MANUAL_ADJUSTMENT_REASONS = [
+    choice for choice in StockMovement.REASON_CHOICES
+    if choice[0] not in (StockMovement.REASON_PURCHASE, StockMovement.REASON_OPENING_STOCK)
+]
+
+
 class InventoryStockAdjustmentForm(forms.ModelForm):
-    """On the ADD form, `quantity` is the legitimate starting ledger value
-    for a brand-new variant/warehouse/stock_type row (there is no prior
-    quantity to protect). On the CHANGE form, InventoryStockAdmin makes
-    `quantity` read-only and routes any change through these extra fields
-    instead — save_model() never calls a raw form.save() for an edit."""
+    """InventoryStockAdmin makes `quantity` read-only and routes any change
+    through these extra fields instead; save_model() never calls a raw
+    form.save(). Rows are never added here: they come from goods receipts
+    (including opening receipts) and stock-type transfers."""
 
     quantity_delta = forms.DecimalField(
         required=False,
-        help_text="Signed adjustment to apply on save (e.g. +10 to receive stock, -2 to write off). "
+        help_text="Signed adjustment to apply on save (e.g. +2 stocktaking gain, -2 to write off). "
                    "Leave blank to make no change.",
     )
-    reason = forms.ChoiceField(choices=StockMovement.REASON_CHOICES, required=False)
+    reason = forms.ChoiceField(choices=MANUAL_ADJUSTMENT_REASONS, required=False)
     notes = forms.CharField(required=False, widget=forms.Textarea)
 
     class Meta:
         model = InventoryStock
         fields = ["variant", "warehouse", "stock_type", "quantity", "reorder_level"]
+
+
+class LowStockFilter(admin.SimpleListFilter):
+    """Rows with a reorder level whose free stock (quantity - reserved) is
+    at or below it."""
+
+    title = "low stock"
+    parameter_name = "low_stock"
+
+    def lookups(self, request, model_admin):
+        return (("yes", "At or below reorder level"),)
+
+    def queryset(self, request, queryset):
+        if self.value() == "yes":
+            return queryset.filter(
+                reorder_level__isnull=False,
+                quantity__lte=F("quantity_reserved") + F("reorder_level"),
+            )
+        return queryset
+
+
+class ActiveReservationFilter(admin.SimpleListFilter):
+    title = "active"
+    parameter_name = "active"
+
+    def lookups(self, request, model_admin):
+        return (("yes", "Held or confirmed"),)
+
+    def queryset(self, request, queryset):
+        if self.value() == "yes":
+            return queryset.filter(
+                status__in=[StockReservation.STATUS_HELD, StockReservation.STATUS_CONFIRMED]
+            )
+        return queryset
+
+
+TRANSFER_REASONS = (
+    StockMovement.REASON_MARKETING_USE,
+    StockMovement.REASON_DAMAGED_GOODS,
+    StockMovement.REASON_STOCKTAKING_RESULTS,
+    StockMovement.REASON_STOCK_WRITTEN_OFF,
+)
+
+
+class StockTypeTransferForm(forms.Form):
+    to_type = forms.ChoiceField(label="Move to", widget=UnfoldAdminSelectWidget)
+    quantity = forms.IntegerField(min_value=1, widget=UnfoldAdminIntegerFieldWidget)
+    reason = forms.ChoiceField(
+        choices=[c for c in StockMovement.REASON_CHOICES if c[0] in TRANSFER_REASONS],
+        widget=UnfoldAdminSelectWidget,
+    )
+    notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget)
+
+    def __init__(self, *args, stock, **kwargs):
+        super().__init__(*args, **kwargs)
+        allowed = adjustment_services.ALLOWED_STOCK_TYPE_TRANSFERS.get(stock.stock_type, set())
+        self.fields["to_type"].choices = [
+            c for c in InventoryStock.STOCK_TYPE_CHOICES if c[0] in allowed
+        ]
 
 
 @admin.register(InventoryStock)
@@ -80,25 +153,81 @@ class InventoryStockAdmin(ModelAdmin):
         "variant", "warehouse", "stock_type", "quantity", "quantity_reserved",
         "available", "reorder_level",
     )
-    list_filter = ("stock_type", "warehouse")
-    search_fields = ("variant__sku",)
+    list_filter = ("stock_type", "warehouse", LowStockFilter)
+    search_fields = (
+        "variant__sku", "variant__edition__name", "variant__edition__product__name",
+        "variant__edition__product__brand__name",
+    )
     autocomplete_fields = ("variant",)
     form = InventoryStockAdjustmentForm
+    actions_detail = ["transfer_stock_type"]
+
+    def has_transfer_stock_type_permission(self, request, object_id=None):
+        if not request.user.has_perm("inventory.transfer_stock_type"):
+            return False
+        if object_id is None:
+            return True
+        return InventoryStock.objects.filter(
+            pk=object_id, stock_type__in=list(adjustment_services.ALLOWED_STOCK_TYPE_TRANSFERS),
+        ).exists()
+
+    @action(
+        description="Transfer stock type", url_path="transfer",
+        permissions=["transfer_stock_type"], icon="swap_horiz",
+    )
+    def transfer_stock_type(self, request, object_id):
+        """GET shows the form; only POST moves free units, through
+        adjustment_services.transfer_stock_type()."""
+        stock = get_object_or_404(InventoryStock.objects.select_related("variant", "warehouse"), pk=object_id)
+        change_url = reverse("admin:inventory_inventorystock_change", args=[stock.pk])
+        form = StockTypeTransferForm(request.POST or None, stock=stock)
+        if request.method == "POST" and form.is_valid():
+            data = form.cleaned_data
+            try:
+                adjustment_services.transfer_stock_type(
+                    stock, to_type=data["to_type"], quantity=data["quantity"],
+                    reason=data["reason"], notes=data["notes"], performed_by=request.user,
+                )
+            except adjustment_services.InventoryAdjustmentError as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+            else:
+                self.log_change(request, stock, f"Transferred {data['quantity']} to {data['to_type']}.")
+                self.message_user(
+                    request, f"Moved {data['quantity']} unit(s) to {data['to_type']}.", level=messages.SUCCESS,
+                )
+            return redirect(change_url)
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Transfer stock type: {stock.variant} [{stock.stock_type}]",
+            "opts": self.model._meta,
+            "form": form,
+            "message": (
+                f"Free units: {stock.available} (reserved units never move). "
+                "Damaged stock cannot be moved back, and testers or promotional stock "
+                "cannot return to retail."
+            ),
+            "rows": [],
+            "button_label": "Transfer",
+            "button_class": "bg-primary-600",
+            "back_url": change_url,
+        }
+        return TemplateResponse(request, "admin/purchases/po_action.html", context)
+
+    def has_add_permission(self, request):
+        # Opening stock is an opening goods receipt; other new rows come
+        # from purchase receipts and stock-type transfers.
+        return False
 
     def has_delete_permission(self, request, obj=None):
         return False
 
     def get_fields(self, request, obj=None):
-        if obj is None:
-            return ["variant", "warehouse", "stock_type", "quantity", "reorder_level"]
         return [
             "variant", "warehouse", "stock_type", "quantity", "quantity_reserved",
             "reorder_level", "quantity_delta", "reason", "notes",
         ]
 
     def get_readonly_fields(self, request, obj=None):
-        if obj is None:
-            return []
         # quantity_reserved is never manually adjustable — it only ever
         # changes as a side effect of reservation/consumption. quantity on
         # an EXISTING row is locked here; the only way to change it is the
@@ -106,23 +235,15 @@ class InventoryStockAdmin(ModelAdmin):
         return ["variant", "warehouse", "stock_type", "quantity", "quantity_reserved"]
 
     def save_model(self, request, obj, form, change):
-        if not change:
-            # Brand-new row: this IS the starting ledger entry, not an edit
-            # of an existing one. Still logged as a real StockMovement for
-            # full audit traceability — no silent, movement-free creation.
-            super().save_model(request, obj, form, change)
-            if obj.quantity:
-                StockMovement.objects.create(
-                    variant=obj.variant, warehouse=obj.warehouse, stock_type=obj.stock_type,
-                    movement_type=StockMovement.MOVEMENT_ADJUSTMENT, quantity_delta=obj.quantity,
-                    reason=StockMovement.REASON_PURCHASE, notes="Initial stock entry via admin",
-                    performed_by=request.user,
-                )
-            return
-
+        # reorder_level is plain configuration (no ledger effect); quantity
+        # changes only through adjust_inventory_stock() below.
+        reorder_level = form.cleaned_data.get("reorder_level")
+        if reorder_level != InventoryStock.objects.get(pk=obj.pk).reorder_level:
+            InventoryStock.objects.filter(pk=obj.pk).update(reorder_level=reorder_level)
+            self.message_user(request, "Reorder level updated.", level=messages.SUCCESS)
         delta = form.cleaned_data.get("quantity_delta")
         if not delta:
-            self.message_user(request, "No quantity_delta given — nothing changed.", level=messages.INFO)
+            self.message_user(request, "No quantity_delta given — quantity unchanged.", level=messages.INFO)
             return
         reason = form.cleaned_data.get("reason")
         if not reason:
@@ -148,7 +269,7 @@ class PartialBottleLotAdjustmentForm(forms.ModelForm):
         help_text="Signed adjustment to remaining_ml (e.g. -5 for evaporation/spillage write-off). "
                    "Leave blank to make no change.",
     )
-    reason = forms.ChoiceField(choices=StockMovement.REASON_CHOICES, required=False)
+    reason = forms.ChoiceField(choices=MANUAL_ADJUSTMENT_REASONS, required=False)
     notes = forms.CharField(required=False, widget=forms.Textarea)
 
     class Meta:
@@ -241,6 +362,7 @@ class StockMovementAdmin(ModelAdmin):
     )
     list_filter = ("movement_type", "reason", "warehouse")
     search_fields = ("variant__sku", "notes")
+    date_hierarchy = "created_at"
     autocomplete_fields = ("variant", "supplier", "partial_lot")
     readonly_fields = (
         "transaction_group", "variant", "warehouse", "stock_type", "movement_type",
@@ -273,7 +395,7 @@ class StockReservationAdmin(ModelAdmin):
     InventoryStock/PartialBottleLot rows it's holding capacity against."""
 
     list_display = ("order_item", "variant", "warehouse", "purpose", "quantity", "status", "created_at")
-    list_filter = ("status", "purpose", "warehouse")
+    list_filter = (ActiveReservationFilter, "status", "purpose", "warehouse")
     search_fields = ("order_item__order__order_number", "variant__sku")
     autocomplete_fields = ("variant",)
 

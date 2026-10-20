@@ -20,6 +20,7 @@ from apps.inventory.models import InventoryStock
 from apps.inventory.services import reservation as reservation_service
 from apps.inventory.services.receipt import (
     PurchaseReversalStockError,
+    receive_opening_stock,
     receive_purchased_stock,
     reverse_purchased_stock,
 )
@@ -364,6 +365,69 @@ def post_goods_receipt(receipt, user):
     ])
 
     refresh_po_receipt_status(po)
+    return receipt
+
+
+def create_opening_receipt(warehouse, user, received_date=None, notes=""):
+    """Start an empty draft opening-stock receipt: stock already on hand at
+    cutover. No purchase order and no vendor, so it never enters PO or
+    vendor receipt history. Lines carry variant, stock type, quantity and
+    unit cost."""
+    receipt = GoodsReceipt(
+        receipt_type=GoodsReceipt.TYPE_OPENING,
+        warehouse=warehouse,
+        notes=(notes or "").strip(),
+        created_by=user,
+    )
+    if received_date:
+        receipt.received_date = received_date
+    receipt.save()
+    return receipt
+
+
+@transaction.atomic
+def post_opening_receipt(receipt, user):
+    """Draft opening receipt -> posted. Adds the units to stock through one
+    opening_stock StockTransaction (opening_in movements, never
+    purchase_in). Each line keeps its unit cost for valuation. All or
+    nothing; posting twice is refused. Posted opening receipts cannot be
+    reversed; correct mistakes with a stocktaking adjustment."""
+    receipt = GoodsReceipt.objects.select_for_update().get(pk=receipt.pk)
+    if receipt.receipt_type != GoodsReceipt.TYPE_OPENING:
+        raise GoodsReceiptError("Only opening stock receipts can be posted here.")
+    if receipt.status == GoodsReceipt.STATUS_POSTED:
+        raise GoodsReceiptAlreadyPosted(f"{receipt.grn_number} is already posted.")
+    if receipt.status != GoodsReceipt.STATUS_DRAFT:
+        raise GoodsReceiptError(f"{receipt.grn_number} is not a draft and cannot be posted.")
+
+    lines = list(receipt.lines.order_by("pk"))
+    problems = []
+    if receipt.supplier_id or receipt.purchase_order_id:
+        problems.append("Opening stock receipts have no vendor or purchase order.")
+    if not lines:
+        problems.append("Add at least one line before posting.")
+    allowed_types = {value for value, _ in GoodsReceiptLine.STOCK_TYPE_CHOICES}
+    for number, line in enumerate(lines, start=1):
+        if line.po_line_id:
+            problems.append(f"Line {number}: opening stock lines have no PO line.")
+        if line.quantity <= 0:
+            problems.append(f"Line {number}: quantity must be more than 0.")
+        if line.stock_type not in allowed_types:
+            problems.append(f"Line {number}: stock type must be retail or damaged.")
+    if problems:
+        raise GoodsReceiptError(" ".join(problems))
+
+    stock_transaction = receive_opening_stock(
+        warehouse=receipt.warehouse,
+        lines=lines,
+        performed_by=user,
+        notes=f"Opening stock receipt {receipt.grn_number}",
+    )
+    receipt.status = GoodsReceipt.STATUS_POSTED
+    receipt.stock_transaction = stock_transaction
+    receipt.posted_by = user
+    receipt.posted_at = timezone.now()
+    receipt.save(update_fields=["status", "stock_transaction", "posted_by", "posted_at", "updated_at"])
     return receipt
 
 

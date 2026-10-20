@@ -2712,3 +2712,194 @@ class BookedIncomingConcurrencyTests(TransactionTestCase):
             self.assertEqual(allocation.replacement.purchase_order_line, other_line)
             self.assertEqual(stock.quantity_reserved, Decimal("0"))
         self._assert_consistent()
+
+
+# ── Admin ERP Phase 2: overdue PO filter, GRN date hierarchy ─────────────────
+
+import datetime  # noqa: E402
+
+
+class PurchaseAdminFilterTests(_POBase):
+    def test_overdue_filter(self):
+        today = timezone.localdate()
+        overdue = self._po(expected_date=today - datetime.timedelta(days=2), status=PurchaseOrder.STATUS_ISSUED)
+        self._po(expected_date=today + datetime.timedelta(days=2), status=PurchaseOrder.STATUS_ISSUED)
+        self._po(expected_date=today - datetime.timedelta(days=2), status=PurchaseOrder.STATUS_RECEIVED)
+        self._po(expected_date=None, status=PurchaseOrder.STATUS_ISSUED)
+        self.client.force_login(self.user)
+        resp = self.client.get(reverse("admin:purchases_purchaseorder_changelist"), {"overdue": "yes"})
+        self.assertEqual(set(resp.context["cl"].result_list), {overdue})
+
+    def test_goods_receipt_date_hierarchy(self):
+        from apps.purchases.admin import GoodsReceiptAdmin
+        self.assertEqual(GoodsReceiptAdmin.date_hierarchy, "received_date")
+
+
+# ── Admin ERP Phase 2: opening stock receipts ────────────────────────────────
+
+class OpeningReceiptServiceTests(_POBase):
+    def _opening(self):
+        return services.create_opening_receipt(self.warehouse, self.user, notes="Cutover")
+
+    def _line(self, receipt, quantity=5, stock_type="retail", unit_cost="2500.00", variant=None):
+        return GoodsReceiptLine.objects.create(
+            receipt=receipt, variant=variant or self.variant, stock_type=stock_type,
+            quantity=quantity, unit_cost=Decimal(unit_cost), tax_rate=Decimal("18"),
+        )
+
+    def test_create_opening_receipt_has_no_po_and_no_vendor(self):
+        receipt = self._opening()
+        self.assertEqual(receipt.receipt_type, GoodsReceipt.TYPE_OPENING)
+        self.assertEqual(receipt.status, GoodsReceipt.STATUS_DRAFT)
+        self.assertIsNone(receipt.purchase_order_id)
+        self.assertIsNone(receipt.supplier_id)
+        self.assertEqual(receipt.created_by, self.user)
+
+    def test_post_adds_stock_with_opening_ledger_types(self):
+        receipt = self._opening()
+        retail = self._line(receipt, quantity=5)
+        damaged = self._line(receipt, quantity=2, stock_type="damaged", unit_cost="0")
+        services.post_opening_receipt(receipt, self.user)
+
+        receipt.refresh_from_db()
+        self.assertEqual(receipt.status, GoodsReceipt.STATUS_POSTED)
+        self.assertEqual(receipt.posted_by, self.user)
+        txn = receipt.stock_transaction
+        self.assertEqual(txn.transaction_type, StockTransaction.TYPE_OPENING_STOCK)
+        stock = {s.stock_type: s.quantity for s in InventoryStock.objects.filter(variant=self.variant)}
+        self.assertEqual(stock, {"retail": Decimal("5"), "damaged": Decimal("2")})
+
+        movements = list(StockMovement.objects.filter(transaction_group=txn).order_by("pk"))
+        self.assertEqual(len(movements), 2)
+        for movement, line in zip(movements, (retail, damaged)):
+            self.assertEqual(movement.movement_type, StockMovement.MOVEMENT_OPENING_IN)
+            self.assertEqual(movement.reason, StockMovement.REASON_OPENING_STOCK)
+            self.assertEqual(movement.source_receipt_line, line)
+            self.assertIsNone(movement.supplier_id)
+        self.assertFalse(StockMovement.objects.filter(movement_type=StockMovement.MOVEMENT_PURCHASE_IN).exists())
+        retail.refresh_from_db()
+        self.assertEqual(retail.unit_cost, Decimal("2500.0000"))
+
+    def test_opening_stock_stays_out_of_po_receipt_figures(self):
+        po = self._po()
+        po_line = PurchaseOrderLine.objects.create(
+            purchase_order=po, variant=self.variant, quantity_ordered=10, unit_price=Decimal("3100.00"),
+        )
+        receipt = self._opening()
+        self._line(receipt, quantity=4)
+        services.post_opening_receipt(receipt, self.user)
+        self.assertEqual(selectors.received_quantity(po_line), 0)
+        self.assertFalse(GoodsReceipt.objects.filter(purchase_order=po).exists())
+
+    def test_posting_twice_is_refused(self):
+        receipt = self._opening()
+        self._line(receipt)
+        services.post_opening_receipt(receipt, self.user)
+        with self.assertRaises(services.GoodsReceiptAlreadyPosted):
+            services.post_opening_receipt(receipt, self.user)
+        self.assertEqual(InventoryStock.objects.get(variant=self.variant).quantity, Decimal("5"))
+
+    def test_refusals(self):
+        empty = self._opening()
+        with self.assertRaises(services.GoodsReceiptError):
+            services.post_opening_receipt(empty, self.user)
+
+        with_vendor = self._opening()
+        self._line(with_vendor)
+        GoodsReceipt.objects.filter(pk=with_vendor.pk).update(supplier=self.supplier)
+        with self.assertRaises(services.GoodsReceiptError):
+            services.post_opening_receipt(with_vendor, self.user)
+
+        po = self._po()
+        PurchaseOrderLine.objects.create(
+            purchase_order=po, variant=self.variant, quantity_ordered=1, unit_price=Decimal("1"),
+        )
+        services.issue_purchase_order(po, self.user)
+        standard = services.create_receipt_from_po(po, self.user)
+        with self.assertRaises(services.GoodsReceiptError):
+            services.post_opening_receipt(standard, self.user)
+        self.assertFalse(InventoryStock.objects.filter(variant=self.variant).exists())
+
+    def test_standard_posting_refuses_opening_receipt(self):
+        receipt = self._opening()
+        self._line(receipt)
+        with self.assertRaises(services.GoodsReceiptError):
+            services.post_goods_receipt(receipt, self.user)
+
+    def test_tester_and_promotional_lines_are_not_allowed(self):
+        receipt = self._opening()
+        for stock_type in ("tester", "promotional"):
+            with self.subTest(stock_type=stock_type), self.assertRaises(IntegrityError), transaction.atomic():
+                self._line(receipt, stock_type=stock_type)
+
+    def test_opening_receipt_cannot_be_reversed(self):
+        receipt = self._opening()
+        self._line(receipt)
+        services.post_opening_receipt(receipt, self.user)
+        self.assertEqual(selectors.reversible_quantities(receipt), {})
+
+
+class OpeningReceiptAdminTests(_POBase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.user)
+
+    def test_new_opening_receipt_action_creates_draft(self):
+        url = reverse("admin:purchases_goodsreceipt_new_opening_receipt")
+        self.assertEqual(self.client.get(url).status_code, 200)
+        self.assertFalse(GoodsReceipt.objects.exists())
+        self.client.post(url, {
+            "warehouse": self.warehouse.pk, "received_date": "2026-10-01", "notes": "Cutover",
+        })
+        receipt = GoodsReceipt.objects.get()
+        self.assertEqual(receipt.receipt_type, GoodsReceipt.TYPE_OPENING)
+        self.assertIsNone(receipt.supplier_id)
+
+    def test_new_opening_receipt_requires_add_permission(self):
+        staff = User.objects.create_user(
+            username="openview", email="openview@example.com", password="testpass123", is_staff=True,
+        )
+        staff.user_permissions.add(Permission.objects.get(codename="view_goodsreceipt"))
+        self.client.force_login(staff)
+        resp = self.client.post(reverse("admin:purchases_goodsreceipt_new_opening_receipt"), {
+            "warehouse": self.warehouse.pk, "received_date": "2026-10-01",
+        })
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(GoodsReceipt.objects.exists())
+
+    def test_opening_draft_uses_opening_line_inline(self):
+        receipt = services.create_opening_receipt(self.warehouse, self.user)
+        resp = self.client.get(reverse("admin:purchases_goodsreceipt_change", args=[receipt.pk]))
+        self.assertContains(resp, 'name="lines-__prefix__-variant"')
+        self.assertContains(resp, 'name="lines-__prefix__-unit_cost"')
+        self.assertNotContains(resp, 'name="lines-__prefix__-po_line"')
+
+    def test_post_action_posts_opening_receipt(self):
+        receipt = services.create_opening_receipt(self.warehouse, self.user)
+        GoodsReceiptLine.objects.create(
+            receipt=receipt, variant=self.variant, stock_type="retail", quantity=3,
+            unit_cost=Decimal("2000"),
+        )
+        url = reverse("admin:purchases_goodsreceipt_post_grn", args=[receipt.pk])
+        self.assertEqual(self.client.get(url).status_code, 200)
+        self.client.post(url)
+        receipt.refresh_from_db()
+        self.assertEqual(receipt.status, GoodsReceipt.STATUS_POSTED)
+        self.assertEqual(receipt.stock_transaction.transaction_type, StockTransaction.TYPE_OPENING_STOCK)
+
+
+class InventoryStockAddPathRemovedTests(_POBase):
+    def test_stock_add_form_is_disabled(self):
+        from django.contrib import admin as django_admin
+        from apps.inventory.admin import InventoryStockAdmin
+        request = RequestFactory().get("/")
+        request.user = self.user
+        model_admin = InventoryStockAdmin(InventoryStock, django_admin.site)
+        self.assertFalse(model_admin.has_add_permission(request))
+
+    def test_manual_adjustment_cannot_claim_purchase_or_opening(self):
+        from apps.inventory.admin import InventoryStockAdjustmentForm
+        reasons = {value for value, _ in InventoryStockAdjustmentForm.base_fields["reason"].choices}
+        self.assertNotIn(StockMovement.REASON_PURCHASE, reasons)
+        self.assertNotIn(StockMovement.REASON_OPENING_STOCK, reasons)
+        self.assertIn(StockMovement.REASON_STOCKTAKING_RESULTS, reasons)

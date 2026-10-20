@@ -1,7 +1,9 @@
 from django import forms
 from django.contrib import admin
 from django.contrib import messages
-from django.db.models import Exists, OuterRef
+from django.contrib.admin.models import LogEntry
+from django.contrib.contenttypes.models import ContentType
+from django.db.models import Exists, OuterRef, Q
 from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
 from django.urls import reverse
@@ -18,7 +20,7 @@ from unfold.widgets import (
 )
 
 from apps.catalog.models import ProductVariant
-from apps.inventory.models import StockReservationAllocation, Warehouse
+from apps.inventory.models import StockMovement, StockReservationAllocation, Warehouse
 from apps.inventory.services.reservation import InsufficientStockError
 
 from . import services as order_services
@@ -114,6 +116,47 @@ class CompleteRefundForm(forms.Form):
 
 class FailRefundForm(forms.Form):
     failure_reason = forms.CharField(widget=UnfoldAdminTextareaWidget)
+
+
+class StaffReturnForm(forms.Form):
+    """One quantity / reason / notes row per order item. Eligibility (window,
+    quantity caps, in-store) is left entirely to create_return()."""
+
+    def __init__(self, *args, order_items=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.order_items = list(order_items)
+        reasons = [("", "—")] + list(ReturnItem.REASON_CHOICES)
+        for item in self.order_items:
+            self.fields[f"quantity_{item.pk}"] = forms.IntegerField(
+                label=f"{item.variant} (bought {item.quantity})", min_value=0, initial=0,
+                required=False, widget=UnfoldAdminIntegerFieldWidget,
+            )
+            self.fields[f"reason_{item.pk}"] = forms.ChoiceField(
+                label="Reason", choices=reasons, required=False, widget=UnfoldAdminSelectWidget,
+            )
+            self.fields[f"notes_{item.pk}"] = forms.CharField(
+                label="Notes", required=False, widget=UnfoldAdminTextInputWidget,
+            )
+
+    def clean(self):
+        cleaned = super().clean()
+        items = []
+        for item in self.order_items:
+            quantity = cleaned.get(f"quantity_{item.pk}") or 0
+            if not quantity:
+                continue
+            reason = cleaned.get(f"reason_{item.pk}")
+            if not reason:
+                self.add_error(f"reason_{item.pk}", "Choose a reason for this item.")
+                continue
+            items.append({
+                "order_item": item, "requested_quantity": quantity, "reason": reason,
+                "reason_notes": cleaned.get(f"notes_{item.pk}", ""),
+            })
+        if not items and not self.errors:
+            raise forms.ValidationError("Enter a quantity for at least one item.")
+        cleaned["items"] = items
+        return cleaned
 
 
 class StaffActionMixin:
@@ -214,7 +257,12 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
         "is_guest_order_display", "guest_email", "awaiting_incoming_display", "created_at",
     )
     list_filter = ("channel", "status", "payment_method", AwaitingIncomingFilter, "created_at")
-    search_fields = ("order_number", "user__mobile_number", "user__email", "guest_email")
+    search_fields = (
+        "order_number", "user__mobile_number", "user__email", "guest_email",
+        "user__first_name", "user__last_name",
+        "shipping_address__mobile", "shipping_address__full_name",
+    )
+    date_hierarchy = "created_at"
     readonly_fields = (
         "public_id", "order_number", "user", "subtotal",
         "discount_amount", "total", "guest_email", "is_guest_order_display", "created_at",
@@ -229,13 +277,15 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
         # correctly — never editable directly, use the actions instead.
         "status",
         "allocation_breakdown",
+        "business_events",
+        "admin_history",
     )
     inlines = [OrderItemInline, ShippingAddressInline]
     # Shipping is a detail action only (ship_order): it must capture a
     # tracking number per order, which a bulk action cannot.
     actions = ["verify_cod_orders", "pack_orders", "mark_delivered", "cancel_orders"]
     actions_list = ["new_in_store_sale"]
-    actions_detail = ["ship_order"]
+    actions_detail = ["ship_order", "create_return"]
 
     def has_add_permission(self, request):
         # The generic add form would create an Order with no items,
@@ -279,6 +329,14 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
         }),
         ("Timestamps", {
             "fields": ("created_at", "delivered_at", "tracking_number"),
+        }),
+        ("Timeline", {
+            "fields": ("business_events", "admin_history"),
+            "description": (
+                "Business events come from the order's own records. Admin action "
+                "history lists actions run in this admin; changes made through the "
+                "API or services directly do not appear there."
+            ),
         }),
     )
 
@@ -342,6 +400,73 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
                 rows,
             ),
         )
+
+    @admin.display(description="Business events")
+    def business_events(self, obj):
+        """Events derived from data the order already stores (no history
+        model). Shipping and cancellation times are not stored on the order;
+        they appear in the admin action history when done in the admin."""
+        events = [(obj.created_at, f"Order placed ({obj.get_channel_display()})", obj.created_by)]
+        if obj.cod_verified_at:
+            events.append((obj.cod_verified_at, "COD verified", obj.cod_verified_by))
+        consumed = (
+            StockMovement.objects.filter(source_order_item__order=obj)
+            .select_related("performed_by").order_by("created_at").first()
+        )
+        if consumed:
+            events.append((consumed.created_at, "Stock consumed (packed / sold)", consumed.performed_by))
+        if obj.tracking_number:
+            events.append((None, f"Shipped, tracking {obj.tracking_number}", None))
+        if obj.delivered_at:
+            events.append((obj.delivered_at, "Delivered", None))
+        for return_request in obj.returns.all():
+            events.append((
+                return_request.created_at,
+                f"Return #{return_request.pk} requested (now {return_request.get_status_display()})",
+                None,
+            ))
+            for refund in return_request.refunds.select_related("processed_by"):
+                if refund.processed_at:
+                    events.append((
+                        refund.processed_at,
+                        f"Refund {refund.get_refund_status_display().lower()} ({refund.refund_amount})",
+                        refund.processed_by,
+                    ))
+        dated = sorted((e for e in events if e[0]), key=lambda e: e[0])
+        undated = [e for e in events if not e[0]]
+        return format_html(
+            "<table><tbody>{}</tbody></table>",
+            format_html_join(
+                "", "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                ((when or "time not recorded", label, who or "—") for when, label, who in dated + undated),
+            ),
+        )
+
+    @admin.display(description="Admin action history")
+    def admin_history(self, obj):
+        """LogEntry rows for this order and its returns and refunds."""
+        return_ids = list(obj.returns.values_list("pk", flat=True))
+        refund_ids = list(Refund.objects.filter(return_request__order=obj).values_list("pk", flat=True))
+        targets = Q(content_type=ContentType.objects.get_for_model(Order), object_id=str(obj.pk))
+        if return_ids:
+            targets |= Q(
+                content_type=ContentType.objects.get_for_model(Return),
+                object_id__in=[str(pk) for pk in return_ids],
+            )
+        if refund_ids:
+            targets |= Q(
+                content_type=ContentType.objects.get_for_model(Refund),
+                object_id__in=[str(pk) for pk in refund_ids],
+            )
+        entries = LogEntry.objects.filter(targets).select_related("user").order_by("-action_time")
+        rows = format_html_join(
+            "", "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            (
+                (entry.action_time, entry.user, entry.object_repr, entry.get_change_message())
+                for entry in entries
+            ),
+        )
+        return format_html("<table><tbody>{}</tbody></table>", rows) if entries else "—"
 
     @action(
         description="New in-store sale",
@@ -421,6 +546,17 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
             return True
         return Order.objects.filter(pk=object_id, status=Order.STATUS_PROCESSING).exists()
 
+    def has_process_return_permission(self, request, object_id=None):
+        # Shown only on delivered online orders; create_return() still
+        # applies every eligibility rule on submit.
+        if not self._has_orders_perm(request, "process_return"):
+            return False
+        if object_id is None:
+            return True
+        return Order.objects.filter(
+            pk=object_id, status=Order.STATUS_DELIVERED,
+        ).exclude(channel=Order.CHANNEL_IN_STORE).exists()
+
     def _run_order_action(self, request, queryset, service_fn, error_cls, verb, log_message):
         count = 0
         for order in queryset:
@@ -494,6 +630,41 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
             order_services.OrderTransitionError, "Cancelled", "Cancelled order.",
         )
 
+    @action(
+        description="Create return", url_path="create-return", permissions=["process_return"],
+        icon="assignment_return",
+    )
+    def create_return(self, request, object_id):
+        """Staff-created return (phone/WhatsApp). Calls
+        order_services.create_return() unchanged, so the customer rules
+        apply exactly; any failure creates nothing."""
+        order = get_object_or_404(Order, pk=object_id)
+        change_url = reverse("admin:orders_order_change", args=[order.pk])
+        order_items = order.items.select_related("variant__edition__product__brand").order_by("pk")
+        form = StaffReturnForm(request.POST or None, order_items=order_items)
+        if request.method == "POST" and form.is_valid():
+            try:
+                return_request = order_services.create_return(
+                    order, form.cleaned_data["items"], requested_by=request.user,
+                )
+            except order_services.ReturnEligibilityError as exc:
+                form.add_error(None, str(exc))
+            else:
+                self._record(request, order, f"Created return #{return_request.pk} for the customer.")
+                ReturnAdmin(Return, self.admin_site)._record(
+                    request, return_request, "Created by staff for the customer.",
+                )
+                self.message_user(
+                    request, f"Return #{return_request.pk} created (requested).", level=messages.SUCCESS,
+                )
+                return redirect(reverse("admin:orders_return_change", args=[return_request.pk]))
+        return self._action_page(
+            request, order, f"Create return for {order.order_number}", form,
+            "Enter what the customer is returning. The same rules as a customer return apply: "
+            "delivered orders only, within the return window, up to the quantity bought.",
+            "Create return", change_url,
+        )
+
     @action(description="Ship order", url_path="ship", permissions=["ship_order"], icon="local_shipping")
     def ship_order(self, request, object_id):
         """GET shows the tracking-number form; only a valid POST ships the
@@ -543,6 +714,7 @@ class ReturnItemInline(admin.TabularInline):
 class ReturnAdmin(StaffActionMixin, ModelAdmin):
     list_display = ("id", "order", "status", "created_at")
     list_filter = ("status", "created_at")
+    date_hierarchy = "created_at"
     search_fields = ("order__order_number",)
     # base_shipping_refund_override is intentionally editable — it's the
     # staff override point ("unless an explicit staff override is used")
@@ -574,8 +746,19 @@ class ReturnAdmin(StaffActionMixin, ModelAdmin):
     def has_delete_permission(self, request, obj=None):
         return False
 
+    def get_readonly_fields(self, request, obj=None):
+        readonly = tuple(super().get_readonly_fields(request, obj))
+        # The shipping-refund override changes what the customer is paid;
+        # warehouse staff edit this page only to record received quantities.
+        if not self._has_orders_perm(request, "process_refund"):
+            readonly += ("base_shipping_refund_override",)
+        return readonly
+
     def has_process_return_permission(self, request):
         return self._has_orders_perm(request, "process_return")
+
+    def has_receive_return_permission(self, request):
+        return self._has_orders_perm(request, "receive_return")
 
     def has_process_refund_permission(self, request):
         return self._has_orders_perm(request, "process_refund")
@@ -623,7 +806,7 @@ class ReturnAdmin(StaffActionMixin, ModelAdmin):
             order_services.ReturnTransitionError, "Cancelled",
         )
 
-    @admin.action(description="Mark selected returns as In Transit", permissions=["process_return"])
+    @admin.action(description="Mark selected returns as In Transit", permissions=["receive_return"])
     def mark_in_transit(self, request, queryset):
         self._run_action(
             request, queryset, order_services.mark_return_in_transit,
@@ -632,7 +815,7 @@ class ReturnAdmin(StaffActionMixin, ModelAdmin):
 
     @admin.action(
         description="Mark selected returns as Received (requires received_quantity set on every line)",
-        permissions=["process_return"],
+        permissions=["receive_return"],
     )
     def mark_received(self, request, queryset):
         self._run_action(
@@ -640,7 +823,7 @@ class ReturnAdmin(StaffActionMixin, ModelAdmin):
             order_services.ReturnTransitionError, "Marked received",
         )
 
-    @admin.action(description="Start inspection on selected returns", permissions=["process_return"])
+    @admin.action(description="Start inspection on selected returns", permissions=["receive_return"])
     def start_inspection(self, request, queryset):
         self._run_action(
             request, queryset, order_services.start_inspection,
@@ -785,6 +968,7 @@ class RefundAdmin(StaffActionMixin, ModelAdmin):
         "refund_method", "refund_reference", "processed_at",
     )
     list_filter = ("refund_status", "refund_method")
+    date_hierarchy = "created_at"
     search_fields = ("return_request__order__order_number", "refund_reference")
     form = RefundProcessingForm
     actions = ["mark_processing"]

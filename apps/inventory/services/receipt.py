@@ -17,13 +17,9 @@ from decimal import Decimal
 from ..models import InventoryStock, StockMovement, StockTransaction
 
 
-def receive_purchased_stock(*, warehouse, supplier, lines, performed_by, notes=""):
-    """Add physically received units to stock.
-
-    `lines` is a list of objects with variant_id, stock_type and quantity
-    (goods receipt lines). Creates one StockTransaction and one
-    purchase_in StockMovement per line, linked back to the line. Returns
-    the StockTransaction."""
+def _increase_stock(warehouse, lines):
+    """Lock (creating if missing) one stock row per (variant, stock type),
+    in sorted order, and add the lines' quantities."""
     per_stock = defaultdict(int)
     for line in lines:
         per_stock[(line.variant_id, line.stock_type)] += line.quantity
@@ -40,6 +36,44 @@ def receive_purchased_stock(*, warehouse, supplier, lines, performed_by, notes="
         stock = stocks[key]
         stock.quantity += quantity
         stock.save(update_fields=["quantity", "updated_at"])
+
+
+def receive_opening_stock(*, warehouse, lines, performed_by, notes=""):
+    """Add opening (cutover) stock from an opening goods receipt. Same
+    stock locking as a purchase, but recorded as one opening_stock
+    StockTransaction with opening_in movements and no supplier, so it never
+    appears as a purchase. Returns the StockTransaction."""
+    _increase_stock(warehouse, lines)
+    transaction_group = StockTransaction.objects.create(
+        transaction_type=StockTransaction.TYPE_OPENING_STOCK,
+        performed_by=performed_by,
+        notes=notes,
+    )
+    StockMovement.objects.bulk_create([
+        StockMovement(
+            transaction_group=transaction_group,
+            variant_id=line.variant_id,
+            warehouse=warehouse,
+            stock_type=line.stock_type,
+            movement_type=StockMovement.MOVEMENT_OPENING_IN,
+            quantity_delta=Decimal(line.quantity),
+            reason=StockMovement.REASON_OPENING_STOCK,
+            source_receipt_line=line,
+            performed_by=performed_by,
+        )
+        for line in lines
+    ])
+    return transaction_group
+
+
+def receive_purchased_stock(*, warehouse, supplier, lines, performed_by, notes=""):
+    """Add physically received units to stock.
+
+    `lines` is a list of objects with variant_id, stock_type and quantity
+    (goods receipt lines). Creates one StockTransaction and one
+    purchase_in StockMovement per line, linked back to the line. Returns
+    the StockTransaction."""
+    _increase_stock(warehouse, lines)
 
     transaction_group = StockTransaction.objects.create(
         transaction_type=StockTransaction.TYPE_PURCHASE_RECEIPT,

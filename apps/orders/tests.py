@@ -3867,3 +3867,269 @@ class RefundAdminActionTests(TestCase):
         from apps.orders.admin import RefundAdmin
         readonly = RefundAdmin(Refund, django_admin.site).get_readonly_fields(request, self.refund)
         self.assertIn("refund_method", readonly)
+
+
+# ── Admin ERP Phase 2: changelist query counts ───────────────────────────────
+
+from apps.core.test_utils import AdminQueryCountMixin  # noqa: E402
+
+
+class OrdersAdminQueryCountTests(AdminQueryCountMixin, TestCase):
+    def setUp(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="orderquery", email="orderquery@example.com", password="testpass123",
+        ))
+        self.variant = _make_variant()
+
+    def _order(self, i):
+        order = _plain_order(100 + i, Order.STATUS_DELIVERED)
+        OrderItem.objects.create(
+            order=order, variant=self.variant, quantity=1, unit_price=Decimal("500.00"),
+            line_total=Decimal("500.00"),
+        )
+        return order
+
+    def test_order_changelist(self):
+        self.assertChangelistQueriesFlat(ORDER_CHANGELIST, self._order)
+
+    def test_return_changelist(self):
+        self.assertChangelistQueriesFlat(
+            RETURN_CHANGELIST, lambda i: Return.objects.create(order=self._order(i)),
+        )
+
+    def test_return_item_changelist(self):
+        def make(i):
+            order = self._order(i)
+            ReturnItem.objects.create(
+                return_request=Return.objects.create(order=order),
+                order_item=order.items.get(), reason=ReturnItem.REASON_WRONG_VARIANT,
+                requested_quantity=1,
+            )
+        self.assertChangelistQueriesFlat("/admin/orders/returnitem/", make)
+
+    def test_refund_changelist(self):
+        def make(i):
+            Refund.objects.create(
+                return_request=Return.objects.create(order=self._order(i)),
+                refund_amount=Decimal("100.00"),
+            )
+        self.assertChangelistQueriesFlat(REFUND_CHANGELIST, make)
+
+
+# ── Admin ERP Phase 2: operational search and date hierarchy ─────────────────
+
+from apps.orders.models import ShippingAddress  # noqa: E402
+
+
+class OrdersAdminSearchTests(TestCase):
+    def setUp(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="ordersearch", email="ordersearch@example.com", password="testpass123",
+        ))
+        self.match = _plain_order(200, Order.STATUS_PENDING)
+        ShippingAddress.objects.create(
+            order=self.match, full_name="Ayesha Khan", mobile="9876500011",
+            address_line1="1 Lane", city="Pune", state="MH", pincode="411001",
+        )
+        self.other = _plain_order(201, Order.STATUS_PENDING)
+        ShippingAddress.objects.create(
+            order=self.other, full_name="Rohan Mehta", mobile="9876500022",
+            address_line1="2 Lane", city="Pune", state="MH", pincode="411001",
+        )
+
+    def _results(self, query):
+        resp = self.client.get(ORDER_CHANGELIST, {"q": query})
+        return set(resp.context["cl"].result_list)
+
+    def test_search_by_shipping_mobile(self):
+        self.assertEqual(self._results("9876500011"), {self.match})
+
+    def test_search_by_shipping_name(self):
+        self.assertEqual(self._results("Ayesha"), {self.match})
+
+    def test_search_by_customer_name(self):
+        User.objects.filter(pk=self.other.user_id).update(first_name="Zubin")
+        self.assertEqual(self._results("Zubin"), {self.other})
+
+    def test_date_hierarchy(self):
+        from apps.orders.admin import RefundAdmin, ReturnAdmin
+        self.assertEqual(OrderAdmin.date_hierarchy, "created_at")
+        self.assertEqual(ReturnAdmin.date_hierarchy, "created_at")
+        self.assertEqual(RefundAdmin.date_hierarchy, "created_at")
+        self.assertEqual(self.client.get(ORDER_CHANGELIST).status_code, 200)
+
+
+# ── Admin ERP Phase 2: order timeline ────────────────────────────────────────
+
+class OrderTimelineTests(TestCase):
+    def setUp(self):
+        self.staff = User.objects.create_superuser(
+            username="timeline", email="timeline@example.com", password="testpass123",
+        )
+        self.client.force_login(self.staff)
+        self.order = _plain_order(
+            300, Order.STATUS_DELIVERED, payment_method=Order.PAYMENT_METHOD_COD,
+            cod_verified_at=timezone.now(), cod_verified_by=self.staff,
+            delivered_at=timezone.now(), tracking_number="AWB-T1",
+        )
+        self.return_request = Return.objects.create(order=self.order)
+        self.refund = Refund.objects.create(
+            return_request=self.return_request, refund_amount=Decimal("100.00"),
+            refund_status=Refund.STATUS_COMPLETED, processed_at=timezone.now(), processed_by=self.staff,
+        )
+        LogEntry.objects.log_actions(
+            user_id=self.staff.pk, queryset=[self.order], action_flag=2,
+            change_message="Shipped order (tracking AWB-T1).", single_object=True,
+        )
+        LogEntry.objects.log_actions(
+            user_id=self.staff.pk, queryset=[self.refund], action_flag=2,
+            change_message="Completed refund.", single_object=True,
+        )
+        self.url = reverse("admin:orders_order_change", args=[self.order.pk])
+
+    def test_business_events_panel(self):
+        resp = self.client.get(self.url)
+        self.assertContains(resp, "Business events")
+        self.assertContains(resp, "Order placed")
+        self.assertContains(resp, "COD verified")
+        self.assertContains(resp, "Delivered")
+        self.assertContains(resp, f"Return #{self.return_request.pk} requested")
+        self.assertContains(resp, "Refund completed")
+        self.assertContains(resp, "AWB-T1")
+
+    def test_admin_action_history_includes_order_and_related_records(self):
+        resp = self.client.get(self.url)
+        self.assertContains(resp, "Admin action history")
+        self.assertContains(resp, "Shipped order (tracking AWB-T1).")
+        self.assertContains(resp, "Completed refund.")
+
+    def test_timeline_is_read_only(self):
+        request = RequestFactory().get("/")
+        request.user = self.staff
+        form_class = OrderAdmin(Order, django_admin.site).get_form(request, self.order)
+        self.assertNotIn("business_events", form_class.base_fields)
+        self.assertNotIn("admin_history", form_class.base_fields)
+
+
+# ── Admin ERP Phase 2: return decision vs warehouse handling permissions ─────
+
+class ReturnPermissionSplitTests(TestCase):
+    def setUp(self):
+        self.order = _plain_order(400, Order.STATUS_DELIVERED)
+
+    def _run(self, action, status, confirm=True):
+        return_request = Return.objects.create(order=self.order, status=status)
+        data = {"action": action, "_selected_action": [return_request.pk]}
+        if confirm:
+            data["confirm"] = "yes"
+        self.client.post(RETURN_CHANGELIST, data)
+        return_request.refresh_from_db()
+        return return_request.status
+
+    def test_process_return_cannot_do_warehouse_handling(self):
+        self.client.force_login(_admin_staff("returndecider", "view_return", "process_return"))
+        self.assertEqual(self._run("mark_in_transit", Return.STATUS_APPROVED), Return.STATUS_APPROVED)
+        self.assertEqual(self._run("start_inspection", Return.STATUS_RECEIVED), Return.STATUS_RECEIVED)
+
+    def test_receive_return_handles_but_cannot_decide(self):
+        self.client.force_login(_admin_staff("returnwarehouse", "view_return", "receive_return"))
+        self.assertEqual(self._run("mark_in_transit", Return.STATUS_APPROVED), Return.STATUS_IN_TRANSIT)
+        self.assertEqual(
+            self._run("start_inspection", Return.STATUS_RECEIVED), Return.STATUS_INSPECTION_PENDING,
+        )
+        for action in ("approve_returns", "reject_returns", "cancel_returns"):
+            self.assertEqual(self._run(action, Return.STATUS_REQUESTED), Return.STATUS_REQUESTED, action)
+
+
+# ── Admin ERP Phase 2: staff-created returns ─────────────────────────────────
+
+class StaffCreateReturnTests(TestCase):
+    def setUp(self):
+        self.variant = _make_variant()
+        self.order = _plain_order(500, Order.STATUS_DELIVERED, delivered_at=timezone.now())
+        self.item = OrderItem.objects.create(
+            order=self.order, variant=self.variant, quantity=2,
+            unit_price=Decimal("500.00"), line_total=Decimal("1000.00"),
+        )
+        self.url = reverse("admin:orders_order_create_return", args=[self.order.pk])
+
+    def _data(self, quantity="1", reason=ReturnItem.REASON_TRANSIT_DAMAGE):
+        return {
+            f"quantity_{self.item.pk}": quantity,
+            f"reason_{self.item.pk}": reason,
+            f"notes_{self.item.pk}": "called in",
+        }
+
+    def test_requires_process_return(self):
+        self.client.force_login(_admin_staff("noreturnperm", "view_order", "receive_return"))
+        self.assertEqual(self.client.post(self.url, self._data()).status_code, 403)
+        self.assertFalse(Return.objects.exists())
+
+    def test_get_changes_nothing(self):
+        self.client.force_login(_admin_staff("returndesk1", "view_order", "process_return"))
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, f'name="quantity_{self.item.pk}"')
+        self.assertFalse(Return.objects.exists())
+
+    def test_creates_requested_return_through_service(self):
+        staff = _admin_staff("returndesk2", "view_order", "process_return")
+        self.client.force_login(staff)
+        self.client.post(self.url, self._data())
+        return_request = Return.objects.get(order=self.order)
+        self.assertEqual(return_request.status, Return.STATUS_REQUESTED)
+        item = return_request.items.get()
+        self.assertEqual(
+            (item.order_item_id, item.requested_quantity, item.reason, item.reason_notes),
+            (self.item.pk, 1, ReturnItem.REASON_TRANSIT_DAMAGE, "called in"),
+        )
+        self.assertTrue(_logged(return_request))
+
+    def test_customer_eligibility_rules_apply(self):
+        Order.objects.filter(pk=self.order.pk).update(delivered_at=timezone.now() - timedelta(days=5))
+        self.client.force_login(_admin_staff("returndesk3", "view_order", "process_return"))
+        resp = self.client.post(self.url, self._data())
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "Return window has closed")
+        self.assertFalse(Return.objects.exists())
+
+    def test_quantity_cap_applies(self):
+        self.client.force_login(_admin_staff("returndesk4", "view_order", "process_return"))
+        resp = self.client.post(self.url, self._data(quantity="3"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(Return.objects.exists())
+
+    def test_needs_at_least_one_item_and_a_reason(self):
+        self.client.force_login(_admin_staff("returndesk5", "view_order", "process_return"))
+        self.client.post(self.url, self._data(quantity="0"))
+        self.client.post(self.url, self._data(reason=""))
+        self.assertFalse(Return.objects.exists())
+
+    def test_in_store_order_refused(self):
+        Order.objects.filter(pk=self.order.pk).update(channel=Order.CHANNEL_IN_STORE)
+        self.client.force_login(_admin_staff("returndesk6", "view_order", "process_return"))
+        self.client.post(self.url, self._data())
+        self.assertFalse(Return.objects.exists())
+
+    def test_hidden_unless_delivered_online_order(self):
+        staff = _admin_staff("returndesk7", "view_order", "process_return")
+        request = RequestFactory().get("/")
+        request.user = staff
+        model_admin = OrderAdmin(Order, django_admin.site)
+        self.assertTrue(model_admin.has_process_return_permission(request, self.order.pk))
+        Order.objects.filter(pk=self.order.pk).update(status=Order.STATUS_SHIPPED)
+        self.assertFalse(model_admin.has_process_return_permission(request, self.order.pk))
+
+
+class ReturnShippingOverridePermissionTests(TestCase):
+    def test_shipping_refund_override_needs_process_refund(self):
+        from apps.orders.admin import ReturnAdmin
+        return_request = Return.objects.create(order=_plain_order(600, Order.STATUS_DELIVERED))
+        model_admin = ReturnAdmin(Return, django_admin.site)
+        request = RequestFactory().get("/")
+        request.user = _admin_staff("warehousereturns", "view_return", "change_return", "receive_return")
+        self.assertIn("base_shipping_refund_override", model_admin.get_readonly_fields(request, return_request))
+        request.user = _admin_staff("financereturns", "view_return", "change_return", "process_refund")
+        self.assertNotIn(
+            "base_shipping_refund_override", model_admin.get_readonly_fields(request, return_request),
+        )

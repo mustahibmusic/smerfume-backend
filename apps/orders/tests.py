@@ -4039,3 +4039,83 @@ class ReturnPermissionSplitTests(TestCase):
         )
         for action in ("approve_returns", "reject_returns", "cancel_returns"):
             self.assertEqual(self._run(action, Return.STATUS_REQUESTED), Return.STATUS_REQUESTED, action)
+
+
+# ── Admin ERP Phase 2: staff-created returns ─────────────────────────────────
+
+class StaffCreateReturnTests(TestCase):
+    def setUp(self):
+        self.variant = _make_variant()
+        self.order = _plain_order(500, Order.STATUS_DELIVERED, delivered_at=timezone.now())
+        self.item = OrderItem.objects.create(
+            order=self.order, variant=self.variant, quantity=2,
+            unit_price=Decimal("500.00"), line_total=Decimal("1000.00"),
+        )
+        self.url = reverse("admin:orders_order_create_return", args=[self.order.pk])
+
+    def _data(self, quantity="1", reason=ReturnItem.REASON_TRANSIT_DAMAGE):
+        return {
+            f"quantity_{self.item.pk}": quantity,
+            f"reason_{self.item.pk}": reason,
+            f"notes_{self.item.pk}": "called in",
+        }
+
+    def test_requires_process_return(self):
+        self.client.force_login(_admin_staff("noreturnperm", "view_order", "receive_return"))
+        self.assertEqual(self.client.post(self.url, self._data()).status_code, 403)
+        self.assertFalse(Return.objects.exists())
+
+    def test_get_changes_nothing(self):
+        self.client.force_login(_admin_staff("returndesk1", "view_order", "process_return"))
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, f'name="quantity_{self.item.pk}"')
+        self.assertFalse(Return.objects.exists())
+
+    def test_creates_requested_return_through_service(self):
+        staff = _admin_staff("returndesk2", "view_order", "process_return")
+        self.client.force_login(staff)
+        self.client.post(self.url, self._data())
+        return_request = Return.objects.get(order=self.order)
+        self.assertEqual(return_request.status, Return.STATUS_REQUESTED)
+        item = return_request.items.get()
+        self.assertEqual(
+            (item.order_item_id, item.requested_quantity, item.reason, item.reason_notes),
+            (self.item.pk, 1, ReturnItem.REASON_TRANSIT_DAMAGE, "called in"),
+        )
+        self.assertTrue(_logged(return_request))
+
+    def test_customer_eligibility_rules_apply(self):
+        Order.objects.filter(pk=self.order.pk).update(delivered_at=timezone.now() - timedelta(days=5))
+        self.client.force_login(_admin_staff("returndesk3", "view_order", "process_return"))
+        resp = self.client.post(self.url, self._data())
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "Return window has closed")
+        self.assertFalse(Return.objects.exists())
+
+    def test_quantity_cap_applies(self):
+        self.client.force_login(_admin_staff("returndesk4", "view_order", "process_return"))
+        resp = self.client.post(self.url, self._data(quantity="3"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(Return.objects.exists())
+
+    def test_needs_at_least_one_item_and_a_reason(self):
+        self.client.force_login(_admin_staff("returndesk5", "view_order", "process_return"))
+        self.client.post(self.url, self._data(quantity="0"))
+        self.client.post(self.url, self._data(reason=""))
+        self.assertFalse(Return.objects.exists())
+
+    def test_in_store_order_refused(self):
+        Order.objects.filter(pk=self.order.pk).update(channel=Order.CHANNEL_IN_STORE)
+        self.client.force_login(_admin_staff("returndesk6", "view_order", "process_return"))
+        self.client.post(self.url, self._data())
+        self.assertFalse(Return.objects.exists())
+
+    def test_hidden_unless_delivered_online_order(self):
+        staff = _admin_staff("returndesk7", "view_order", "process_return")
+        request = RequestFactory().get("/")
+        request.user = staff
+        model_admin = OrderAdmin(Order, django_admin.site)
+        self.assertTrue(model_admin.has_process_return_permission(request, self.order.pk))
+        Order.objects.filter(pk=self.order.pk).update(status=Order.STATUS_SHIPPED)
+        self.assertFalse(model_admin.has_process_return_permission(request, self.order.pk))

@@ -118,6 +118,47 @@ class FailRefundForm(forms.Form):
     failure_reason = forms.CharField(widget=UnfoldAdminTextareaWidget)
 
 
+class StaffReturnForm(forms.Form):
+    """One quantity / reason / notes row per order item. Eligibility (window,
+    quantity caps, in-store) is left entirely to create_return()."""
+
+    def __init__(self, *args, order_items=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.order_items = list(order_items)
+        reasons = [("", "—")] + list(ReturnItem.REASON_CHOICES)
+        for item in self.order_items:
+            self.fields[f"quantity_{item.pk}"] = forms.IntegerField(
+                label=f"{item.variant} (bought {item.quantity})", min_value=0, initial=0,
+                required=False, widget=UnfoldAdminIntegerFieldWidget,
+            )
+            self.fields[f"reason_{item.pk}"] = forms.ChoiceField(
+                label="Reason", choices=reasons, required=False, widget=UnfoldAdminSelectWidget,
+            )
+            self.fields[f"notes_{item.pk}"] = forms.CharField(
+                label="Notes", required=False, widget=UnfoldAdminTextInputWidget,
+            )
+
+    def clean(self):
+        cleaned = super().clean()
+        items = []
+        for item in self.order_items:
+            quantity = cleaned.get(f"quantity_{item.pk}") or 0
+            if not quantity:
+                continue
+            reason = cleaned.get(f"reason_{item.pk}")
+            if not reason:
+                self.add_error(f"reason_{item.pk}", "Choose a reason for this item.")
+                continue
+            items.append({
+                "order_item": item, "requested_quantity": quantity, "reason": reason,
+                "reason_notes": cleaned.get(f"notes_{item.pk}", ""),
+            })
+        if not items and not self.errors:
+            raise forms.ValidationError("Enter a quantity for at least one item.")
+        cleaned["items"] = items
+        return cleaned
+
+
 class StaffActionMixin:
     """Shared helpers for state-changing admin actions: a confirmation step
     for bulk actions, the confirmed-action page for detail actions, and an
@@ -244,7 +285,7 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
     # tracking number per order, which a bulk action cannot.
     actions = ["verify_cod_orders", "pack_orders", "mark_delivered", "cancel_orders"]
     actions_list = ["new_in_store_sale"]
-    actions_detail = ["ship_order"]
+    actions_detail = ["ship_order", "create_return"]
 
     def has_add_permission(self, request):
         # The generic add form would create an Order with no items,
@@ -505,6 +546,17 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
             return True
         return Order.objects.filter(pk=object_id, status=Order.STATUS_PROCESSING).exists()
 
+    def has_process_return_permission(self, request, object_id=None):
+        # Shown only on delivered online orders; create_return() still
+        # applies every eligibility rule on submit.
+        if not self._has_orders_perm(request, "process_return"):
+            return False
+        if object_id is None:
+            return True
+        return Order.objects.filter(
+            pk=object_id, status=Order.STATUS_DELIVERED,
+        ).exclude(channel=Order.CHANNEL_IN_STORE).exists()
+
     def _run_order_action(self, request, queryset, service_fn, error_cls, verb, log_message):
         count = 0
         for order in queryset:
@@ -576,6 +628,41 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
         self._run_order_action(
             request, queryset, order_services.cancel_order,
             order_services.OrderTransitionError, "Cancelled", "Cancelled order.",
+        )
+
+    @action(
+        description="Create return", url_path="create-return", permissions=["process_return"],
+        icon="assignment_return",
+    )
+    def create_return(self, request, object_id):
+        """Staff-created return (phone/WhatsApp). Calls
+        order_services.create_return() unchanged, so the customer rules
+        apply exactly; any failure creates nothing."""
+        order = get_object_or_404(Order, pk=object_id)
+        change_url = reverse("admin:orders_order_change", args=[order.pk])
+        order_items = order.items.select_related("variant__edition__product__brand").order_by("pk")
+        form = StaffReturnForm(request.POST or None, order_items=order_items)
+        if request.method == "POST" and form.is_valid():
+            try:
+                return_request = order_services.create_return(
+                    order, form.cleaned_data["items"], requested_by=request.user,
+                )
+            except order_services.ReturnEligibilityError as exc:
+                form.add_error(None, str(exc))
+            else:
+                self._record(request, order, f"Created return #{return_request.pk} for the customer.")
+                ReturnAdmin(Return, self.admin_site)._record(
+                    request, return_request, "Created by staff for the customer.",
+                )
+                self.message_user(
+                    request, f"Return #{return_request.pk} created (requested).", level=messages.SUCCESS,
+                )
+                return redirect(reverse("admin:orders_return_change", args=[return_request.pk]))
+        return self._action_page(
+            request, order, f"Create return for {order.order_number}", form,
+            "Enter what the customer is returning. The same rules as a customer return apply: "
+            "delivered orders only, within the return window, up to the quantity bought.",
+            "Create return", change_url,
         )
 
     @action(description="Ship order", url_path="ship", permissions=["ship_order"], icon="local_shipping")

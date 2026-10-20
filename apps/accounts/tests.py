@@ -1014,3 +1014,23 @@ class SetupStaffGroupsTests(TestCase):
     def test_dry_run_changes_nothing(self):
         self._run("--dry-run")
         self.assertFalse(Group.objects.exists())
+
+
+class SupplierPaymentGroupPermissionTests(TestCase):
+    """DEC-010: Finance records and reverses supplier payments; only
+    Manager classifies pre-existing POs; Warehouse and Ops get nothing."""
+
+    def test_payment_permission_matrix(self):
+        call_command("setup_staff_groups", stdout=StringIO())
+        ops, warehouse, finance, manager = (
+            _group_codes(n) for n in ("Ops", "Warehouse", "Finance", "Manager")
+        )
+        payment_perms = {
+            "purchases.record_po_payment", "purchases.reverse_po_payment",
+            "purchases.view_purchaseorderpayment",
+        }
+        self.assertTrue(payment_perms <= finance)
+        self.assertNotIn("purchases.set_po_tax_treatment", finance)
+        self.assertTrue(payment_perms | {"purchases.set_po_tax_treatment"} <= manager)
+        for group in (ops, warehouse):
+            self.assertFalse(group & (payment_perms | {"purchases.set_po_tax_treatment"}))

@@ -4009,3 +4009,33 @@ class OrderTimelineTests(TestCase):
         form_class = OrderAdmin(Order, django_admin.site).get_form(request, self.order)
         self.assertNotIn("business_events", form_class.base_fields)
         self.assertNotIn("admin_history", form_class.base_fields)
+
+
+# ── Admin ERP Phase 2: return decision vs warehouse handling permissions ─────
+
+class ReturnPermissionSplitTests(TestCase):
+    def setUp(self):
+        self.order = _plain_order(400, Order.STATUS_DELIVERED)
+
+    def _run(self, action, status, confirm=True):
+        return_request = Return.objects.create(order=self.order, status=status)
+        data = {"action": action, "_selected_action": [return_request.pk]}
+        if confirm:
+            data["confirm"] = "yes"
+        self.client.post(RETURN_CHANGELIST, data)
+        return_request.refresh_from_db()
+        return return_request.status
+
+    def test_process_return_cannot_do_warehouse_handling(self):
+        self.client.force_login(_admin_staff("returndecider", "view_return", "process_return"))
+        self.assertEqual(self._run("mark_in_transit", Return.STATUS_APPROVED), Return.STATUS_APPROVED)
+        self.assertEqual(self._run("start_inspection", Return.STATUS_RECEIVED), Return.STATUS_RECEIVED)
+
+    def test_receive_return_handles_but_cannot_decide(self):
+        self.client.force_login(_admin_staff("returnwarehouse", "view_return", "receive_return"))
+        self.assertEqual(self._run("mark_in_transit", Return.STATUS_APPROVED), Return.STATUS_IN_TRANSIT)
+        self.assertEqual(
+            self._run("start_inspection", Return.STATUS_RECEIVED), Return.STATUS_INSPECTION_PENDING,
+        )
+        for action in ("approve_returns", "reject_returns", "cancel_returns"):
+            self.assertEqual(self._run(action, Return.STATUS_REQUESTED), Return.STATUS_REQUESTED, action)

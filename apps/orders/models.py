@@ -289,7 +289,10 @@ class Return(BaseModel):
     class Meta:
         db_table = "orders_return"
         ordering = ["-created_at"]
-        permissions = [("process_return", "Can process return")]
+        permissions = [
+            ("process_return", "Can approve, reject, cancel or create return"),
+            ("receive_return", "Can receive return (in transit, received, inspection)"),
+        ]
         constraints = [
             models.CheckConstraint(
                 condition=models.Q(base_shipping_refund_amount__gte=0),

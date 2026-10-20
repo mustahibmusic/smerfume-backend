@@ -662,6 +662,9 @@ class ReturnAdmin(StaffActionMixin, ModelAdmin):
     def has_process_return_permission(self, request):
         return self._has_orders_perm(request, "process_return")
 
+    def has_receive_return_permission(self, request):
+        return self._has_orders_perm(request, "receive_return")
+
     def has_process_refund_permission(self, request):
         return self._has_orders_perm(request, "process_refund")
 
@@ -708,7 +711,7 @@ class ReturnAdmin(StaffActionMixin, ModelAdmin):
             order_services.ReturnTransitionError, "Cancelled",
         )
 
-    @admin.action(description="Mark selected returns as In Transit", permissions=["process_return"])
+    @admin.action(description="Mark selected returns as In Transit", permissions=["receive_return"])
     def mark_in_transit(self, request, queryset):
         self._run_action(
             request, queryset, order_services.mark_return_in_transit,
@@ -717,7 +720,7 @@ class ReturnAdmin(StaffActionMixin, ModelAdmin):
 
     @admin.action(
         description="Mark selected returns as Received (requires received_quantity set on every line)",
-        permissions=["process_return"],
+        permissions=["receive_return"],
     )
     def mark_received(self, request, queryset):
         self._run_action(
@@ -725,7 +728,7 @@ class ReturnAdmin(StaffActionMixin, ModelAdmin):
             order_services.ReturnTransitionError, "Marked received",
         )
 
-    @admin.action(description="Start inspection on selected returns", permissions=["process_return"])
+    @admin.action(description="Start inspection on selected returns", permissions=["receive_return"])
     def start_inspection(self, request, queryset):
         self._run_action(
             request, queryset, order_services.start_inspection,

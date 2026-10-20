@@ -1934,3 +1934,180 @@ class InventoryAdminFilterTests(TestCase):
 
     def test_stock_movement_date_hierarchy(self):
         self.assertEqual(StockMovementAdmin.date_hierarchy, "created_at")
+
+
+# ── Admin ERP Phase 2: stock-type transfer ───────────────────────────────────
+
+class StockTypeTransferServiceTests(TestCase):
+    def setUp(self):
+        self.staff = User.objects.create_superuser(
+            username="transferstaff", email="transferstaff@example.com", password="testpass123",
+        )
+        self.warehouse = Warehouse.objects.get(is_default=True)
+        self.variant = _make_variant("SKU-XFER-100ML")
+
+    def _stock(self, stock_type, quantity, reserved=0):
+        return InventoryStock.objects.create(
+            variant=self.variant, warehouse=self.warehouse, stock_type=stock_type,
+            quantity=Decimal(quantity), quantity_reserved=Decimal(reserved),
+        )
+
+    def _transfer(self, stock, to_type, quantity):
+        return adjustment_service.transfer_stock_type(
+            stock, to_type=to_type, quantity=quantity,
+            reason=StockMovement.REASON_MARKETING_USE, notes="tester shelf", performed_by=self.staff,
+        )
+
+    def _qty(self, stock_type):
+        return InventoryStock.objects.get(
+            variant=self.variant, warehouse=self.warehouse, stock_type=stock_type,
+        ).quantity
+
+    def test_retail_to_tester_creates_target_and_paired_movements(self):
+        retail = self._stock("retail", 10)
+        txn = self._transfer(retail, "tester", 2)
+        self.assertEqual((self._qty("retail"), self._qty("tester")), (Decimal("8"), Decimal("2")))
+        self.assertEqual(txn.transaction_type, StockTransaction.TYPE_STOCK_TYPE_TRANSFER)
+        movements = {m.movement_type: m for m in StockMovement.objects.filter(transaction_group=txn)}
+        self.assertEqual(set(movements), {
+            StockMovement.MOVEMENT_STOCK_TYPE_TRANSFER_OUT, StockMovement.MOVEMENT_STOCK_TYPE_TRANSFER_IN,
+        })
+        out = movements[StockMovement.MOVEMENT_STOCK_TYPE_TRANSFER_OUT]
+        into = movements[StockMovement.MOVEMENT_STOCK_TYPE_TRANSFER_IN]
+        self.assertEqual((out.stock_type, out.quantity_delta), ("retail", Decimal("-2")))
+        self.assertEqual((into.stock_type, into.quantity_delta), ("tester", Decimal("2")))
+        self.assertEqual(out.performed_by, self.staff)
+        self.assertEqual(out.reason, StockMovement.REASON_MARKETING_USE)
+
+    def test_existing_target_row_is_incremented(self):
+        retail = self._stock("retail", 10)
+        self._stock("damaged", 1)
+        self._transfer(retail, "damaged", 3)
+        self.assertEqual(self._qty("damaged"), Decimal("4"))
+
+    def test_allowed_directions(self):
+        retail = self._stock("retail", 10)
+        for to_type in ("tester", "damaged", "promotional"):
+            self._transfer(retail, to_type, 1)
+        for from_type in ("tester", "promotional"):
+            self._transfer(InventoryStock.objects.get(variant=self.variant, stock_type=from_type), "damaged", 1)
+        self.assertEqual(self._qty("damaged"), Decimal("3"))
+
+    def test_blocked_directions(self):
+        stocks = {t: self._stock(t, 5) for t in ("retail", "tester", "damaged", "promotional")}
+        blocked = [
+            ("damaged", "retail"), ("damaged", "tester"), ("damaged", "promotional"),
+            ("tester", "retail"), ("promotional", "retail"), ("tester", "promotional"),
+            ("promotional", "tester"), ("retail", "retail"),
+        ]
+        for from_type, to_type in blocked:
+            with self.assertRaises(adjustment_service.InventoryAdjustmentError, msg=(from_type, to_type)):
+                self._transfer(stocks[from_type], to_type, 1)
+        for stock_type in stocks:
+            self.assertEqual(self._qty(stock_type), Decimal("5"))
+        self.assertFalse(StockTransaction.objects.filter(
+            transaction_type=StockTransaction.TYPE_STOCK_TYPE_TRANSFER,
+        ).exists())
+
+    def test_only_free_stock_moves(self):
+        retail = self._stock("retail", 10, reserved=8)
+        with self.assertRaises(adjustment_service.InventoryAdjustmentError):
+            self._transfer(retail, "damaged", 3)
+        self._transfer(retail, "damaged", 2)
+        retail.refresh_from_db()
+        self.assertEqual((retail.quantity, retail.quantity_reserved), (Decimal("8"), Decimal("8")))
+
+    def test_quantity_must_be_positive_whole_number(self):
+        retail = self._stock("retail", 10)
+        for quantity in (0, -1, Decimal("1.5")):
+            with self.assertRaises(adjustment_service.InventoryAdjustmentError):
+                self._transfer(retail, "tester", quantity)
+        self.assertEqual(self._qty("retail"), Decimal("10"))
+
+
+class StockTypeTransferConcurrencyTests(TransactionTestCase):
+    def setUp(self):
+        Warehouse.objects.filter(is_default=True).delete()
+        self.warehouse = Warehouse.objects.create(name="Smerfume Default", is_default=True)
+        self.variant = _make_variant("SKU-XFER-CONC")
+        self.stock = InventoryStock.objects.create(
+            variant=self.variant, warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal("10"),
+        )
+
+    def test_concurrent_transfers_cannot_move_more_than_free_stock(self):
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def _run(key, to_type):
+            barrier.wait()
+            try:
+                adjustment_service.transfer_stock_type(
+                    self.stock, to_type=to_type, quantity=6,
+                    reason=StockMovement.REASON_DAMAGED_GOODS,
+                )
+                results[key] = "ok"
+            except adjustment_service.InventoryAdjustmentError:
+                results[key] = "refused"
+            finally:
+                connection.close()
+
+        threads = [
+            threading.Thread(target=_run, args=("a", "damaged")),
+            threading.Thread(target=_run, args=("b", "tester")),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(results.values()), ["ok", "refused"])
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, Decimal("4"))
+
+
+class StockTypeTransferAdminTests(TestCase):
+    def setUp(self):
+        self.warehouse = Warehouse.objects.get(is_default=True)
+        self.stock = InventoryStock.objects.create(
+            variant=_make_variant("SKU-XFER-ADMIN"), warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal("10"),
+        )
+        self.url = reverse("admin:inventory_inventorystock_transfer_stock_type", args=[self.stock.pk])
+
+    def _staff(self, username, *codenames):
+        staff = User.objects.create_user(
+            username=username, email=f"{username}@example.com", password="testpass123", is_staff=True,
+        )
+        staff.user_permissions.add(*Permission.objects.filter(
+            content_type__app_label="inventory", codename__in=codenames,
+        ))
+        return staff
+
+    def _post(self, quantity="2", to_type="tester"):
+        return self.client.post(self.url, {
+            "to_type": to_type, "quantity": quantity,
+            "reason": StockMovement.REASON_MARKETING_USE, "notes": "",
+        }, follow=True)
+
+    def test_requires_transfer_permission(self):
+        self.client.force_login(self._staff("xferview", "view_inventorystock", "change_inventorystock"))
+        self.assertEqual(self.client.post(self.url, {}).status_code, 403)
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, Decimal("10"))
+
+    def test_get_changes_nothing_and_post_transfers(self):
+        self.client.force_login(self._staff("xferops", "view_inventorystock", "transfer_stock_type"))
+        resp = self.client.get(self.url)
+        self.assertContains(resp, 'name="to_type"')
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, Decimal("10"))
+        self._post()
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, Decimal("8"))
+
+    def test_service_error_shown(self):
+        self.client.force_login(self._staff("xferops2", "view_inventorystock", "transfer_stock_type"))
+        resp = self._post(quantity="20")
+        self.assertContains(resp, "free")
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, Decimal("10"))

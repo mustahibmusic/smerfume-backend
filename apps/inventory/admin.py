@@ -6,6 +6,12 @@ from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from unfold.admin import ModelAdmin
+from unfold.decorators import action
+from unfold.widgets import (
+    UnfoldAdminIntegerFieldWidget,
+    UnfoldAdminSelectWidget,
+    UnfoldAdminTextareaWidget,
+)
 
 from .models import (
     DecantSource,
@@ -109,6 +115,31 @@ class ActiveReservationFilter(admin.SimpleListFilter):
         return queryset
 
 
+TRANSFER_REASONS = (
+    StockMovement.REASON_MARKETING_USE,
+    StockMovement.REASON_DAMAGED_GOODS,
+    StockMovement.REASON_STOCKTAKING_RESULTS,
+    StockMovement.REASON_STOCK_WRITTEN_OFF,
+)
+
+
+class StockTypeTransferForm(forms.Form):
+    to_type = forms.ChoiceField(label="Move to", widget=UnfoldAdminSelectWidget)
+    quantity = forms.IntegerField(min_value=1, widget=UnfoldAdminIntegerFieldWidget)
+    reason = forms.ChoiceField(
+        choices=[c for c in StockMovement.REASON_CHOICES if c[0] in TRANSFER_REASONS],
+        widget=UnfoldAdminSelectWidget,
+    )
+    notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget)
+
+    def __init__(self, *args, stock, **kwargs):
+        super().__init__(*args, **kwargs)
+        allowed = adjustment_services.ALLOWED_STOCK_TYPE_TRANSFERS.get(stock.stock_type, set())
+        self.fields["to_type"].choices = [
+            c for c in InventoryStock.STOCK_TYPE_CHOICES if c[0] in allowed
+        ]
+
+
 @admin.register(InventoryStock)
 class InventoryStockAdmin(ModelAdmin):
     list_display = (
@@ -122,6 +153,58 @@ class InventoryStockAdmin(ModelAdmin):
     )
     autocomplete_fields = ("variant",)
     form = InventoryStockAdjustmentForm
+    actions_detail = ["transfer_stock_type"]
+
+    def has_transfer_stock_type_permission(self, request, object_id=None):
+        if not request.user.has_perm("inventory.transfer_stock_type"):
+            return False
+        if object_id is None:
+            return True
+        return InventoryStock.objects.filter(
+            pk=object_id, stock_type__in=list(adjustment_services.ALLOWED_STOCK_TYPE_TRANSFERS),
+        ).exists()
+
+    @action(
+        description="Transfer stock type", url_path="transfer",
+        permissions=["transfer_stock_type"], icon="swap_horiz",
+    )
+    def transfer_stock_type(self, request, object_id):
+        """GET shows the form; only POST moves free units, through
+        adjustment_services.transfer_stock_type()."""
+        stock = get_object_or_404(InventoryStock.objects.select_related("variant", "warehouse"), pk=object_id)
+        change_url = reverse("admin:inventory_inventorystock_change", args=[stock.pk])
+        form = StockTypeTransferForm(request.POST or None, stock=stock)
+        if request.method == "POST" and form.is_valid():
+            data = form.cleaned_data
+            try:
+                adjustment_services.transfer_stock_type(
+                    stock, to_type=data["to_type"], quantity=data["quantity"],
+                    reason=data["reason"], notes=data["notes"], performed_by=request.user,
+                )
+            except adjustment_services.InventoryAdjustmentError as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+            else:
+                self.log_change(request, stock, f"Transferred {data['quantity']} to {data['to_type']}.")
+                self.message_user(
+                    request, f"Moved {data['quantity']} unit(s) to {data['to_type']}.", level=messages.SUCCESS,
+                )
+            return redirect(change_url)
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Transfer stock type: {stock.variant} [{stock.stock_type}]",
+            "opts": self.model._meta,
+            "form": form,
+            "message": (
+                f"Free units: {stock.available} (reserved units never move). "
+                "Damaged stock cannot be moved back, and testers or promotional stock "
+                "cannot return to retail."
+            ),
+            "rows": [],
+            "button_label": "Transfer",
+            "button_class": "bg-primary-600",
+            "back_url": change_url,
+        }
+        return TemplateResponse(request, "admin/purchases/po_action.html", context)
 
     def has_delete_permission(self, request, obj=None):
         return False

@@ -14,7 +14,7 @@ from decimal import Decimal
 
 from django.db import transaction
 
-from ..models import InventoryStock, PartialBottleLot, StockMovement
+from ..models import InventoryStock, PartialBottleLot, StockMovement, StockTransaction
 
 
 class InventoryAdjustmentError(Exception):
@@ -76,3 +76,73 @@ def adjust_partial_lot(lot, ml_delta, reason, notes="", performed_by=None):
         reason=reason, notes=notes, partial_lot=lot, performed_by=performed_by,
     )
     return lot
+
+
+# Stock-type transfers staff may make (approved directions only). Damaged
+# stock never moves back, and tester/promotional stock never returns to
+# retail.
+ALLOWED_STOCK_TYPE_TRANSFERS = {
+    InventoryStock.STOCK_TYPE_RETAIL: {
+        InventoryStock.STOCK_TYPE_TESTER,
+        InventoryStock.STOCK_TYPE_DAMAGED,
+        InventoryStock.STOCK_TYPE_PROMOTIONAL,
+    },
+    InventoryStock.STOCK_TYPE_TESTER: {InventoryStock.STOCK_TYPE_DAMAGED},
+    InventoryStock.STOCK_TYPE_PROMOTIONAL: {InventoryStock.STOCK_TYPE_DAMAGED},
+}
+
+
+@transaction.atomic
+def transfer_stock_type(stock, to_type, quantity, reason, notes="", performed_by=None):
+    """Move whole units of FREE stock (quantity - quantity_reserved) from
+    one stock type to another for the same variant and warehouse, e.g.
+    retail -> tester. Both rows are locked in stock-type order; the target
+    row is created if missing. Records one stock_type_transfer
+    StockTransaction with a transfer_out and a transfer_in movement.
+    Reserved units never move."""
+    from_type = stock.stock_type
+    if to_type not in ALLOWED_STOCK_TYPE_TRANSFERS.get(from_type, set()):
+        raise InventoryAdjustmentError(f"Transfers from {from_type} to {to_type} are not allowed.")
+    quantity = Decimal(quantity)
+    if quantity <= 0 or quantity != quantity.to_integral_value():
+        raise InventoryAdjustmentError("Quantity must be a whole number greater than 0.")
+
+    InventoryStock.objects.get_or_create(
+        variant_id=stock.variant_id, warehouse_id=stock.warehouse_id, stock_type=to_type,
+        defaults={"quantity": Decimal("0")},
+    )
+    rows = {
+        row.stock_type: row
+        for row in InventoryStock.objects.select_for_update().filter(
+            variant_id=stock.variant_id, warehouse_id=stock.warehouse_id,
+            stock_type__in=[from_type, to_type],
+        ).order_by("stock_type")
+    }
+    source, target = rows[from_type], rows[to_type]
+    if quantity > source.available:
+        raise InventoryAdjustmentError(
+            f"Only {source.available} free unit(s) of {from_type} stock can be transferred; "
+            f"{source.quantity_reserved} are reserved."
+        )
+
+    source.quantity -= quantity
+    target.quantity += quantity
+    source.save(update_fields=["quantity", "updated_at"])
+    target.save(update_fields=["quantity", "updated_at"])
+
+    transaction_group = StockTransaction.objects.create(
+        transaction_type=StockTransaction.TYPE_STOCK_TYPE_TRANSFER,
+        performed_by=performed_by,
+        notes=notes,
+    )
+    for row, movement_type, delta in (
+        (source, StockMovement.MOVEMENT_STOCK_TYPE_TRANSFER_OUT, -quantity),
+        (target, StockMovement.MOVEMENT_STOCK_TYPE_TRANSFER_IN, quantity),
+    ):
+        StockMovement.objects.create(
+            transaction_group=transaction_group, variant_id=row.variant_id,
+            warehouse_id=row.warehouse_id, stock_type=row.stock_type,
+            movement_type=movement_type, quantity_delta=delta,
+            reason=reason, notes=notes, performed_by=performed_by,
+        )
+    return transaction_group

@@ -420,7 +420,7 @@ class PurchaseOrderAdmin(ModelAdmin):
             ("Remaining against PO (operational)", "-" if remaining is None else remaining),
             ("Payment status", dict(PAYMENT_STATUS_CHOICES)[obj.payment_status]),
         ]
-        entries = obj.payment_entries.select_related("recorded_by", "reverses").order_by("entry_date", "pk")
+        entries = obj.payment_entries.select_related("recorded_by", "reverses", "reversal").order_by("entry_date", "pk")
         rows = format_html_join(
             "", "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             (

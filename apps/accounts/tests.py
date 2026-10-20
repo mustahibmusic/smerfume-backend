@@ -867,3 +867,58 @@ class AccountsAdminQueryCountTests(AdminQueryCountMixin, TestCase):
             user = _make_user(mobile=f"+91982000{i:04d}", username=f"qprof{i}")
             CustomerProfile.objects.get_or_create(user=user)
         self.assertChangelistQueriesFlat("/admin/accounts/customerprofile/", make)
+
+
+# ── Admin ERP Phase 2: customer operations view ──────────────────────────────
+
+from decimal import Decimal  # noqa: E402
+
+from apps.orders.models import Order, Return, ShippingAddress  # noqa: E402
+
+
+class CustomerOperationsViewTests(TestCase):
+    def setUp(self):
+        self.client.force_login(get_user_model().objects.create_superuser(
+            username="custops", email="custops@example.com", password="testpass123",
+        ))
+        self.customer = _make_user(mobile="+919830000001", username="opscustomer")
+        self.order = Order.objects.create(
+            user=self.customer, order_number="SMR-CUST-000001",
+            subtotal=Decimal("900.00"), total=Decimal("900.00"), status=Order.STATUS_DELIVERED,
+        )
+        ShippingAddress.objects.create(
+            order=self.order, full_name="Ops Customer", mobile="9830000001",
+            address_line1="7 Hill Road", city="Nashik", state="MH", pincode="422001",
+        )
+        self.return_request = Return.objects.create(order=self.order)
+        other = _make_user(mobile="+919830000002", username="othercustomer")
+        self.other_order = Order.objects.create(
+            user=other, order_number="SMR-CUST-000002",
+            subtotal=Decimal("100.00"), total=Decimal("100.00"),
+        )
+
+    def _assert_panel(self, response):
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "SMR-CUST-000001")
+        self.assertContains(response, reverse("admin:orders_order_change", args=[self.order.pk]))
+        self.assertContains(response, reverse("admin:orders_return_change", args=[self.return_request.pk]))
+        self.assertContains(response, "Nashik")
+        self.assertContains(response, f"user__id__exact={self.customer.pk}")
+        self.assertNotContains(response, "SMR-CUST-000002")
+
+    def test_user_change_page_shows_customer_activity(self):
+        self._assert_panel(self.client.get(
+            reverse("admin:accounts_user_change", args=[self.customer.pk])
+        ))
+
+    def test_customer_profile_page_shows_customer_activity(self):
+        profile, _ = CustomerProfile.objects.get_or_create(user=self.customer)
+        self._assert_panel(self.client.get(
+            reverse("admin:accounts_customerprofile_change", args=[profile.pk])
+        ))
+
+    def test_view_all_orders_link_filters_by_customer(self):
+        response = self.client.get(
+            reverse("admin:orders_order_changelist"), {"user__id__exact": self.customer.pk}
+        )
+        self.assertEqual(set(response.context["cl"].result_list), {self.order})

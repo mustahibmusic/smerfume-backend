@@ -3347,7 +3347,7 @@ class PackOrderIncomingGateTests(TestCase):
         self.client.login(username="p2bstaff@example.com", password="testpass123")
         resp = self.client.post(
             "/admin/orders/order/",
-            {"action": "pack_orders", "_selected_action": [self.order.pk]},
+            {"action": "pack_orders", "_selected_action": [self.order.pk], "confirm": "yes"},
             follow=True,
         )
         self.assertEqual(resp.status_code, 200)
@@ -3490,3 +3490,380 @@ class OrderAdminAwaitingIncomingTests(TestCase):
         self.assertContains(resp, self.line.purchase_order.po_number)
         self.assertContains(resp, "Incoming")
         self.assertContains(resp, "Physical")
+
+
+# ── Admin ERP Phase 1: action permissions, confirmations, audit ──────────────
+
+from django.contrib.admin.models import LogEntry  # noqa: E402
+from django.contrib.auth.models import Permission  # noqa: E402
+from django.urls import reverse  # noqa: E402
+
+ORDER_CHANGELIST = "/admin/orders/order/"
+RETURN_CHANGELIST = "/admin/orders/return/"
+REFUND_CHANGELIST = "/admin/orders/refund/"
+
+
+def _admin_staff(username, *codenames):
+    """Staff user with only the given orders-app permissions."""
+    staff = User.objects.create_user(
+        username=username, email=f"{username}@example.com", password="testpass123", is_staff=True,
+    )
+    staff.user_permissions.add(
+        *Permission.objects.filter(content_type__app_label="orders", codename__in=codenames)
+    )
+    return staff
+
+
+def _plain_order(number, status, **extra):
+    return Order.objects.create(
+        user=_make_user(mobile=f"+9197{number:08d}", username=f"oc{number}"),
+        order_number=f"SMR-ERP-{number:06d}",
+        subtotal=Decimal("500.00"), total=Decimal("500.00"), status=status, **extra,
+    )
+
+
+def _logged(obj):
+    return LogEntry.objects.filter(object_id=str(obj.pk)).exists()
+
+
+class OrderAdminActionPermissionTests(TestCase):
+    VIEW = ("view_order",)
+
+    def _post_action(self, action, order, confirm=False):
+        data = {"action": action, "_selected_action": [order.pk]}
+        if confirm:
+            data["confirm"] = "yes"
+        return self.client.post(ORDER_CHANGELIST, data)
+
+    def test_view_only_staff_sees_no_actions(self):
+        self.client.force_login(_admin_staff("orderviewer", *self.VIEW))
+        resp = self.client.get(ORDER_CHANGELIST)
+        self.assertEqual(resp.status_code, 200)
+        for action in ("verify_cod_orders", "pack_orders", "mark_delivered", "cancel_orders"):
+            self.assertNotContains(resp, f'value="{action}"')
+
+    def test_view_only_staff_cannot_force_any_action(self):
+        self.client.force_login(_admin_staff("orderviewer2", *self.VIEW))
+        cases = [
+            ("verify_cod_orders", _plain_order(1, Order.STATUS_PENDING, payment_method=Order.PAYMENT_METHOD_COD)),
+            ("pack_orders", _plain_order(2, Order.STATUS_CONFIRMED)),
+            ("mark_delivered", _plain_order(3, Order.STATUS_SHIPPED)),
+            ("cancel_orders", _plain_order(4, Order.STATUS_PENDING)),
+        ]
+        for action, order in cases:
+            before = order.status
+            self._post_action(action, order, confirm=True)
+            order.refresh_from_db()
+            self.assertEqual(order.status, before, action)
+
+    def test_change_permission_alone_does_not_allow_cancel(self):
+        self.client.force_login(_admin_staff("orderchanger", "view_order", "change_order"))
+        order = _plain_order(5, Order.STATUS_PENDING)
+        self._post_action("cancel_orders", order, confirm=True)
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.STATUS_PENDING)
+
+    def test_bulk_mark_shipped_is_removed(self):
+        superuser = User.objects.create_superuser(
+            username="erpsuper", email="erpsuper@example.com", password="testpass123",
+        )
+        request = RequestFactory().get(ORDER_CHANGELIST)
+        request.user = superuser
+        actions = OrderAdmin(Order, django_admin.site).get_actions(request)
+        self.assertNotIn("mark_shipped", actions)
+
+    def test_verify_cod_runs_without_confirmation_and_is_logged(self):
+        self.client.force_login(_admin_staff("codverifier", "view_order", "verify_cod_order"))
+        order = _plain_order(6, Order.STATUS_PENDING, payment_method=Order.PAYMENT_METHOD_COD)
+        self._post_action("verify_cod_orders", order)
+        order.refresh_from_db()
+        self.assertEqual(order.status, Order.STATUS_CONFIRMED)
+        self.assertTrue(_logged(order))
+
+    def _assert_confirmed_flow(self, action, perm, status_before, status_after, number):
+        self.client.force_login(_admin_staff(f"erp{action}", "view_order", perm))
+        order = _plain_order(number, status_before)
+        resp = self._post_action(action, order)
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, order.order_number)
+        self.assertContains(resp, 'name="confirm"')
+        order.refresh_from_db()
+        self.assertEqual(order.status, status_before)
+        self.assertFalse(_logged(order))
+
+        self._post_action(action, order, confirm=True)
+        order.refresh_from_db()
+        self.assertEqual(order.status, status_after)
+        self.assertTrue(_logged(order))
+
+    def test_pack_requires_confirmation(self):
+        self._assert_confirmed_flow(
+            "pack_orders", "pack_order", Order.STATUS_CONFIRMED, Order.STATUS_PROCESSING, 7,
+        )
+
+    def test_deliver_requires_confirmation(self):
+        self._assert_confirmed_flow(
+            "mark_delivered", "deliver_order", Order.STATUS_SHIPPED, Order.STATUS_DELIVERED, 8,
+        )
+
+    def test_cancel_requires_confirmation(self):
+        self._assert_confirmed_flow(
+            "cancel_orders", "cancel_order", Order.STATUS_PENDING, Order.STATUS_CANCELLED, 9,
+        )
+
+
+class OrderAdminShipWorkflowTests(TestCase):
+    def setUp(self):
+        self.order = _plain_order(20, Order.STATUS_PROCESSING)
+        self.url = reverse("admin:orders_order_ship_order", args=[self.order.pk])
+
+    def test_requires_ship_permission(self):
+        self.client.force_login(_admin_staff("shipviewer", "view_order", "change_order"))
+        resp = self.client.post(self.url, {"tracking_number": "AWB1"})
+        self.assertEqual(resp.status_code, 403)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_PROCESSING)
+
+    def test_get_shows_form_and_changes_nothing(self):
+        self.client.force_login(_admin_staff("shipper1", "view_order", "ship_order"))
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, 'name="tracking_number"')
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_PROCESSING)
+
+    def test_tracking_number_is_required(self):
+        self.client.force_login(_admin_staff("shipper2", "view_order", "ship_order"))
+        self.client.post(self.url, {"tracking_number": "  "})
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_PROCESSING)
+        self.assertIsNone(self.order.tracking_number)
+
+    def test_post_ships_with_tracking_number_and_logs(self):
+        self.client.force_login(_admin_staff("shipper3", "view_order", "ship_order"))
+        self.client.post(self.url, {"tracking_number": "AWB-12345"})
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_SHIPPED)
+        self.assertEqual(self.order.tracking_number, "AWB-12345")
+        self.assertTrue(_logged(self.order))
+
+    def test_hidden_unless_processing(self):
+        staff = _admin_staff("shipper4", "view_order", "ship_order")
+        request = RequestFactory().get("/")
+        request.user = staff
+        model_admin = OrderAdmin(Order, django_admin.site)
+        self.assertTrue(model_admin.has_ship_order_permission(request, self.order.pk))
+        Order.objects.filter(pk=self.order.pk).update(status=Order.STATUS_SHIPPED)
+        self.assertFalse(model_admin.has_ship_order_permission(request, self.order.pk))
+
+    def test_service_error_shown_and_nothing_changes(self):
+        self.client.force_login(_admin_staff("shipper5", "view_order", "ship_order"))
+        with patch.object(
+            order_services, "mark_order_shipped",
+            side_effect=order_services.OrderTransitionError("not processing"),
+        ):
+            resp = self.client.post(self.url, {"tracking_number": "AWB9"}, follow=True)
+        self.assertContains(resp, "not processing")
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, Order.STATUS_PROCESSING)
+        self.assertIsNone(self.order.tracking_number)
+
+
+class ReturnAdminActionPermissionTests(TestCase):
+    def setUp(self):
+        self.order = _plain_order(30, Order.STATUS_DELIVERED)
+
+    def _return(self, status):
+        return Return.objects.create(order=self.order, status=status)
+
+    def _post(self, action, obj, confirm=False):
+        data = {"action": action, "_selected_action": [obj.pk]}
+        if confirm:
+            data["confirm"] = "yes"
+        return self.client.post(RETURN_CHANGELIST, data)
+
+    def test_view_only_staff_cannot_run_return_actions(self):
+        self.client.force_login(_admin_staff("returnviewer", "view_return"))
+        cases = [
+            ("approve_returns", Return.STATUS_REQUESTED),
+            ("reject_returns", Return.STATUS_REQUESTED),
+            ("cancel_returns", Return.STATUS_REQUESTED),
+            ("mark_in_transit", Return.STATUS_APPROVED),
+            ("start_inspection", Return.STATUS_RECEIVED),
+        ]
+        for action, status in cases:
+            return_request = self._return(status)
+            self._post(action, return_request, confirm=True)
+            return_request.refresh_from_db()
+            self.assertEqual(return_request.status, status, action)
+
+    def test_approve_needs_process_return_and_no_confirmation(self):
+        self.client.force_login(_admin_staff("returnops", "view_return", "process_return"))
+        return_request = self._return(Return.STATUS_REQUESTED)
+        self._post("approve_returns", return_request)
+        return_request.refresh_from_db()
+        self.assertEqual(return_request.status, Return.STATUS_APPROVED)
+        self.assertTrue(_logged(return_request))
+
+    def test_reject_requires_confirmation(self):
+        self.client.force_login(_admin_staff("returnops2", "view_return", "process_return"))
+        return_request = self._return(Return.STATUS_REQUESTED)
+        resp = self._post("reject_returns", return_request)
+        self.assertContains(resp, 'name="confirm"')
+        return_request.refresh_from_db()
+        self.assertEqual(return_request.status, Return.STATUS_REQUESTED)
+        self._post("reject_returns", return_request, confirm=True)
+        return_request.refresh_from_db()
+        self.assertEqual(return_request.status, Return.STATUS_REJECTED)
+        self.assertTrue(_logged(return_request))
+
+    def test_create_refund_requires_process_refund(self):
+        self.client.force_login(
+            _admin_staff("returnops3", "view_return", "process_return", "add_refund")
+        )
+        return_request = self._return(Return.STATUS_COMPLETED)
+        with patch.object(order_services, "create_refund_for_return") as create:
+            self._post("create_refund", return_request)
+        create.assert_not_called()
+
+        staff = _admin_staff("refundcreator", "view_return", "process_refund")
+        self.client.force_login(staff)
+        with patch.object(order_services, "create_refund_for_return") as create:
+            self._post("create_refund", return_request)
+        create.assert_called_once()
+        self.assertEqual(create.call_args.kwargs["approved_by"], staff)
+
+
+class ReturnItemInlineReceivedQuantityTests(TestCase):
+    def setUp(self):
+        self.superuser = User.objects.create_superuser(
+            username="inlinesuper", email="inlinesuper@example.com", password="testpass123",
+        )
+        self.request = RequestFactory().get("/")
+        self.request.user = self.superuser
+        from apps.orders.admin import ReturnItemInline
+        self.inline = ReturnItemInline(Return, django_admin.site)
+        self.order = _plain_order(40, Order.STATUS_DELIVERED)
+
+    def test_editable_before_receipt(self):
+        for status in (Return.STATUS_APPROVED, Return.STATUS_IN_TRANSIT):
+            return_request = Return.objects.create(order=self.order, status=status)
+            self.assertNotIn(
+                "received_quantity", self.inline.get_readonly_fields(self.request, return_request),
+            )
+
+    def test_readonly_once_received(self):
+        for status in (
+            Return.STATUS_REQUESTED, Return.STATUS_RECEIVED, Return.STATUS_INSPECTION_PENDING,
+            Return.STATUS_COMPLETED, Return.STATUS_REJECTED, Return.STATUS_CANCELLED,
+        ):
+            return_request = Return.objects.create(order=self.order, status=status)
+            self.assertIn(
+                "received_quantity", self.inline.get_readonly_fields(self.request, return_request),
+                status,
+            )
+
+
+class RefundAdminActionTests(TestCase):
+    def setUp(self):
+        order = _plain_order(50, Order.STATUS_DELIVERED)
+        return_request = Return.objects.create(order=order, status=Return.STATUS_COMPLETED)
+        self.refund = Refund.objects.create(
+            return_request=return_request, refund_amount=Decimal("100.00"),
+            refund_method=Refund.METHOD_UPI,
+        )
+
+    def _set_status(self, status):
+        Refund.objects.filter(pk=self.refund.pk).update(refund_status=status)
+
+    def _url(self, name):
+        return reverse(f"admin:orders_refund_{name}", args=[self.refund.pk])
+
+    def test_view_only_staff_cannot_mark_processing(self):
+        self.client.force_login(_admin_staff("refundviewer", "view_refund"))
+        self.client.post(REFUND_CHANGELIST, {
+            "action": "mark_processing", "_selected_action": [self.refund.pk], "confirm": "yes",
+        })
+        self.refund.refresh_from_db()
+        self.assertEqual(self.refund.refund_status, Refund.STATUS_PENDING)
+
+    def test_bulk_mark_processing_requires_confirmation(self):
+        self.client.force_login(_admin_staff("refundops", "view_refund", "process_refund"))
+        data = {"action": "mark_processing", "_selected_action": [self.refund.pk]}
+        resp = self.client.post(REFUND_CHANGELIST, data)
+        self.assertContains(resp, 'name="confirm"')
+        self.refund.refresh_from_db()
+        self.assertEqual(self.refund.refund_status, Refund.STATUS_PENDING)
+        self.client.post(REFUND_CHANGELIST, {**data, "confirm": "yes"})
+        self.refund.refresh_from_db()
+        self.assertEqual(self.refund.refund_status, Refund.STATUS_PROCESSING)
+        self.assertTrue(_logged(self.refund))
+
+    def test_detail_mark_processing(self):
+        self.client.force_login(_admin_staff("refundops2", "view_refund", "process_refund"))
+        url = self._url("process_refund_detail")
+        self.assertEqual(self.client.get(url).status_code, 200)
+        self.refund.refresh_from_db()
+        self.assertEqual(self.refund.refund_status, Refund.STATUS_PENDING)
+        self.client.post(url)
+        self.refund.refresh_from_db()
+        self.assertEqual(self.refund.refund_status, Refund.STATUS_PROCESSING)
+
+    def test_complete_requires_complete_refund_permission(self):
+        self._set_status(Refund.STATUS_PROCESSING)
+        self.client.force_login(
+            _admin_staff("refundops3", "view_refund", "change_refund", "process_refund")
+        )
+        resp = self.client.post(self._url("complete_refund_detail"), {"refund_reference": "UTR1"})
+        self.assertEqual(resp.status_code, 403)
+        self.refund.refresh_from_db()
+        self.assertEqual(self.refund.refund_status, Refund.STATUS_PROCESSING)
+
+    def test_complete_refund_flow(self):
+        self._set_status(Refund.STATUS_PROCESSING)
+        staff = _admin_staff("refundfinance", "view_refund", "complete_refund")
+        self.client.force_login(staff)
+        url = self._url("complete_refund_detail")
+        resp = self.client.get(url)
+        self.assertContains(resp, 'name="refund_reference"')
+        self.client.post(url, {"refund_reference": ""})
+        self.refund.refresh_from_db()
+        self.assertEqual(self.refund.refund_status, Refund.STATUS_PROCESSING)
+        self.client.post(url, {"refund_reference": "UTR-777", "notes": "paid"})
+        self.refund.refresh_from_db()
+        self.assertEqual(self.refund.refund_status, Refund.STATUS_COMPLETED)
+        self.assertEqual(self.refund.refund_reference, "UTR-777")
+        self.assertEqual(self.refund.processed_by, staff)
+        self.assertTrue(_logged(self.refund))
+
+    def test_fail_refund_flow(self):
+        self._set_status(Refund.STATUS_PROCESSING)
+        self.client.force_login(_admin_staff("refundfinance2", "view_refund", "complete_refund"))
+        url = self._url("fail_refund_detail")
+        self.client.post(url, {"failure_reason": ""})
+        self.refund.refresh_from_db()
+        self.assertEqual(self.refund.refund_status, Refund.STATUS_PROCESSING)
+        self.client.post(url, {"failure_reason": "Bank rejected"})
+        self.refund.refresh_from_db()
+        self.assertEqual(self.refund.refund_status, Refund.STATUS_FAILED)
+        self.assertEqual(self.refund.failure_reason, "Bank rejected")
+
+    def test_change_form_cannot_complete_refund(self):
+        self._set_status(Refund.STATUS_PROCESSING)
+        superuser = User.objects.create_superuser(
+            username="refundsuper", email="refundsuper@example.com", password="testpass123",
+        )
+        request = RequestFactory().get("/")
+        request.user = superuser
+        from apps.orders.admin import RefundAdmin
+        form_class = RefundAdmin(Refund, django_admin.site).get_form(request, self.refund)
+        for name in ("action", "refund_reference", "failure_reason"):
+            self.assertNotIn(name, form_class.base_fields)
+
+    def test_refund_method_readonly_without_process_refund(self):
+        staff = _admin_staff("refundchanger", "view_refund", "change_refund")
+        request = RequestFactory().get("/")
+        request.user = staff
+        from apps.orders.admin import RefundAdmin
+        readonly = RefundAdmin(Refund, django_admin.site).get_readonly_fields(request, self.refund)
+        self.assertIn("refund_method", readonly)

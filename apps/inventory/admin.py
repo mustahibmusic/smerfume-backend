@@ -235,11 +235,15 @@ class InventoryStockAdmin(ModelAdmin):
         return ["variant", "warehouse", "stock_type", "quantity", "quantity_reserved"]
 
     def save_model(self, request, obj, form, change):
-        if form.cleaned_data.get("reorder_level") != InventoryStock.objects.get(pk=obj.pk).reorder_level:
-            InventoryStock.objects.filter(pk=obj.pk).update(reorder_level=form.cleaned_data["reorder_level"])
+        # reorder_level is plain configuration (no ledger effect); quantity
+        # changes only through adjust_inventory_stock() below.
+        reorder_level = form.cleaned_data.get("reorder_level")
+        if reorder_level != InventoryStock.objects.get(pk=obj.pk).reorder_level:
+            InventoryStock.objects.filter(pk=obj.pk).update(reorder_level=reorder_level)
+            self.message_user(request, "Reorder level updated.", level=messages.SUCCESS)
         delta = form.cleaned_data.get("quantity_delta")
         if not delta:
-            self.message_user(request, "No quantity_delta given — nothing changed.", level=messages.INFO)
+            self.message_user(request, "No quantity_delta given — quantity unchanged.", level=messages.INFO)
             return
         reason = form.cleaned_data.get("reason")
         if not reason:

@@ -967,6 +967,8 @@ class SetupStaffGroupsTests(TestCase):
         self.assertIn("orders.complete_refund", finance)
         self.assertNotIn("purchases.reverse_goodsreceipt", warehouse)
         self.assertIn("accounts.change_user", ops)
+        self.assertIn("orders.change_return", finance)
+        self.assertNotIn("orders.change_returnitem", finance)
         self.assertTrue((ops | warehouse | finance) <= manager)
 
     def test_never_grants_auth_admin_or_ledger_permissions(self):

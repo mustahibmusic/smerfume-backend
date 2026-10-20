@@ -88,6 +88,7 @@ FINANCE = (
         "purchases", "purchaseorder", "purchaseorderline", "goodsreceipt", "goodsreceiptline",
         "receiptdiscrepancy",
     ),
+    "orders.change_return",
     "orders.change_refund",
     "orders.process_refund",
     "orders.complete_refund",

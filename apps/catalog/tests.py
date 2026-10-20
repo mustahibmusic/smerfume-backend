@@ -924,6 +924,17 @@ class ProductVariantImageAdminTests(TestCase):
         self.assertTrue(ProductVariantImageInline.validate_max)
 
 
+class ProductVariantAdminListTests(CatalogTestBase):
+    def test_list_shows_real_sku_not_database_id(self):
+        from apps.catalog.admin import ProductVariantAdmin
+
+        variant = self.edition_sauvage.variants.get()
+        model_admin = ProductVariantAdmin(ProductVariant, django_admin.site)
+        title, subtitle = model_admin.display_name_formatted(variant)
+        self.assertEqual(subtitle, f"SKU: {variant.sku}")
+        self.assertNotEqual(variant.sku, str(variant.pk))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 13. ProductVariantImage — API representation
 # ─────────────────────────────────────────────────────────────────────────────

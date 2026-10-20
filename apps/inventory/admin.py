@@ -225,6 +225,10 @@ class StockTransactionAdmin(ModelAdmin):
         # (bottle opening, return disposition) — never directly.
         return False
 
+    def has_change_permission(self, request, obj=None):
+        # Ledger header: view only, for everyone including superusers.
+        return False
+
     def has_delete_permission(self, request, obj=None):
         return False
 
@@ -248,6 +252,12 @@ class StockMovementAdmin(ModelAdmin):
         # The append-only ledger — every row is written by a service
         # (reservation consumption, return disposition, manual adjustment),
         # never typed in directly.
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        # Fully read-only, for everyone including superusers: no field,
+        # including ledger links such as source_receipt_line (used by GRN
+        # reversals), may be edited by hand.
         return False
 
     def has_delete_permission(self, request, obj=None):

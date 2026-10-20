@@ -865,6 +865,23 @@ class InventoryAdminIntegrityTests(TestCase):
         self.assertFalse(admin_instance.has_add_permission(self.request))
         self.assertFalse(admin_instance.has_delete_permission(self.request, self.txn))
 
+    def test_stock_ledger_admins_have_no_change_permission_even_for_superuser(self):
+        movement_admin = StockMovementAdmin(StockMovement, django_admin.site)
+        self.assertFalse(movement_admin.has_change_permission(self.request))
+        self.assertFalse(movement_admin.has_change_permission(self.request, self.movement))
+        txn_admin = StockTransactionAdmin(StockTransaction, django_admin.site)
+        self.assertFalse(txn_admin.has_change_permission(self.request, self.txn))
+
+    def test_stock_movement_change_post_is_refused(self):
+        self.client.login(username="invadminstaff@example.com", password="testpass123")
+        url = f"/admin/inventory/stockmovement/{self.movement.pk}/change/"
+        self.assertEqual(self.client.get(url).status_code, 200)
+        response = self.client.post(url, data={"notes": "tampered", "source_receipt_line": "1"})
+        self.assertEqual(response.status_code, 403)
+        self.movement.refresh_from_db()
+        self.assertNotEqual(self.movement.notes, "tampered")
+        self.assertIsNone(self.movement.source_receipt_line_id)
+
     def test_stock_reservation_is_fully_locked(self):
         admin_instance = StockReservationAdmin(StockReservation, django_admin.site)
         self.assertFalse(admin_instance.has_add_permission(self.request))

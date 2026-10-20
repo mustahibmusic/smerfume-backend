@@ -2,7 +2,7 @@ from django import forms
 from django.contrib import admin
 from django.contrib import messages
 from django.db.models import Exists, OuterRef
-from django.shortcuts import redirect
+from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
 from django.urls import reverse
 from django.utils.html import format_html, format_html_join
@@ -98,6 +98,69 @@ InStoreSaleLineFormSet = forms.formset_factory(
 )
 
 
+class ShipOrderForm(forms.Form):
+    # Required here even though mark_order_shipped() accepts none: shipping
+    # from the admin must always record the courier tracking number.
+    tracking_number = forms.CharField(max_length=100, widget=UnfoldAdminTextInputWidget)
+
+
+class CompleteRefundForm(forms.Form):
+    refund_reference = forms.CharField(
+        max_length=100, widget=UnfoldAdminTextInputWidget,
+        help_text="UTR / bank reference / gateway refund id.",
+    )
+    notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget)
+
+
+class FailRefundForm(forms.Form):
+    failure_reason = forms.CharField(widget=UnfoldAdminTextareaWidget)
+
+
+class StaffActionMixin:
+    """Shared helpers for state-changing admin actions: a confirmation step
+    for bulk actions, the confirmed-action page for detail actions, and an
+    admin history (LogEntry) record of who ran each action."""
+
+    def _has_orders_perm(self, request, codename):
+        return request.user.has_perm(f"orders.{codename}")
+
+    def _confirm_bulk(self, request, queryset, action, message, button_label):
+        """Return a confirmation page until the POST carries confirm=yes;
+        then return None so the caller performs the action."""
+        if request.POST.get("confirm") == "yes":
+            return None
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Please confirm",
+            "opts": self.model._meta,
+            "queryset": queryset,
+            "action": action,
+            "message": message,
+            "button_label": button_label,
+            "button_class": "bg-red-600",
+            "back_url": request.get_full_path(),
+        }
+        return TemplateResponse(request, "admin/orders/confirm_bulk_action.html", context)
+
+    def _action_page(self, request, obj, title, form, message, button_label, back_url,
+                     button_class="bg-primary-600"):
+        context = {
+            **self.admin_site.each_context(request),
+            "title": title,
+            "opts": self.model._meta,
+            "form": form,
+            "message": message,
+            "rows": [],
+            "button_label": button_label,
+            "button_class": button_class,
+            "back_url": back_url,
+        }
+        return TemplateResponse(request, "admin/purchases/po_action.html", context)
+
+    def _record(self, request, obj, message):
+        self.log_change(request, obj, message)
+
+
 class OrderItemInline(admin.TabularInline):
     model = OrderItem
     extra = 0
@@ -145,7 +208,7 @@ class AwaitingIncomingFilter(admin.SimpleListFilter):
 
 
 @admin.register(Order)
-class OrderAdmin(ModelAdmin):
+class OrderAdmin(StaffActionMixin, ModelAdmin):
     list_display = (
         "order_number", "user", "channel", "status", "payment_method", "total",
         "is_guest_order_display", "guest_email", "awaiting_incoming_display", "created_at",
@@ -168,8 +231,11 @@ class OrderAdmin(ModelAdmin):
         "allocation_breakdown",
     )
     inlines = [OrderItemInline, ShippingAddressInline]
-    actions = ["verify_cod_orders", "pack_orders", "mark_shipped", "mark_delivered", "cancel_orders"]
+    # Shipping is a detail action only (ship_order): it must capture a
+    # tracking number per order, which a bulk action cannot.
+    actions = ["verify_cod_orders", "pack_orders", "mark_delivered", "cancel_orders"]
     actions_list = ["new_in_store_sale"]
+    actions_detail = ["ship_order"]
 
     def has_add_permission(self, request):
         # The generic add form would create an Order with no items,
@@ -331,85 +397,127 @@ class OrderAdmin(ModelAdmin):
         }
         return TemplateResponse(request, "admin/orders/in_store_sale.html", context)
 
-    @admin.action(description="Verify selected COD orders (confirms reservation, advances to Confirmed)")
+    # --- state-changing actions ---
+    # Each needs its own custom permission (orders.0011); view or change
+    # permission alone never runs one. Bulk actions that move or release
+    # stock show a confirmation page first.
+
+    def has_verify_cod_order_permission(self, request):
+        return self._has_orders_perm(request, "verify_cod_order")
+
+    def has_pack_order_permission(self, request):
+        return self._has_orders_perm(request, "pack_order")
+
+    def has_deliver_order_permission(self, request):
+        return self._has_orders_perm(request, "deliver_order")
+
+    def has_cancel_order_permission(self, request):
+        return self._has_orders_perm(request, "cancel_order")
+
+    def has_ship_order_permission(self, request, object_id=None):
+        if not self._has_orders_perm(request, "ship_order"):
+            return False
+        if object_id is None:
+            return True
+        return Order.objects.filter(pk=object_id, status=Order.STATUS_PROCESSING).exists()
+
+    def _run_order_action(self, request, queryset, service_fn, error_cls, verb, log_message):
+        count = 0
+        for order in queryset:
+            try:
+                service_fn(order)
+            except error_cls as exc:
+                self.message_user(request, f"{order.order_number}: {exc}", level=messages.WARNING)
+            else:
+                self._record(request, order, log_message)
+                count += 1
+        if count:
+            self.message_user(request, f"{verb} {count} order(s).", level=messages.SUCCESS)
+
+    @admin.action(
+        description="Verify selected COD orders (confirms reservation, advances to Confirmed)",
+        permissions=["verify_cod_order"],
+    )
     def verify_cod_orders(self, request, queryset):
-        verified_count = 0
-        for order in queryset:
-            try:
-                order_services.verify_cod_order(order, verified_by=request.user)
-                verified_count += 1
-            except order_services.CODVerificationError as exc:
-                self.message_user(
-                    request, f"{order.order_number}: {exc}", level=messages.WARNING
-                )
-        if verified_count:
-            self.message_user(
-                request, f"Verified {verified_count} order(s).", level=messages.SUCCESS
-            )
+        self._run_order_action(
+            request, queryset,
+            lambda order: order_services.verify_cod_order(order, verified_by=request.user),
+            order_services.CODVerificationError, "Verified", "Verified COD order.",
+        )
 
-    @admin.action(description="Pack selected orders (consumes reserved inventory, advances to Processing)")
+    @admin.action(
+        description="Pack selected orders (consumes reserved inventory, advances to Processing)",
+        permissions=["pack_order"],
+    )
     def pack_orders(self, request, queryset):
-        packed_count = 0
-        for order in queryset:
-            try:
-                order_services.pack_order(order, performed_by=request.user)
-                packed_count += 1
-            except order_services.OrderPackingError as exc:
-                self.message_user(
-                    request, f"{order.order_number}: {exc}", level=messages.WARNING
-                )
-        if packed_count:
-            self.message_user(
-                request, f"Packed {packed_count} order(s).", level=messages.SUCCESS
-            )
+        confirmation = self._confirm_bulk(
+            request, queryset, "pack_orders",
+            "Pack these orders? Their reserved stock is consumed and they move to Processing.",
+            "Pack orders",
+        )
+        if confirmation:
+            return confirmation
+        self._run_order_action(
+            request, queryset,
+            lambda order: order_services.pack_order(order, performed_by=request.user),
+            order_services.OrderPackingError, "Packed", "Packed order.",
+        )
 
-    @admin.action(description="Mark selected orders as Shipped")
-    def mark_shipped(self, request, queryset):
-        shipped_count = 0
-        for order in queryset:
-            try:
-                order_services.mark_order_shipped(order)
-                shipped_count += 1
-            except order_services.OrderTransitionError as exc:
-                self.message_user(
-                    request, f"{order.order_number}: {exc}", level=messages.WARNING
-                )
-        if shipped_count:
-            self.message_user(
-                request, f"Marked {shipped_count} order(s) as shipped.", level=messages.SUCCESS
-            )
-
-    @admin.action(description="Mark selected orders as Delivered")
+    @admin.action(description="Mark selected orders as Delivered", permissions=["deliver_order"])
     def mark_delivered(self, request, queryset):
-        delivered_count = 0
-        for order in queryset:
-            try:
-                order_services.mark_order_delivered(order)
-                delivered_count += 1
-            except order_services.OrderTransitionError as exc:
-                self.message_user(
-                    request, f"{order.order_number}: {exc}", level=messages.WARNING
-                )
-        if delivered_count:
-            self.message_user(
-                request, f"Marked {delivered_count} order(s) as delivered.", level=messages.SUCCESS
-            )
+        confirmation = self._confirm_bulk(
+            request, queryset, "mark_delivered",
+            "Mark these orders as delivered? This starts the return window.",
+            "Mark delivered",
+        )
+        if confirmation:
+            return confirmation
+        self._run_order_action(
+            request, queryset, order_services.mark_order_delivered,
+            order_services.OrderTransitionError, "Marked delivered", "Marked order delivered.",
+        )
 
-    @admin.action(description="Cancel selected orders (releases reserved inventory)")
+    @admin.action(
+        description="Cancel selected orders (releases reserved inventory)",
+        permissions=["cancel_order"],
+    )
     def cancel_orders(self, request, queryset):
-        cancelled_count = 0
-        for order in queryset:
+        confirmation = self._confirm_bulk(
+            request, queryset, "cancel_orders",
+            "Cancel these orders? Their reserved stock is released. This cannot be undone.",
+            "Cancel orders",
+        )
+        if confirmation:
+            return confirmation
+        self._run_order_action(
+            request, queryset, order_services.cancel_order,
+            order_services.OrderTransitionError, "Cancelled", "Cancelled order.",
+        )
+
+    @action(description="Ship order", url_path="ship", permissions=["ship_order"], icon="local_shipping")
+    def ship_order(self, request, object_id):
+        """GET shows the tracking-number form; only a valid POST ships the
+        order, through order_services.mark_order_shipped()."""
+        order = get_object_or_404(Order, pk=object_id)
+        change_url = reverse("admin:orders_order_change", args=[order.pk])
+        form = ShipOrderForm(request.POST or None)
+        if request.method == "POST" and form.is_valid():
+            tracking_number = form.cleaned_data["tracking_number"]
             try:
-                order_services.cancel_order(order)
-                cancelled_count += 1
+                order_services.mark_order_shipped(order, tracking_number=tracking_number)
             except order_services.OrderTransitionError as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+            else:
+                self._record(request, order, f"Shipped order (tracking {tracking_number}).")
                 self.message_user(
-                    request, f"{order.order_number}: {exc}", level=messages.WARNING
+                    request, f"{order.order_number} marked shipped.", level=messages.SUCCESS,
                 )
-        if cancelled_count:
-            self.message_user(
-                request, f"Cancelled {cancelled_count} order(s).", level=messages.SUCCESS
-            )
+            return redirect(change_url)
+        return self._action_page(
+            request, order, f"Ship {order.order_number}", form,
+            "Enter the courier tracking number. The order moves to Shipped. Stock is not changed.",
+            "Ship order", change_url,
+        )
 
 
 class ReturnItemInline(admin.TabularInline):
@@ -419,9 +527,20 @@ class ReturnItemInline(admin.TabularInline):
     readonly_fields = ("order_item", "reason", "reason_notes", "requested_quantity")
     can_delete = False
 
+    # received_quantity is a plain field only until the goods arrive: it must
+    # be set before mark_return_received(). After that the inspection form
+    # (finalize_return_item) is the only place that may change it.
+    RECEIVED_QUANTITY_EDITABLE_STATUSES = (Return.STATUS_APPROVED, Return.STATUS_IN_TRANSIT)
+
+    def get_readonly_fields(self, request, obj=None):
+        readonly = tuple(super().get_readonly_fields(request, obj))
+        if obj is None or obj.status not in self.RECEIVED_QUANTITY_EDITABLE_STATUSES:
+            readonly += ("received_quantity",)
+        return readonly
+
 
 @admin.register(Return)
-class ReturnAdmin(ModelAdmin):
+class ReturnAdmin(StaffActionMixin, ModelAdmin):
     list_display = ("id", "order", "status", "created_at")
     list_filter = ("status", "created_at")
     search_fields = ("order__order_number",)
@@ -455,62 +574,83 @@ class ReturnAdmin(ModelAdmin):
     def has_delete_permission(self, request, obj=None):
         return False
 
+    def has_process_return_permission(self, request):
+        return self._has_orders_perm(request, "process_return")
+
+    def has_process_refund_permission(self, request):
+        return self._has_orders_perm(request, "process_refund")
+
     def _run_action(self, request, queryset, service_fn, error_cls, verb):
         count = 0
         for return_request in queryset:
             try:
                 service_fn(return_request)
-                count += 1
             except error_cls as exc:
                 self.message_user(
                     request, f"Return #{return_request.pk}: {exc}", level=messages.WARNING
                 )
+            else:
+                self._record(request, return_request, f"{verb} return.")
+                count += 1
         if count:
             self.message_user(request, f"{verb} {count} return(s).", level=messages.SUCCESS)
 
-    @admin.action(description="Approve selected returns")
+    @admin.action(description="Approve selected returns", permissions=["process_return"])
     def approve_returns(self, request, queryset):
         self._run_action(
             request, queryset, order_services.approve_return,
             order_services.ReturnTransitionError, "Approved",
         )
 
-    @admin.action(description="Reject selected returns")
+    @admin.action(description="Reject selected returns", permissions=["process_return"])
     def reject_returns(self, request, queryset):
+        confirmation = self._confirm_bulk(
+            request, queryset, "reject_returns",
+            "Reject these return requests? The customer's return is closed.",
+            "Reject returns",
+        )
+        if confirmation:
+            return confirmation
         self._run_action(
             request, queryset, order_services.reject_return,
             order_services.ReturnTransitionError, "Rejected",
         )
 
-    @admin.action(description="Cancel selected returns")
+    @admin.action(description="Cancel selected returns", permissions=["process_return"])
     def cancel_returns(self, request, queryset):
         self._run_action(
             request, queryset, order_services.cancel_return,
             order_services.ReturnTransitionError, "Cancelled",
         )
 
-    @admin.action(description="Mark selected returns as In Transit")
+    @admin.action(description="Mark selected returns as In Transit", permissions=["process_return"])
     def mark_in_transit(self, request, queryset):
         self._run_action(
             request, queryset, order_services.mark_return_in_transit,
             order_services.ReturnTransitionError, "Marked in-transit",
         )
 
-    @admin.action(description="Mark selected returns as Received (requires received_quantity set on every line)")
+    @admin.action(
+        description="Mark selected returns as Received (requires received_quantity set on every line)",
+        permissions=["process_return"],
+    )
     def mark_received(self, request, queryset):
         self._run_action(
             request, queryset, order_services.mark_return_received,
             order_services.ReturnTransitionError, "Marked received",
         )
 
-    @admin.action(description="Start inspection on selected returns")
+    @admin.action(description="Start inspection on selected returns", permissions=["process_return"])
     def start_inspection(self, request, queryset):
         self._run_action(
             request, queryset, order_services.start_inspection,
             order_services.ReturnTransitionError, "Started inspection on",
         )
 
-    @admin.action(description="Create refund for selected returns (completed returns only)")
+    @admin.action(
+        description="Create refund for selected returns (completed returns only)",
+        permissions=["process_refund"],
+    )
     def create_refund(self, request, queryset):
         count = 0
         for return_request in queryset:
@@ -522,11 +662,13 @@ class ReturnAdmin(ModelAdmin):
                 order_services.create_refund_for_return(
                     return_request, approved_by=request.user,
                 )
-                count += 1
             except order_services.RefundError as exc:
                 self.message_user(
                     request, f"Return #{return_request.pk}: {exc}", level=messages.WARNING
                 )
+            else:
+                self._record(request, return_request, "Created refund.")
+                count += 1
         if count:
             self.message_user(
                 request,
@@ -624,33 +766,20 @@ class ReturnItemAdmin(ModelAdmin):
 
 class RefundProcessingForm(forms.ModelForm):
     """Like ReturnItemInspectionForm: looks like a normal ModelForm, but
-    RefundAdmin.save_model() never calls form.save()/obj.save() — every
-    field change is routed through mark_refund_processing()/complete_refund()/
-    fail_refund() instead, so refund_amount can never be hand-edited and a
-    completed refund's figures can never be silently overwritten."""
-
-    ACTION_NONE = ""
-    ACTION_COMPLETE = "complete"
-    ACTION_FAIL = "fail"
-
-    action = forms.ChoiceField(
-        choices=[
-            (ACTION_NONE, "— No change —"),
-            (ACTION_COMPLETE, "Mark Completed"),
-            (ACTION_FAIL, "Mark Failed"),
-        ],
-        required=False,
-    )
-    refund_reference = forms.CharField(required=False, help_text="UTR / bank reference / gateway refund id.")
-    failure_reason = forms.CharField(required=False, widget=forms.Textarea)
+    RefundAdmin.save_model() never calls form.save()/obj.save(). The only
+    field it offers is refund_method, routed through set_refund_method().
+    Processing, completion and failure are confirmed detail actions
+    (process_refund_detail / complete_refund_detail / fail_refund_detail),
+    so refund_amount can never be hand-edited and a completed refund's
+    figures can never be silently overwritten."""
 
     class Meta:
         model = Refund
-        fields = ["refund_method", "notes"]
+        fields = ["refund_method"]
 
 
 @admin.register(Refund)
-class RefundAdmin(ModelAdmin):
+class RefundAdmin(StaffActionMixin, ModelAdmin):
     list_display = (
         "id", "return_request", "refund_amount", "refund_status",
         "refund_method", "refund_reference", "processed_at",
@@ -659,6 +788,7 @@ class RefundAdmin(ModelAdmin):
     search_fields = ("return_request__order__order_number", "refund_reference")
     form = RefundProcessingForm
     actions = ["mark_processing"]
+    actions_detail = ["process_refund_detail", "complete_refund_detail", "fail_refund_detail"]
 
     def has_add_permission(self, request):
         # Refunds are only ever created via create_refund_for_return()
@@ -670,74 +800,152 @@ class RefundAdmin(ModelAdmin):
     def has_delete_permission(self, request, obj=None):
         return False
 
+    def _refund_in_status(self, object_id, status):
+        if object_id is None:
+            return True
+        return Refund.objects.filter(pk=object_id, refund_status=status).exists()
+
+    def has_process_refund_permission(self, request, object_id=None):
+        return self._has_orders_perm(request, "process_refund") and self._refund_in_status(
+            object_id, Refund.STATUS_PENDING
+        )
+
+    def has_complete_refund_permission(self, request, object_id=None):
+        # Money movement: completing or failing a refund needs its own
+        # permission, separate from creating/processing one.
+        return self._has_orders_perm(request, "complete_refund") and self._refund_in_status(
+            object_id, Refund.STATUS_PROCESSING
+        )
+
     def get_fields(self, request, obj=None):
         return [
             "return_request", "refund_amount", "refund_status", "refund_method",
             "refund_reference", "failure_reason", "processed_at", "processed_by",
-            "approved_by", "notes", "action",
+            "approved_by", "notes",
         ]
 
     def get_readonly_fields(self, request, obj=None):
-        always_readonly = [
-            "return_request", "refund_amount", "refund_status",
-            "processed_at", "processed_by", "approved_by",
+        readonly = [
+            "return_request", "refund_amount", "refund_status", "refund_reference",
+            "failure_reason", "processed_at", "processed_by", "approved_by", "notes",
         ]
-        if obj is not None and obj.refund_status in (Refund.STATUS_COMPLETED, Refund.STATUS_FAILED):
-            # Terminal states — nothing left to change through this form.
-            return always_readonly + ["refund_method", "refund_reference", "failure_reason", "notes"]
-        if obj is not None and obj.refund_status == Refund.STATUS_PROCESSING:
-            # The method has already been committed to processing money —
-            # only the completion fields (reference/failure reason/notes)
-            # stay editable from here.
-            return always_readonly + ["refund_method"]
-        return always_readonly
+        # The method is chosen only while the refund is pending, and only by
+        # staff who may process refunds; once processing, it is committed.
+        method_editable = (
+            obj is not None
+            and obj.refund_status == Refund.STATUS_PENDING
+            and self._has_orders_perm(request, "process_refund")
+        )
+        if not method_editable:
+            readonly.append("refund_method")
+        return readonly
 
     def save_model(self, request, obj, form, change):
-        action = form.cleaned_data.get("action")
-        method_changed = False
+        if "refund_method" not in form.cleaned_data:
+            return
+        new_method = form.cleaned_data["refund_method"]
+        if new_method == Refund.objects.get(pk=obj.pk).refund_method:
+            self.message_user(request, "No change.", level=messages.INFO)
+            return
         try:
-            # refund_method is excluded from the form once readonly (see
-            # get_readonly_fields), so it's only present here while the
-            # refund is still pending and staff explicitly picked a value.
-            if "refund_method" in form.cleaned_data:
-                new_method = form.cleaned_data["refund_method"]
-                current = Refund.objects.get(pk=obj.pk)
-                if new_method != current.refund_method:
-                    order_services.set_refund_method(obj, new_method)
-                    method_changed = True
-            if action == RefundProcessingForm.ACTION_COMPLETE:
-                order_services.complete_refund(
-                    obj,
-                    refund_reference=form.cleaned_data.get("refund_reference", ""),
-                    processed_by=request.user,
-                    notes=form.cleaned_data.get("notes", ""),
-                )
-                self.message_user(request, "Refund marked completed.", level=messages.SUCCESS)
-            elif action == RefundProcessingForm.ACTION_FAIL:
-                order_services.fail_refund(
-                    obj,
-                    failure_reason=form.cleaned_data.get("failure_reason", ""),
-                    processed_by=request.user,
-                )
-                self.message_user(request, "Refund marked failed.", level=messages.WARNING)
-            elif method_changed:
-                self.message_user(request, "Refund method updated.", level=messages.SUCCESS)
-            else:
-                self.message_user(request, "No action selected — nothing changed.", level=messages.INFO)
+            order_services.set_refund_method(obj, new_method)
         except order_services.RefundError as exc:
             self.message_user(request, str(exc), level=messages.ERROR)
+        else:
+            self._record(request, obj, f"Set refund method to {new_method}.")
+            self.message_user(request, "Refund method updated.", level=messages.SUCCESS)
 
-    @admin.action(description="Mark selected refunds as Processing")
+    def _change_url(self, refund):
+        return reverse("admin:orders_refund_change", args=[refund.pk])
+
+    def _mark_processing(self, request, refund):
+        try:
+            order_services.mark_refund_processing(refund)
+        except order_services.RefundError as exc:
+            self.message_user(request, f"Refund #{refund.pk}: {exc}", level=messages.WARNING)
+            return False
+        self._record(request, refund, "Marked refund processing.")
+        return True
+
+    @admin.action(description="Mark selected refunds as Processing", permissions=["process_refund"])
     def mark_processing(self, request, queryset):
-        count = 0
-        for refund in queryset:
-            try:
-                order_services.mark_refund_processing(refund)
-                count += 1
-            except order_services.RefundError as exc:
-                self.message_user(request, f"Refund #{refund.pk}: {exc}", level=messages.WARNING)
+        confirmation = self._confirm_bulk(
+            request, queryset, "mark_processing",
+            "Mark these refunds as processing? The refund method can no longer be changed.",
+            "Mark processing",
+        )
+        if confirmation:
+            return confirmation
+        count = sum(1 for refund in queryset if self._mark_processing(request, refund))
         if count:
             self.message_user(request, f"Marked {count} refund(s) as processing.", level=messages.SUCCESS)
+
+    @action(
+        description="Mark processing", url_path="process", permissions=["process_refund"],
+        icon="pending",
+    )
+    def process_refund_detail(self, request, object_id):
+        refund = get_object_or_404(Refund, pk=object_id)
+        if request.method == "POST":
+            if self._mark_processing(request, refund):
+                self.message_user(request, "Refund marked processing.", level=messages.SUCCESS)
+            return redirect(self._change_url(refund))
+        return self._action_page(
+            request, refund, f"Mark refund #{refund.pk} as processing", forms.Form(),
+            f"Start paying {refund.refund_amount} by {refund.get_refund_method_display() or '—'}. "
+            "The refund method can no longer be changed.",
+            "Mark processing", self._change_url(refund),
+        )
+
+    @action(
+        description="Complete refund", url_path="complete", permissions=["complete_refund"],
+        icon="task_alt",
+    )
+    def complete_refund_detail(self, request, object_id):
+        refund = get_object_or_404(Refund, pk=object_id)
+        form = CompleteRefundForm(request.POST or None)
+        if request.method == "POST" and form.is_valid():
+            try:
+                order_services.complete_refund(
+                    refund, refund_reference=form.cleaned_data["refund_reference"],
+                    processed_by=request.user, notes=form.cleaned_data["notes"],
+                )
+            except order_services.RefundError as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+            else:
+                self._record(request, refund, "Completed refund.")
+                self.message_user(request, "Refund marked completed.", level=messages.SUCCESS)
+            return redirect(self._change_url(refund))
+        return self._action_page(
+            request, refund, f"Complete refund #{refund.pk}", form,
+            f"Confirm that {refund.refund_amount} has been paid to the customer. "
+            "A completed refund cannot be changed; later corrections need a refund adjustment.",
+            "Complete refund", self._change_url(refund), button_class="bg-red-600",
+        )
+
+    @action(
+        description="Mark failed", url_path="fail", permissions=["complete_refund"], icon="error",
+    )
+    def fail_refund_detail(self, request, object_id):
+        refund = get_object_or_404(Refund, pk=object_id)
+        form = FailRefundForm(request.POST or None)
+        if request.method == "POST" and form.is_valid():
+            try:
+                order_services.fail_refund(
+                    refund, failure_reason=form.cleaned_data["failure_reason"],
+                    processed_by=request.user,
+                )
+            except order_services.RefundError as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+            else:
+                self._record(request, refund, "Marked refund failed.")
+                self.message_user(request, "Refund marked failed.", level=messages.WARNING)
+            return redirect(self._change_url(refund))
+        return self._action_page(
+            request, refund, f"Mark refund #{refund.pk} as failed", form,
+            "Record why the payment failed. The amount becomes claimable again by a later refund.",
+            "Mark failed", self._change_url(refund), button_class="bg-red-600",
+        )
 
 
 class RefundAdjustmentForm(forms.ModelForm):

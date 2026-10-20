@@ -137,6 +137,13 @@ class Order(BaseModel):
     class Meta:
         db_table = "orders_order"
         ordering = ["-created_at"]
+        permissions = [
+            ("verify_cod_order", "Can verify COD order"),
+            ("pack_order", "Can pack order"),
+            ("ship_order", "Can ship order"),
+            ("deliver_order", "Can mark order delivered"),
+            ("cancel_order", "Can cancel order"),
+        ]
         constraints = [
             models.CheckConstraint(
                 condition=models.Q(base_shipping_charge__gte=0), name="order_base_shipping_charge_gte_0"
@@ -282,6 +289,7 @@ class Return(BaseModel):
     class Meta:
         db_table = "orders_return"
         ordering = ["-created_at"]
+        permissions = [("process_return", "Can process return")]
         constraints = [
             models.CheckConstraint(
                 condition=models.Q(base_shipping_refund_amount__gte=0),
@@ -446,6 +454,10 @@ class Refund(BaseModel):
 
     class Meta:
         db_table = "orders_refund"
+        permissions = [
+            ("process_refund", "Can create and process refund"),
+            ("complete_refund", "Can complete or fail refund"),
+        ]
         constraints = [
             models.CheckConstraint(condition=models.Q(refund_amount__gte=0), name="refund_amount_gte_0"),
         ]

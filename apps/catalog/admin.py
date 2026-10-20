@@ -148,7 +148,7 @@ class ProductVariantAdmin(ModelAdmin):
 
     @display(description="Variant Product", header=True)
     def display_name_formatted(self, obj):
-        return [obj.display_name(), f"SKU: {obj.id}"]
+        return [obj.display_name(), f"SKU: {obj.sku}"]
 
     @display(description="Selling Price", header=True)
     def price_label(self, obj):

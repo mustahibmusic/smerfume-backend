@@ -1235,3 +1235,34 @@ class CatalogBookedIncomingAvailabilityTests(CatalogTestBase):
         with CaptureQueriesContext(connection) as after:
             self.client.get(LIST_URL)
         self.assertEqual(len(before.captured_queries), len(after.captured_queries))
+
+
+# ── Admin ERP Phase 2: changelist query counts ───────────────────────────────
+
+from apps.core.test_utils import AdminQueryCountMixin  # noqa: E402
+
+
+class CatalogAdminQueryCountTests(AdminQueryCountMixin, TestCase):
+    def setUp(self):
+        from django.contrib.auth import get_user_model
+        self.client.force_login(get_user_model().objects.create_superuser(
+            username="catquery", email="catquery@example.com", password="testpass123",
+        ))
+        self.category = Category.objects.create(name="QCat", slug="qcat")
+
+    def _product(self, i):
+        brand = Brand.objects.create(name=f"QBrand{i}", slug=f"qbrand{i}")
+        return Product.objects.create(
+            name=f"QProduct{i}", slug=f"qproduct{i}", brand=brand, category=self.category,
+        )
+
+    def test_product_changelist(self):
+        self.assertChangelistQueriesFlat("/admin/catalog/product/", self._product)
+
+    def test_edition_changelist(self):
+        def make(i):
+            ProductEdition.objects.create(
+                product=self._product(i), name="EDP", slug=f"q-edp-{i}",
+                concentration="edp", gender="unisex",
+            )
+        self.assertChangelistQueriesFlat("/admin/catalog/productedition/", make)

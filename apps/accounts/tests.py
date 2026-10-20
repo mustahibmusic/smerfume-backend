@@ -849,3 +849,21 @@ class UserAdminPrivilegeTests(TestCase):
         self.assertFalse(self.customer.is_superuser)
         self.assertFalse(self.customer.is_staff)
         self.assertEqual(self.customer.role, "customer")
+
+
+# ── Admin ERP Phase 2: changelist query counts ───────────────────────────────
+
+from apps.accounts.models import CustomerProfile  # noqa: E402
+from apps.core.test_utils import AdminQueryCountMixin  # noqa: E402
+
+
+class AccountsAdminQueryCountTests(AdminQueryCountMixin, TestCase):
+    def test_customer_profile_changelist(self):
+        self.client.force_login(get_user_model().objects.create_superuser(
+            username="acctquery", email="acctquery@example.com", password="testpass123",
+        ))
+
+        def make(i):
+            user = _make_user(mobile=f"+91982000{i:04d}", username=f"qprof{i}")
+            CustomerProfile.objects.get_or_create(user=user)
+        self.assertChangelistQueriesFlat("/admin/accounts/customerprofile/", make)

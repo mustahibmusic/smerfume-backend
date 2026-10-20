@@ -3867,3 +3867,50 @@ class RefundAdminActionTests(TestCase):
         from apps.orders.admin import RefundAdmin
         readonly = RefundAdmin(Refund, django_admin.site).get_readonly_fields(request, self.refund)
         self.assertIn("refund_method", readonly)
+
+
+# ── Admin ERP Phase 2: changelist query counts ───────────────────────────────
+
+from apps.core.test_utils import AdminQueryCountMixin  # noqa: E402
+
+
+class OrdersAdminQueryCountTests(AdminQueryCountMixin, TestCase):
+    def setUp(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="orderquery", email="orderquery@example.com", password="testpass123",
+        ))
+        self.variant = _make_variant()
+
+    def _order(self, i):
+        order = _plain_order(100 + i, Order.STATUS_DELIVERED)
+        OrderItem.objects.create(
+            order=order, variant=self.variant, quantity=1, unit_price=Decimal("500.00"),
+            line_total=Decimal("500.00"),
+        )
+        return order
+
+    def test_order_changelist(self):
+        self.assertChangelistQueriesFlat(ORDER_CHANGELIST, self._order)
+
+    def test_return_changelist(self):
+        self.assertChangelistQueriesFlat(
+            RETURN_CHANGELIST, lambda i: Return.objects.create(order=self._order(i)),
+        )
+
+    def test_return_item_changelist(self):
+        def make(i):
+            order = self._order(i)
+            ReturnItem.objects.create(
+                return_request=Return.objects.create(order=order),
+                order_item=order.items.get(), reason=ReturnItem.REASON_WRONG_VARIANT,
+                requested_quantity=1,
+            )
+        self.assertChangelistQueriesFlat("/admin/orders/returnitem/", make)
+
+    def test_refund_changelist(self):
+        def make(i):
+            Refund.objects.create(
+                return_request=Return.objects.create(order=self._order(i)),
+                refund_amount=Decimal("100.00"),
+            )
+        self.assertChangelistQueriesFlat(REFUND_CHANGELIST, make)

@@ -1828,3 +1828,54 @@ class ReallocateIncomingAdminTests(_ReserveOrderItemsBase):
         self.client.force_login(self.staff)
         response = self.client.get(reverse("admin:orders_order_change", args=[order.pk]))
         self.assertContains(response, self.url)
+
+
+# ── Admin ERP Phase 2: changelist query counts ───────────────────────────────
+
+from apps.core.test_utils import AdminQueryCountMixin  # noqa: E402
+
+
+class InventoryAdminQueryCountTests(AdminQueryCountMixin, TestCase):
+    def setUp(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="invquery", email="invquery@example.com", password="testpass123",
+        ))
+        self.warehouse = Warehouse.objects.get(is_default=True)
+
+    def _stock(self, i):
+        return InventoryStock.objects.create(
+            variant=_make_variant(f"SKU-QC-{i}"), warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal("5"),
+        )
+
+    def test_inventory_stock_changelist(self):
+        self.assertChangelistQueriesFlat("/admin/inventory/inventorystock/", self._stock)
+
+    def test_stock_movement_changelist(self):
+        def make(i):
+            StockMovement.objects.create(
+                variant=_make_variant(f"SKU-QM-{i}"), warehouse=self.warehouse,
+                stock_type=InventoryStock.STOCK_TYPE_RETAIL,
+                movement_type=StockMovement.MOVEMENT_ADJUSTMENT, quantity_delta=Decimal("1"),
+                reason=StockMovement.REASON_STOCKTAKING_RESULTS,
+            )
+        self.assertChangelistQueriesFlat("/admin/inventory/stockmovement/", make)
+
+    def test_partial_bottle_lot_changelist(self):
+        txn = StockTransaction.objects.create(transaction_type=StockTransaction.TYPE_ADJUSTMENT)
+
+        def make(i):
+            PartialBottleLot.objects.create(
+                variant=_make_variant(f"SKU-QL-{i}"), warehouse=self.warehouse,
+                remaining_ml=Decimal("50"), opened_at=timezone.now(), source_transaction=txn,
+            )
+        self.assertChangelistQueriesFlat("/admin/inventory/partialbottlelot/", make)
+
+    def test_stock_reservation_changelist(self):
+        def make(i):
+            variant = _make_variant(f"SKU-QR-{i}")
+            StockReservation.objects.create(
+                order_item=_make_order_item(variant), variant=variant, warehouse=self.warehouse,
+                purpose=StockReservation.PURPOSE_CHOICES[0][0], quantity=Decimal("1"),
+            )
+        self.assertChangelistQueriesFlat("/admin/inventory/stockreservation/", make)

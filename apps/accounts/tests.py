@@ -749,3 +749,103 @@ class MobileSendLimitConcurrencyTests(TransactionTestCase):
         self.assertEqual(sorted(results), ["OTPRateLimitError", "ok"], results)
         self.assertEqual(otp_service._recent_send_count(self.user), 5)
         self.assertEqual(sms.call_count, 1)
+
+
+# ── Admin ERP Phase 1: user privilege safety ─────────────────────────────────
+
+from django.contrib import admin as django_admin  # noqa: E402
+from django.contrib.auth.models import Permission  # noqa: E402
+from django.test import RequestFactory  # noqa: E402
+
+from apps.accounts.admin import UserAdmin  # noqa: E402
+
+PRIVILEGE_FIELDS = ("is_superuser", "is_staff", "groups", "user_permissions", "role")
+
+
+class UserAdminPrivilegeTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.manager = User.objects.create_user(
+            username="accountmgr", email="accountmgr@example.com", password="testpass123",
+            is_staff=True, role="staff",
+        )
+        self.manager.user_permissions.add(*Permission.objects.filter(
+            content_type__app_label="accounts",
+            codename__in=["view_user", "add_user", "change_user", "delete_user"],
+        ))
+        self.superuser = User.objects.create_superuser(
+            username="rootadmin", email="rootadmin@example.com", password="testpass123",
+        )
+        self.customer = _make_user(mobile="+919811100001", username="plaincustomer")
+        self.other_staff = User.objects.create_user(
+            username="otherstaff", email="otherstaff@example.com", password="testpass123",
+            is_staff=True, role="staff",
+        )
+        self.admin_role_user = _make_user(mobile="+919811100002", username="apiadmin", role="admin")
+        self.model_admin = UserAdmin(User, django_admin.site)
+
+    def _request(self, user):
+        request = RequestFactory().get("/")
+        request.user = user
+        return request
+
+    def test_privilege_fields_readonly_for_non_superuser(self):
+        request = self._request(self.manager)
+        readonly = self.model_admin.get_readonly_fields(request, self.customer)
+        for field in PRIVILEGE_FIELDS:
+            self.assertIn(field, readonly)
+        form_class = self.model_admin.get_form(request, self.customer)
+        for field in PRIVILEGE_FIELDS:
+            self.assertNotIn(field, form_class.base_fields)
+
+    def test_privilege_fields_editable_for_superuser(self):
+        request = self._request(self.superuser)
+        readonly = self.model_admin.get_readonly_fields(request, self.customer)
+        for field in PRIVILEGE_FIELDS:
+            self.assertNotIn(field, readonly)
+
+    def test_non_superuser_can_manage_customers_only(self):
+        request = self._request(self.manager)
+        self.assertTrue(self.model_admin.has_change_permission(request, self.customer))
+        for target in (self.superuser, self.other_staff, self.admin_role_user, self.manager):
+            self.assertFalse(self.model_admin.has_change_permission(request, target), target)
+            self.assertFalse(self.model_admin.has_delete_permission(request, target), target)
+        self.assertTrue(self.model_admin.has_change_permission(request))
+
+    def test_superuser_can_manage_staff(self):
+        request = self._request(self.superuser)
+        self.assertTrue(self.model_admin.has_change_permission(request, self.other_staff))
+
+    def test_add_form_has_no_role_for_non_superuser(self):
+        fields = [
+            f for _, opts in self.model_admin.get_fieldsets(self._request(self.manager))
+            for f in opts["fields"]
+        ]
+        self.assertNotIn("role", fields)
+        superuser_fields = [
+            f for _, opts in self.model_admin.get_fieldsets(self._request(self.superuser))
+            for f in opts["fields"]
+        ]
+        self.assertIn("role", superuser_fields)
+
+    def test_non_superuser_cannot_reset_staff_password_or_edit_superuser(self):
+        self.client.force_login(self.manager)
+        password_url = reverse("admin:auth_user_password_change", args=[self.superuser.pk])
+        self.assertEqual(self.client.get(password_url).status_code, 403)
+        change_url = reverse("admin:accounts_user_change", args=[self.superuser.pk])
+        self.client.post(change_url, {"email": "taken@example.com"})
+        self.superuser.refresh_from_db()
+        self.assertEqual(self.superuser.email, "rootadmin@example.com")
+
+    def test_non_superuser_cannot_escalate_customer(self):
+        self.client.force_login(self.manager)
+        url = reverse("admin:accounts_user_change", args=[self.customer.pk])
+        self.client.post(url, {
+            "username": self.customer.username, "mobile_number": self.customer.mobile_number,
+            "email": "", "first_name": "", "last_name": "",
+            "is_superuser": "on", "is_staff": "on", "role": "admin", "is_active": "on",
+        })
+        self.customer.refresh_from_db()
+        self.assertFalse(self.customer.is_superuser)
+        self.assertFalse(self.customer.is_staff)
+        self.assertEqual(self.customer.role, "customer")

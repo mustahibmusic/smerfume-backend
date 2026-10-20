@@ -1,7 +1,9 @@
 from django import forms
 from django.contrib import admin
 from django.contrib import messages
-from django.db.models import Exists, OuterRef
+from django.contrib.admin.models import LogEntry
+from django.contrib.contenttypes.models import ContentType
+from django.db.models import Exists, OuterRef, Q
 from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
 from django.urls import reverse
@@ -18,7 +20,7 @@ from unfold.widgets import (
 )
 
 from apps.catalog.models import ProductVariant
-from apps.inventory.models import StockReservationAllocation, Warehouse
+from apps.inventory.models import StockMovement, StockReservationAllocation, Warehouse
 from apps.inventory.services.reservation import InsufficientStockError
 
 from . import services as order_services
@@ -234,6 +236,8 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
         # correctly — never editable directly, use the actions instead.
         "status",
         "allocation_breakdown",
+        "business_events",
+        "admin_history",
     )
     inlines = [OrderItemInline, ShippingAddressInline]
     # Shipping is a detail action only (ship_order): it must capture a
@@ -284,6 +288,14 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
         }),
         ("Timestamps", {
             "fields": ("created_at", "delivered_at", "tracking_number"),
+        }),
+        ("Timeline", {
+            "fields": ("business_events", "admin_history"),
+            "description": (
+                "Business events come from the order's own records. Admin action "
+                "history lists actions run in this admin; changes made through the "
+                "API or services directly do not appear there."
+            ),
         }),
     )
 
@@ -347,6 +359,73 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
                 rows,
             ),
         )
+
+    @admin.display(description="Business events")
+    def business_events(self, obj):
+        """Events derived from data the order already stores (no history
+        model). Shipping and cancellation times are not stored on the order;
+        they appear in the admin action history when done in the admin."""
+        events = [(obj.created_at, f"Order placed ({obj.get_channel_display()})", obj.created_by)]
+        if obj.cod_verified_at:
+            events.append((obj.cod_verified_at, "COD verified", obj.cod_verified_by))
+        consumed = (
+            StockMovement.objects.filter(source_order_item__order=obj)
+            .select_related("performed_by").order_by("created_at").first()
+        )
+        if consumed:
+            events.append((consumed.created_at, "Stock consumed (packed / sold)", consumed.performed_by))
+        if obj.tracking_number:
+            events.append((None, f"Shipped, tracking {obj.tracking_number}", None))
+        if obj.delivered_at:
+            events.append((obj.delivered_at, "Delivered", None))
+        for return_request in obj.returns.all():
+            events.append((
+                return_request.created_at,
+                f"Return #{return_request.pk} requested (now {return_request.get_status_display()})",
+                None,
+            ))
+            for refund in return_request.refunds.select_related("processed_by"):
+                if refund.processed_at:
+                    events.append((
+                        refund.processed_at,
+                        f"Refund {refund.get_refund_status_display().lower()} ({refund.refund_amount})",
+                        refund.processed_by,
+                    ))
+        dated = sorted((e for e in events if e[0]), key=lambda e: e[0])
+        undated = [e for e in events if not e[0]]
+        return format_html(
+            "<table><tbody>{}</tbody></table>",
+            format_html_join(
+                "", "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                ((when or "time not recorded", label, who or "—") for when, label, who in dated + undated),
+            ),
+        )
+
+    @admin.display(description="Admin action history")
+    def admin_history(self, obj):
+        """LogEntry rows for this order and its returns and refunds."""
+        return_ids = list(obj.returns.values_list("pk", flat=True))
+        refund_ids = list(Refund.objects.filter(return_request__order=obj).values_list("pk", flat=True))
+        targets = Q(content_type=ContentType.objects.get_for_model(Order), object_id=str(obj.pk))
+        if return_ids:
+            targets |= Q(
+                content_type=ContentType.objects.get_for_model(Return),
+                object_id__in=[str(pk) for pk in return_ids],
+            )
+        if refund_ids:
+            targets |= Q(
+                content_type=ContentType.objects.get_for_model(Refund),
+                object_id__in=[str(pk) for pk in refund_ids],
+            )
+        entries = LogEntry.objects.filter(targets).select_related("user").order_by("-action_time")
+        rows = format_html_join(
+            "", "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            (
+                (entry.action_time, entry.user, entry.object_repr, entry.get_change_message())
+                for entry in entries
+            ),
+        )
+        return format_html("<table><tbody>{}</tbody></table>", rows) if entries else "—"
 
     @action(
         description="New in-store sale",

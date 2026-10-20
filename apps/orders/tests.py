@@ -3957,3 +3957,55 @@ class OrdersAdminSearchTests(TestCase):
         self.assertEqual(ReturnAdmin.date_hierarchy, "created_at")
         self.assertEqual(RefundAdmin.date_hierarchy, "created_at")
         self.assertEqual(self.client.get(ORDER_CHANGELIST).status_code, 200)
+
+
+# ── Admin ERP Phase 2: order timeline ────────────────────────────────────────
+
+class OrderTimelineTests(TestCase):
+    def setUp(self):
+        self.staff = User.objects.create_superuser(
+            username="timeline", email="timeline@example.com", password="testpass123",
+        )
+        self.client.force_login(self.staff)
+        self.order = _plain_order(
+            300, Order.STATUS_DELIVERED, payment_method=Order.PAYMENT_METHOD_COD,
+            cod_verified_at=timezone.now(), cod_verified_by=self.staff,
+            delivered_at=timezone.now(), tracking_number="AWB-T1",
+        )
+        self.return_request = Return.objects.create(order=self.order)
+        self.refund = Refund.objects.create(
+            return_request=self.return_request, refund_amount=Decimal("100.00"),
+            refund_status=Refund.STATUS_COMPLETED, processed_at=timezone.now(), processed_by=self.staff,
+        )
+        LogEntry.objects.log_actions(
+            user_id=self.staff.pk, queryset=[self.order], action_flag=2,
+            change_message="Shipped order (tracking AWB-T1).", single_object=True,
+        )
+        LogEntry.objects.log_actions(
+            user_id=self.staff.pk, queryset=[self.refund], action_flag=2,
+            change_message="Completed refund.", single_object=True,
+        )
+        self.url = reverse("admin:orders_order_change", args=[self.order.pk])
+
+    def test_business_events_panel(self):
+        resp = self.client.get(self.url)
+        self.assertContains(resp, "Business events")
+        self.assertContains(resp, "Order placed")
+        self.assertContains(resp, "COD verified")
+        self.assertContains(resp, "Delivered")
+        self.assertContains(resp, f"Return #{self.return_request.pk} requested")
+        self.assertContains(resp, "Refund completed")
+        self.assertContains(resp, "AWB-T1")
+
+    def test_admin_action_history_includes_order_and_related_records(self):
+        resp = self.client.get(self.url)
+        self.assertContains(resp, "Admin action history")
+        self.assertContains(resp, "Shipped order (tracking AWB-T1).")
+        self.assertContains(resp, "Completed refund.")
+
+    def test_timeline_is_read_only(self):
+        request = RequestFactory().get("/")
+        request.user = self.staff
+        form_class = OrderAdmin(Order, django_admin.site).get_form(request, self.order)
+        self.assertNotIn("business_events", form_class.base_fields)
+        self.assertNotIn("admin_history", form_class.base_fields)

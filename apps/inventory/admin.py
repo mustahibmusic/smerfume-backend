@@ -61,19 +61,26 @@ class SupplierAdmin(ModelAdmin):
         return False
 
 
+# Reasons a manual adjustment may record. Purchases come only from goods
+# receipts and opening stock only from opening receipts.
+MANUAL_ADJUSTMENT_REASONS = [
+    choice for choice in StockMovement.REASON_CHOICES
+    if choice[0] not in (StockMovement.REASON_PURCHASE, StockMovement.REASON_OPENING_STOCK)
+]
+
+
 class InventoryStockAdjustmentForm(forms.ModelForm):
-    """On the ADD form, `quantity` is the legitimate starting ledger value
-    for a brand-new variant/warehouse/stock_type row (there is no prior
-    quantity to protect). On the CHANGE form, InventoryStockAdmin makes
-    `quantity` read-only and routes any change through these extra fields
-    instead — save_model() never calls a raw form.save() for an edit."""
+    """InventoryStockAdmin makes `quantity` read-only and routes any change
+    through these extra fields instead; save_model() never calls a raw
+    form.save(). Rows are never added here: they come from goods receipts
+    (including opening receipts) and stock-type transfers."""
 
     quantity_delta = forms.DecimalField(
         required=False,
-        help_text="Signed adjustment to apply on save (e.g. +10 to receive stock, -2 to write off). "
+        help_text="Signed adjustment to apply on save (e.g. +2 stocktaking gain, -2 to write off). "
                    "Leave blank to make no change.",
     )
-    reason = forms.ChoiceField(choices=StockMovement.REASON_CHOICES, required=False)
+    reason = forms.ChoiceField(choices=MANUAL_ADJUSTMENT_REASONS, required=False)
     notes = forms.CharField(required=False, widget=forms.Textarea)
 
     class Meta:
@@ -206,20 +213,21 @@ class InventoryStockAdmin(ModelAdmin):
         }
         return TemplateResponse(request, "admin/purchases/po_action.html", context)
 
+    def has_add_permission(self, request):
+        # Opening stock is an opening goods receipt; other new rows come
+        # from purchase receipts and stock-type transfers.
+        return False
+
     def has_delete_permission(self, request, obj=None):
         return False
 
     def get_fields(self, request, obj=None):
-        if obj is None:
-            return ["variant", "warehouse", "stock_type", "quantity", "reorder_level"]
         return [
             "variant", "warehouse", "stock_type", "quantity", "quantity_reserved",
             "reorder_level", "quantity_delta", "reason", "notes",
         ]
 
     def get_readonly_fields(self, request, obj=None):
-        if obj is None:
-            return []
         # quantity_reserved is never manually adjustable — it only ever
         # changes as a side effect of reservation/consumption. quantity on
         # an EXISTING row is locked here; the only way to change it is the
@@ -227,20 +235,8 @@ class InventoryStockAdmin(ModelAdmin):
         return ["variant", "warehouse", "stock_type", "quantity", "quantity_reserved"]
 
     def save_model(self, request, obj, form, change):
-        if not change:
-            # Brand-new row: this IS the starting ledger entry, not an edit
-            # of an existing one. Still logged as a real StockMovement for
-            # full audit traceability — no silent, movement-free creation.
-            super().save_model(request, obj, form, change)
-            if obj.quantity:
-                StockMovement.objects.create(
-                    variant=obj.variant, warehouse=obj.warehouse, stock_type=obj.stock_type,
-                    movement_type=StockMovement.MOVEMENT_ADJUSTMENT, quantity_delta=obj.quantity,
-                    reason=StockMovement.REASON_PURCHASE, notes="Initial stock entry via admin",
-                    performed_by=request.user,
-                )
-            return
-
+        if form.cleaned_data.get("reorder_level") != InventoryStock.objects.get(pk=obj.pk).reorder_level:
+            InventoryStock.objects.filter(pk=obj.pk).update(reorder_level=form.cleaned_data["reorder_level"])
         delta = form.cleaned_data.get("quantity_delta")
         if not delta:
             self.message_user(request, "No quantity_delta given — nothing changed.", level=messages.INFO)
@@ -269,7 +265,7 @@ class PartialBottleLotAdjustmentForm(forms.ModelForm):
         help_text="Signed adjustment to remaining_ml (e.g. -5 for evaporation/spillage write-off). "
                    "Leave blank to make no change.",
     )
-    reason = forms.ChoiceField(choices=StockMovement.REASON_CHOICES, required=False)
+    reason = forms.ChoiceField(choices=MANUAL_ADJUSTMENT_REASONS, required=False)
     notes = forms.CharField(required=False, widget=forms.Textarea)
 
     class Meta:

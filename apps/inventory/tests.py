@@ -802,13 +802,23 @@ class InventoryAdminIntegrityTests(TestCase):
         form_class = admin_instance.get_form(self.request, self.stock)
         self.assertNotIn("quantity", form_class.base_fields)
 
-    def test_inventory_stock_quantity_is_editable_on_add_form(self):
-        # The one legitimate exception: bootstrapping a brand-new
-        # variant/warehouse/stock_type row needs an initial value.
+    def test_reorder_level_edit_is_saved_without_a_movement(self):
+        self.client.login(username="invadminstaff@example.com", password="testpass123")
+        url = f"/admin/inventory/inventorystock/{self.stock.pk}/change/"
+        before = StockMovement.objects.count()
+        self.client.post(url, data={
+            "reorder_level": "4", "quantity_delta": "", "reason": "", "notes": "", "_save": "Save",
+        })
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.reorder_level, Decimal("4"))
+        self.assertEqual(self.stock.quantity, Decimal("10"))
+        self.assertEqual(StockMovement.objects.count(), before)
+
+    def test_inventory_stock_has_no_add_path(self):
+        # Opening stock now comes from an opening goods receipt; new rows are
+        # created by receipts and transfers, never typed in.
         admin_instance = InventoryStockAdmin(InventoryStock, django_admin.site)
-        self.assertEqual(admin_instance.get_readonly_fields(self.request, None), [])
-        form_class = admin_instance.get_form(self.request, None)
-        self.assertIn("quantity", form_class.base_fields)
+        self.assertFalse(admin_instance.has_add_permission(self.request))
 
     def test_inventory_stock_admin_change_page_does_not_render_quantity_widget(self):
         self.client.login(username="invadminstaff@example.com", password="testpass123")

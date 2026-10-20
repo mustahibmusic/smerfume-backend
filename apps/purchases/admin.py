@@ -15,7 +15,7 @@ from unfold.widgets import (
     UnfoldAdminTextInputWidget,
 )
 
-from apps.inventory.models import Supplier
+from apps.inventory.models import Supplier, Warehouse
 
 from . import selectors
 from . import services as po_services
@@ -191,6 +191,20 @@ class ReceiveGoodsForm(forms.Form):
         required=False, max_length=100, widget=UnfoldAdminTextInputWidget,
         label="Delivery challan / invoice number",
     )
+
+
+class OpeningReceiptForm(forms.Form):
+    warehouse = forms.ModelChoiceField(
+        queryset=Warehouse.objects.filter(is_active=True).order_by("name"),
+        widget=UnfoldAdminSelectWidget,
+    )
+    received_date = forms.DateField(widget=UnfoldAdminDateWidget, label="Stock count date")
+    notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["warehouse"].initial = Warehouse.objects.filter(is_default=True).first()
+        self.fields["received_date"].initial = timezone.localdate()
 
 
 class OverduePurchaseOrderFilter(admin.SimpleListFilter):
@@ -627,6 +641,32 @@ class GoodsReceiptLineInline(TabularInline):
         return selectors.outstanding_quantity(line.po_line) if line.pk and line.po_line_id else "-"
 
 
+class OpeningReceiptLineInline(TabularInline):
+    """Lines of an opening-stock receipt: stock on hand at cutover, entered
+    directly (no PO line). Retail or damaged only; testers and promotional
+    stock are received as retail and then moved with a stock-type
+    transfer. Editable only while the receipt is a draft."""
+
+    model = GoodsReceiptLine
+    extra = 1
+    autocomplete_fields = ("variant",)
+    fields = ("variant", "stock_type", "quantity", "unit_cost", "tax_rate")
+    verbose_name = "opening stock line"
+    verbose_name_plural = "opening stock lines"
+
+    def _is_draft(self, obj):
+        return obj is None or obj.is_draft
+
+    def has_add_permission(self, request, obj=None):
+        return self._is_draft(obj) and super().has_add_permission(request, obj)
+
+    def has_change_permission(self, request, obj=None):
+        return self._is_draft(obj) and super().has_change_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        return self._is_draft(obj) and super().has_delete_permission(request, obj)
+
+
 class ReceiptDiscrepancyInline(TabularInline):
     """Short / wrong item / excess observations entered on a draft goods
     receipt. They never change stock. Damaged discrepancies appear here
@@ -696,6 +736,7 @@ class GoodsReceiptAdmin(ModelAdmin):
     )
     list_select_related = ("supplier", "warehouse", "purchase_order")
     actions_detail = ["post_grn", "reverse_grn", "cancel_grn"]
+    actions_list = ["new_opening_receipt"]
     EDITABLE_DRAFT_FIELDS = ("received_date", "vendor_document_reference", "notes")
     fieldsets = (
         ("Goods receipt", {"fields": (
@@ -728,6 +769,12 @@ class GoodsReceiptAdmin(ModelAdmin):
         if obj is not None and obj.is_draft:
             return fields
         return fields + self.EDITABLE_DRAFT_FIELDS
+
+    def get_inlines(self, request, obj):
+        # Opening-stock receipts have no PO, so no PO lines or discrepancies.
+        if obj is not None and obj.receipt_type == GoodsReceipt.TYPE_OPENING:
+            return [OpeningReceiptLineInline]
+        return super().get_inlines(request, obj)
 
     def get_inline_instances(self, request, obj=None):
         # The line inline needs the receipt's PO (to limit PO line choices)
@@ -818,6 +865,46 @@ class GoodsReceiptAdmin(ModelAdmin):
             return True
         return GoodsReceipt.objects.filter(pk=object_id, status=status).exists()
 
+    def has_add_opening_permission(self, request):
+        return request.user.has_perm("purchases.add_goodsreceipt")
+
+    @action(
+        description="New opening receipt", url_path="new-opening",
+        permissions=["add_opening"], icon="inventory_2",
+    )
+    def new_opening_receipt(self, request):
+        """Start a draft opening-stock receipt (cutover stock on hand). No
+        vendor, no purchase order; lines are entered on the receipt and
+        nothing changes stock until it is posted."""
+        form = OpeningReceiptForm(request.POST or None)
+        if request.method == "POST" and form.is_valid():
+            receipt = po_services.create_opening_receipt(
+                form.cleaned_data["warehouse"], request.user,
+                received_date=form.cleaned_data["received_date"], notes=form.cleaned_data["notes"],
+            )
+            self.message_user(
+                request,
+                f"Draft opening receipt {receipt.grn_number} created. Add the stock lines, then post it.",
+                level=messages.SUCCESS,
+            )
+            return redirect(self._change_url(receipt))
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "New opening stock receipt",
+            "opts": self.model._meta,
+            "form": form,
+            "message": (
+                "Record stock already on hand at cutover, with its unit cost. It is not a purchase: "
+                "no vendor and no purchase order. Retail and damaged stock only; receive testers and "
+                "promotional stock as retail, then use a stock-type transfer."
+            ),
+            "rows": [],
+            "button_label": "Start opening receipt",
+            "button_class": "bg-primary-600",
+            "back_url": reverse("admin:purchases_goodsreceipt_changelist"),
+        }
+        return TemplateResponse(request, "admin/purchases/po_action.html", context)
+
     def has_post_permission(self, request, object_id=None):
         return request.user.has_perm("purchases.post_goodsreceipt") and self._receipt_in_status(
             object_id, GoodsReceipt.STATUS_DRAFT
@@ -859,9 +946,11 @@ class GoodsReceiptAdmin(ModelAdmin):
     def post_grn(self, request, object_id):
         """GET shows what will be added to stock; only POST posts."""
         receipt = get_object_or_404(GoodsReceipt, pk=object_id)
+        is_opening = receipt.receipt_type == GoodsReceipt.TYPE_OPENING
         if request.method == "POST":
+            post = po_services.post_opening_receipt if is_opening else po_services.post_goods_receipt
             try:
-                po_services.post_goods_receipt(receipt, request.user)
+                post(receipt, request.user)
             except po_services.GoodsReceiptAlreadyPosted as exc:
                 self.message_user(request, str(exc), level=messages.INFO)
             except po_services.GoodsReceiptError as exc:

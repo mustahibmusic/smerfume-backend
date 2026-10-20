@@ -1,6 +1,7 @@
 from django import forms
 from django.contrib import admin, messages
 from django.core.exceptions import PermissionDenied
+from django.db.models import F
 from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
@@ -74,14 +75,51 @@ class InventoryStockAdjustmentForm(forms.ModelForm):
         fields = ["variant", "warehouse", "stock_type", "quantity", "reorder_level"]
 
 
+class LowStockFilter(admin.SimpleListFilter):
+    """Rows with a reorder level whose free stock (quantity - reserved) is
+    at or below it."""
+
+    title = "low stock"
+    parameter_name = "low_stock"
+
+    def lookups(self, request, model_admin):
+        return (("yes", "At or below reorder level"),)
+
+    def queryset(self, request, queryset):
+        if self.value() == "yes":
+            return queryset.filter(
+                reorder_level__isnull=False,
+                quantity__lte=F("quantity_reserved") + F("reorder_level"),
+            )
+        return queryset
+
+
+class ActiveReservationFilter(admin.SimpleListFilter):
+    title = "active"
+    parameter_name = "active"
+
+    def lookups(self, request, model_admin):
+        return (("yes", "Held or confirmed"),)
+
+    def queryset(self, request, queryset):
+        if self.value() == "yes":
+            return queryset.filter(
+                status__in=[StockReservation.STATUS_HELD, StockReservation.STATUS_CONFIRMED]
+            )
+        return queryset
+
+
 @admin.register(InventoryStock)
 class InventoryStockAdmin(ModelAdmin):
     list_display = (
         "variant", "warehouse", "stock_type", "quantity", "quantity_reserved",
         "available", "reorder_level",
     )
-    list_filter = ("stock_type", "warehouse")
-    search_fields = ("variant__sku",)
+    list_filter = ("stock_type", "warehouse", LowStockFilter)
+    search_fields = (
+        "variant__sku", "variant__edition__name", "variant__edition__product__name",
+        "variant__edition__product__brand__name",
+    )
     autocomplete_fields = ("variant",)
     form = InventoryStockAdjustmentForm
 
@@ -241,6 +279,7 @@ class StockMovementAdmin(ModelAdmin):
     )
     list_filter = ("movement_type", "reason", "warehouse")
     search_fields = ("variant__sku", "notes")
+    date_hierarchy = "created_at"
     autocomplete_fields = ("variant", "supplier", "partial_lot")
     readonly_fields = (
         "transaction_group", "variant", "warehouse", "stock_type", "movement_type",
@@ -273,7 +312,7 @@ class StockReservationAdmin(ModelAdmin):
     InventoryStock/PartialBottleLot rows it's holding capacity against."""
 
     list_display = ("order_item", "variant", "warehouse", "purpose", "quantity", "status", "created_at")
-    list_filter = ("status", "purpose", "warehouse")
+    list_filter = (ActiveReservationFilter, "status", "purpose", "warehouse")
     search_fields = ("order_item__order__order_number", "variant__sku")
     autocomplete_fields = ("variant",)
 

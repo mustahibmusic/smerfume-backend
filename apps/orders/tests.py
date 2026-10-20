@@ -3914,3 +3914,46 @@ class OrdersAdminQueryCountTests(AdminQueryCountMixin, TestCase):
                 refund_amount=Decimal("100.00"),
             )
         self.assertChangelistQueriesFlat(REFUND_CHANGELIST, make)
+
+
+# ── Admin ERP Phase 2: operational search and date hierarchy ─────────────────
+
+from apps.orders.models import ShippingAddress  # noqa: E402
+
+
+class OrdersAdminSearchTests(TestCase):
+    def setUp(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="ordersearch", email="ordersearch@example.com", password="testpass123",
+        ))
+        self.match = _plain_order(200, Order.STATUS_PENDING)
+        ShippingAddress.objects.create(
+            order=self.match, full_name="Ayesha Khan", mobile="9876500011",
+            address_line1="1 Lane", city="Pune", state="MH", pincode="411001",
+        )
+        self.other = _plain_order(201, Order.STATUS_PENDING)
+        ShippingAddress.objects.create(
+            order=self.other, full_name="Rohan Mehta", mobile="9876500022",
+            address_line1="2 Lane", city="Pune", state="MH", pincode="411001",
+        )
+
+    def _results(self, query):
+        resp = self.client.get(ORDER_CHANGELIST, {"q": query})
+        return set(resp.context["cl"].result_list)
+
+    def test_search_by_shipping_mobile(self):
+        self.assertEqual(self._results("9876500011"), {self.match})
+
+    def test_search_by_shipping_name(self):
+        self.assertEqual(self._results("Ayesha"), {self.match})
+
+    def test_search_by_customer_name(self):
+        User.objects.filter(pk=self.other.user_id).update(first_name="Zubin")
+        self.assertEqual(self._results("Zubin"), {self.other})
+
+    def test_date_hierarchy(self):
+        from apps.orders.admin import RefundAdmin, ReturnAdmin
+        self.assertEqual(OrderAdmin.date_hierarchy, "created_at")
+        self.assertEqual(ReturnAdmin.date_hierarchy, "created_at")
+        self.assertEqual(RefundAdmin.date_hierarchy, "created_at")
+        self.assertEqual(self.client.get(ORDER_CHANGELIST).status_code, 200)

@@ -193,6 +193,25 @@ class ReceiveGoodsForm(forms.Form):
     )
 
 
+class OverduePurchaseOrderFilter(admin.SimpleListFilter):
+    """Still expecting goods (issued or partially received) after the
+    expected date."""
+
+    title = "overdue"
+    parameter_name = "overdue"
+
+    def lookups(self, request, model_admin):
+        return (("yes", "Past expected date"),)
+
+    def queryset(self, request, queryset):
+        if self.value() == "yes":
+            return queryset.filter(
+                expected_date__lt=timezone.localdate(),
+                status__in=PurchaseOrder.RECEIVABLE_STATUSES,
+            )
+        return queryset
+
+
 @admin.register(PurchaseOrder)
 class PurchaseOrderAdmin(ModelAdmin):
     """Purchase order business screen. Status changes only through the
@@ -203,7 +222,7 @@ class PurchaseOrderAdmin(ModelAdmin):
         "po_number", "supplier", "warehouse", "order_date", "expected_date",
         "status_label", "line_count", "order_value", "created_by",
     )
-    list_filter = ("status", "supplier", "warehouse", "order_date")
+    list_filter = ("status", OverduePurchaseOrderFilter, "supplier", "warehouse", "order_date")
     search_fields = (
         "po_number", "supplier__name", "supplier__vendor_code",
         "vendor_reference", "lines__variant__sku",
@@ -670,6 +689,7 @@ class GoodsReceiptAdmin(ModelAdmin):
         "received_date", "status_label", "line_count", "total_units", "posted_at",
     )
     list_filter = ("status", "receipt_type", "supplier", "warehouse", "received_date")
+    date_hierarchy = "received_date"
     search_fields = (
         "grn_number", "purchase_order__po_number", "supplier__name",
         "supplier__vendor_code", "vendor_document_reference", "lines__variant__sku",

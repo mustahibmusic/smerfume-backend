@@ -214,7 +214,12 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
         "is_guest_order_display", "guest_email", "awaiting_incoming_display", "created_at",
     )
     list_filter = ("channel", "status", "payment_method", AwaitingIncomingFilter, "created_at")
-    search_fields = ("order_number", "user__mobile_number", "user__email", "guest_email")
+    search_fields = (
+        "order_number", "user__mobile_number", "user__email", "guest_email",
+        "user__first_name", "user__last_name",
+        "shipping_address__mobile", "shipping_address__full_name",
+    )
+    date_hierarchy = "created_at"
     readonly_fields = (
         "public_id", "order_number", "user", "subtotal",
         "discount_amount", "total", "guest_email", "is_guest_order_display", "created_at",
@@ -543,6 +548,7 @@ class ReturnItemInline(admin.TabularInline):
 class ReturnAdmin(StaffActionMixin, ModelAdmin):
     list_display = ("id", "order", "status", "created_at")
     list_filter = ("status", "created_at")
+    date_hierarchy = "created_at"
     search_fields = ("order__order_number",)
     # base_shipping_refund_override is intentionally editable — it's the
     # staff override point ("unless an explicit staff override is used")
@@ -785,6 +791,7 @@ class RefundAdmin(StaffActionMixin, ModelAdmin):
         "refund_method", "refund_reference", "processed_at",
     )
     list_filter = ("refund_status", "refund_method")
+    date_hierarchy = "created_at"
     search_fields = ("return_request__order__order_number", "refund_reference")
     form = RefundProcessingForm
     actions = ["mark_processing"]

@@ -1879,3 +1879,58 @@ class InventoryAdminQueryCountTests(AdminQueryCountMixin, TestCase):
                 purpose=StockReservation.PURPOSE_CHOICES[0][0], quantity=Decimal("1"),
             )
         self.assertChangelistQueriesFlat("/admin/inventory/stockreservation/", make)
+
+
+# ── Admin ERP Phase 2: operational filters and search ────────────────────────
+
+class InventoryAdminFilterTests(TestCase):
+    def setUp(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="invfilter", email="invfilter@example.com", password="testpass123",
+        ))
+        self.warehouse = Warehouse.objects.get(is_default=True)
+
+    def _stock(self, sku, quantity, reorder_level=None, reserved=0):
+        return InventoryStock.objects.create(
+            variant=_make_variant(sku), warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal(quantity),
+            quantity_reserved=Decimal(reserved), reorder_level=reorder_level,
+        )
+
+    def _results(self, url, params):
+        return set(self.client.get(url, params).context["cl"].result_list)
+
+    def test_low_stock_filter_uses_available_quantity(self):
+        low = self._stock("SKU-LOW-1", 3, reorder_level=5)
+        reserved_low = self._stock("SKU-LOW-2", 8, reorder_level=5, reserved=4)
+        self._stock("SKU-OK-1", 10, reorder_level=5)
+        self._stock("SKU-NOLEVEL", 0)
+        results = self._results("/admin/inventory/inventorystock/", {"low_stock": "yes"})
+        self.assertEqual(results, {low, reserved_low})
+
+    def test_stock_search_by_product_and_brand_name(self):
+        stock = self._stock("SKU-SEARCH-1", 3)
+        self.assertIn(stock, self._results("/admin/inventory/inventorystock/", {"q": "InvTestProduct"}))
+        self.assertIn(stock, self._results("/admin/inventory/inventorystock/", {"q": "InvTestBrand"}))
+
+    def test_active_reservation_filter(self):
+        held = StockReservation.objects.create(
+            order_item=_make_order_item(_make_variant("SKU-RES-1")), variant=_make_variant("SKU-RES-1B"),
+            warehouse=self.warehouse, purpose=StockReservation.PURPOSE_CHOICES[0][0],
+            quantity=Decimal("1"), status=StockReservation.STATUS_HELD,
+        )
+        confirmed = StockReservation.objects.create(
+            order_item=_make_order_item(_make_variant("SKU-RES-2")), variant=_make_variant("SKU-RES-2B"),
+            warehouse=self.warehouse, purpose=StockReservation.PURPOSE_CHOICES[0][0],
+            quantity=Decimal("1"), status=StockReservation.STATUS_CONFIRMED,
+        )
+        StockReservation.objects.create(
+            order_item=_make_order_item(_make_variant("SKU-RES-3")), variant=_make_variant("SKU-RES-3B"),
+            warehouse=self.warehouse, purpose=StockReservation.PURPOSE_CHOICES[0][0],
+            quantity=Decimal("1"), status=StockReservation.STATUS_RELEASED,
+        )
+        results = self._results("/admin/inventory/stockreservation/", {"active": "yes"})
+        self.assertEqual(results, {held, confirmed})
+
+    def test_stock_movement_date_hierarchy(self):
+        self.assertEqual(StockMovementAdmin.date_hierarchy, "created_at")

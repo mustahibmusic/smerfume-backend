@@ -2712,3 +2712,24 @@ class BookedIncomingConcurrencyTests(TransactionTestCase):
             self.assertEqual(allocation.replacement.purchase_order_line, other_line)
             self.assertEqual(stock.quantity_reserved, Decimal("0"))
         self._assert_consistent()
+
+
+# ── Admin ERP Phase 2: overdue PO filter, GRN date hierarchy ─────────────────
+
+import datetime  # noqa: E402
+
+
+class PurchaseAdminFilterTests(_POBase):
+    def test_overdue_filter(self):
+        today = timezone.localdate()
+        overdue = self._po(expected_date=today - datetime.timedelta(days=2), status=PurchaseOrder.STATUS_ISSUED)
+        self._po(expected_date=today + datetime.timedelta(days=2), status=PurchaseOrder.STATUS_ISSUED)
+        self._po(expected_date=today - datetime.timedelta(days=2), status=PurchaseOrder.STATUS_RECEIVED)
+        self._po(expected_date=None, status=PurchaseOrder.STATUS_ISSUED)
+        self.client.force_login(self.user)
+        resp = self.client.get(reverse("admin:purchases_purchaseorder_changelist"), {"overdue": "yes"})
+        self.assertEqual(set(resp.context["cl"].result_list), {overdue})
+
+    def test_goods_receipt_date_hierarchy(self):
+        from apps.purchases.admin import GoodsReceiptAdmin
+        self.assertEqual(GoodsReceiptAdmin.date_hierarchy, "received_date")

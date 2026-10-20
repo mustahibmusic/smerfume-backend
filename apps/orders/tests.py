@@ -4119,3 +4119,17 @@ class StaffCreateReturnTests(TestCase):
         self.assertTrue(model_admin.has_process_return_permission(request, self.order.pk))
         Order.objects.filter(pk=self.order.pk).update(status=Order.STATUS_SHIPPED)
         self.assertFalse(model_admin.has_process_return_permission(request, self.order.pk))
+
+
+class ReturnShippingOverridePermissionTests(TestCase):
+    def test_shipping_refund_override_needs_process_refund(self):
+        from apps.orders.admin import ReturnAdmin
+        return_request = Return.objects.create(order=_plain_order(600, Order.STATUS_DELIVERED))
+        model_admin = ReturnAdmin(Return, django_admin.site)
+        request = RequestFactory().get("/")
+        request.user = _admin_staff("warehousereturns", "view_return", "change_return", "receive_return")
+        self.assertIn("base_shipping_refund_override", model_admin.get_readonly_fields(request, return_request))
+        request.user = _admin_staff("financereturns", "view_return", "change_return", "process_refund")
+        self.assertNotIn(
+            "base_shipping_refund_override", model_admin.get_readonly_fields(request, return_request),
+        )

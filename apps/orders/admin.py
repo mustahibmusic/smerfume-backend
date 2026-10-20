@@ -746,6 +746,14 @@ class ReturnAdmin(StaffActionMixin, ModelAdmin):
     def has_delete_permission(self, request, obj=None):
         return False
 
+    def get_readonly_fields(self, request, obj=None):
+        readonly = tuple(super().get_readonly_fields(request, obj))
+        # The shipping-refund override changes what the customer is paid;
+        # warehouse staff edit this page only to record received quantities.
+        if not self._has_orders_perm(request, "process_refund"):
+            readonly += ("base_shipping_refund_override",)
+        return readonly
+
     def has_process_return_permission(self, request):
         return self._has_orders_perm(request, "process_return")
 

@@ -4,8 +4,8 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
 from django.db import models
-from django.db.models import F, Q, Value
-from django.db.models.functions import Cast, Concat, Greatest, Length, LPad
+from django.db.models import F, Q, Sum, Value
+from django.db.models.functions import Cast, Coalesce, Concat, Greatest, Length, LPad
 from django.utils import timezone
 
 from apps.core.models import BaseModel
@@ -16,6 +16,25 @@ UNIT_COST = Decimal("0.0001")
 
 def _round(value, places):
     return value.quantize(places, rounding=ROUND_HALF_UP)
+
+
+PAYMENT_UNPAID = "unpaid"
+PAYMENT_PARTIALLY_PAID = "partially_paid"
+PAYMENT_PAID = "paid"
+PAYMENT_STATUS_CHOICES = (
+    (PAYMENT_UNPAID, "Unpaid"),
+    (PAYMENT_PARTIALLY_PAID, "Partially paid"),
+    (PAYMENT_PAID, "Paid"),
+)
+
+
+def payment_status_for(net_paid, ordered_gross_total):
+    """Operational PO-payment coverage (DEC-010), not settlement."""
+    if not net_paid:
+        return PAYMENT_UNPAID
+    if ordered_gross_total is not None and net_paid >= ordered_gross_total:
+        return PAYMENT_PAID
+    return PAYMENT_PARTIALLY_PAID
 
 
 class PurchaseOrder(BaseModel):
@@ -58,6 +77,19 @@ class PurchaseOrder(BaseModel):
         STATUS_PARTIALLY_RECEIVED: {STATUS_ISSUED},
     }
     RECEIVABLE_STATUSES = (STATUS_ISSUED, STATUS_PARTIALLY_RECEIVED)
+    # DEC-010: statuses in which supplier payments and vendor refunds may be
+    # recorded. Closing ends procurement, not supplier settlement.
+    PAYABLE_STATUSES = (STATUS_ISSUED, STATUS_PARTIALLY_RECEIVED, STATUS_RECEIVED, STATUS_CLOSED)
+
+    # DEC-010: the commercial/tax treatment of this specific purchase,
+    # chosen explicitly by staff (never inferred from vendor or payment
+    # method). Django records it; Zoho Books decides accounting treatment.
+    TAX_GST_INVOICE = "gst_invoice"
+    TAX_NO_GST_INVOICE = "no_gst_invoice"
+    TAX_TREATMENT_CHOICES = (
+        (TAX_GST_INVOICE, "GST invoice"),
+        (TAX_NO_GST_INVOICE, "No GST invoice"),
+    )
     # POs whose lines may carry a vendor-confirmed booked quantity that
     # counts as incoming stock (DEC-009).
     BOOKABLE_STATUSES = (STATUS_ISSUED, STATUS_PARTIALLY_RECEIVED)
@@ -66,7 +98,7 @@ class PurchaseOrder(BaseModel):
     # in draft.
     EDITABLE_DRAFT_FIELDS = (
         "supplier", "warehouse", "order_date", "expected_date",
-        "vendor_reference", "amounts_include_tax", "notes",
+        "vendor_reference", "purchase_tax_treatment", "amounts_include_tax", "notes",
     )
     EDITABLE_OPEN_FIELDS = ("expected_date", "notes")
     EDITABLE_FINAL_FIELDS = ("notes",)
@@ -97,6 +129,12 @@ class PurchaseOrder(BaseModel):
     expected_date = models.DateField(null=True, blank=True)
     vendor_reference = models.CharField(
         max_length=100, blank=True, help_text="The vendor's quote or order number."
+    )
+    # Nullable only for purchase orders created before DEC-010; drafts must
+    # choose one (admin form + issue check). Locked once issued.
+    purchase_tax_treatment = models.CharField(
+        max_length=20, choices=TAX_TREATMENT_CHOICES, null=True, blank=True,
+        help_text="Whether this purchase comes with a GST invoice. The payment method does not decide this.",
     )
     amounts_include_tax = models.BooleanField(
         default=False, help_text="Tick if the vendor's prices include GST."
@@ -129,6 +167,7 @@ class PurchaseOrder(BaseModel):
             ("issue_purchaseorder", "Can issue purchase order"),
             ("cancel_purchaseorder", "Can cancel purchase order"),
             ("close_purchaseorder", "Can close purchase order"),
+            ("set_po_tax_treatment", "Can classify the tax treatment of an existing purchase order"),
         ]
 
     def __str__(self):
@@ -181,6 +220,71 @@ class PurchaseOrder(BaseModel):
         if any(value is None for value in values):
             return None
         return sum(values, Decimal("0.00"))
+
+    # --- DEC-010: operational ordered amount and supplier payment coverage.
+    # Not the accounting liability; Zoho Books is authoritative for that.
+    # selectors.annotate_payment_summary() computes the same values in SQL.
+
+    @property
+    def ordered_gross_total(self):
+        """Operational ordered amount: including GST for gst_invoice POs
+        (added per line, rounded per line, when prices exclude tax), the
+        agreed amount for no_gst_invoice POs, None while unclassified."""
+        if self.purchase_tax_treatment is None:
+            return None
+        if self.purchase_tax_treatment == self.TAX_NO_GST_INVOICE or self.amounts_include_tax:
+            return self.total_discounted_amount
+        total = Decimal("0.00")
+        for line in self.lines.all():
+            if line.tax_rate is None:
+                return None
+            total += _round(line.discounted_line_amount * (1 + line.tax_rate / 100), MONEY)
+        return total
+
+    def payment_summary(self):
+        """Ledger totals in one query: gross_payments, vendor_refunds (not
+        reversed), reversals and net_paid."""
+        P = PurchaseOrderPayment.TYPE_PAYMENT
+        R = PurchaseOrderPayment.TYPE_VENDOR_REFUND
+        X = PurchaseOrderPayment.TYPE_REVERSAL
+        zero = Value(Decimal("0.00"))
+        totals = self.payment_entries.aggregate(
+            gross_payments=Coalesce(Sum("amount", filter=Q(entry_type=P)), zero),
+            active_payments=Coalesce(Sum("amount", filter=Q(entry_type=P, reversal__isnull=True)), zero),
+            active_refunds=Coalesce(Sum("amount", filter=Q(entry_type=R, reversal__isnull=True)), zero),
+            reversals=Coalesce(Sum("amount", filter=Q(entry_type=X)), zero),
+        )
+        return {
+            "gross_payments": totals["gross_payments"],
+            "vendor_refunds": totals["active_refunds"],
+            "reversals": totals["reversals"],
+            "net_paid": totals["active_payments"] - totals["active_refunds"],
+        }
+
+    @property
+    def gross_payments(self):
+        return self.payment_summary()["gross_payments"]
+
+    @property
+    def vendor_refunds(self):
+        return self.payment_summary()["vendor_refunds"]
+
+    @property
+    def reversals(self):
+        return self.payment_summary()["reversals"]
+
+    @property
+    def net_paid(self):
+        return self.payment_summary()["net_paid"]
+
+    @property
+    def remaining_against_po(self):
+        total = self.ordered_gross_total
+        return None if total is None else total - self.net_paid
+
+    @property
+    def payment_status(self):
+        return payment_status_for(self.net_paid, self.ordered_gross_total)
 
 
 class PurchaseOrderLine(BaseModel):
@@ -688,3 +792,98 @@ class ReceiptDiscrepancy(BaseModel):
                 errors["receipt_line"] = "A damaged discrepancy needs a damaged line of this receipt."
         if errors:
             raise ValidationError(errors)
+
+
+class PurchaseOrderPayment(BaseModel):
+    """DEC-010 operational supplier payment ledger. Append-only: rows are
+    never updated or deleted. A mistake is corrected with a reversal entry
+    (full amount, linked, reason required, at most one per entry, never
+    itself reversed). A vendor_refund is money the supplier actually
+    returned. Not an accounting record; Zoho Books is authoritative.
+    Written only through apps.purchases.services."""
+
+    TYPE_PAYMENT = "payment"
+    TYPE_VENDOR_REFUND = "vendor_refund"
+    TYPE_REVERSAL = "reversal"
+    TYPE_CHOICES = (
+        (TYPE_PAYMENT, "Payment"),
+        (TYPE_VENDOR_REFUND, "Vendor refund"),
+        (TYPE_REVERSAL, "Reversal"),
+    )
+
+    METHOD_BANK_TRANSFER = "bank_transfer"
+    METHOD_UPI = "upi"
+    METHOD_CASH = "cash"
+    METHOD_CHEQUE = "cheque"
+    METHOD_CARD = "card"
+    METHOD_OTHER = "other"
+    METHOD_CHOICES = (
+        (METHOD_BANK_TRANSFER, "Bank transfer"),
+        (METHOD_UPI, "UPI"),
+        (METHOD_CASH, "Cash"),
+        (METHOD_CHEQUE, "Cheque"),
+        (METHOD_CARD, "Card"),
+        (METHOD_OTHER, "Other"),
+    )
+    REFERENCE_REQUIRED_METHODS = (METHOD_BANK_TRANSFER, METHOD_UPI, METHOD_CHEQUE, METHOD_CARD)
+
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, on_delete=models.PROTECT, related_name="payment_entries"
+    )
+    entry_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    amount = models.DecimalField(
+        max_digits=12, decimal_places=2,
+        help_text="Always positive; the entry type decides whether it adds or subtracts.",
+    )
+    entry_date = models.DateField(help_text="Date the money moved (recording date for a reversal).")
+    method = models.CharField(max_length=20, choices=METHOD_CHOICES, blank=True)
+    reference = models.CharField(max_length=100, blank=True, help_text="UTR, cheque or card slip number.")
+    notes = models.TextField(blank=True)
+    reverses = models.OneToOneField(
+        "self", on_delete=models.PROTECT, null=True, blank=True, related_name="reversal"
+    )
+    reversal_reason = models.TextField(blank=True)
+    recorded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+"
+    )
+
+    class Meta:
+        ordering = ["entry_date", "id"]
+        verbose_name = "supplier payment entry"
+        verbose_name_plural = "supplier payment entries"
+        permissions = [
+            ("record_po_payment", "Can record supplier payments and vendor refunds"),
+            ("reverse_po_payment", "Can reverse supplier payment entries"),
+        ]
+        indexes = [
+            models.Index(fields=["purchase_order", "entry_type"], name="po_payment_po_type_idx"),
+            models.Index(fields=["reference"], name="po_payment_reference_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(condition=Q(amount__gt=0), name="po_payment_amount_gt_0"),
+            models.CheckConstraint(
+                condition=Q(entry_type="reversal", reverses__isnull=False)
+                | (~Q(entry_type="reversal") & Q(reverses__isnull=True)),
+                name="po_payment_reversal_iff_reverses",
+            ),
+            models.CheckConstraint(
+                condition=~Q(entry_type="reversal") | (~Q(reversal_reason="") & Q(method="")),
+                name="po_payment_reversal_reason_no_method",
+            ),
+            models.CheckConstraint(
+                condition=Q(entry_type="reversal") | ~Q(method=""),
+                name="po_payment_method_required",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.get_entry_type_display()} {self.amount} on {self.purchase_order}"
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError("Supplier payment entries cannot be changed; record a reversal instead.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Supplier payment entries cannot be deleted; record a reversal instead.")
+

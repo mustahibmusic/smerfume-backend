@@ -9,7 +9,11 @@ received; damaged units that physically arrived do. Booked incoming quantities
 from decimal import Decimal
 
 from django.conf import settings
-from django.db.models import Case, F, IntegerField, Sum, When
+from django.db.models import (
+    Case, CharField, DecimalField, Exists, ExpressionWrapper, F, IntegerField, OuterRef, Q, Subquery, Sum,
+    Value, When,
+)
+from django.db.models.functions import Coalesce, Round
 
 from apps.inventory.models import InventoryStock, StockReservationAllocation
 
@@ -242,3 +246,73 @@ def sellable_quantities(variant_ids, warehouse):
 
 def sellable_quantity(variant, warehouse):
     return sellable_quantities([variant.pk], warehouse)[variant.pk]
+
+
+# --- DEC-010: supplier payment coverage in SQL (PO list, filters) ---
+
+_MONEY_FIELD = DecimalField(max_digits=14, decimal_places=2)
+
+
+def _ledger_sum(entry_type, active_only):
+    from .models import PurchaseOrderPayment
+
+    entries = PurchaseOrderPayment.objects.filter(purchase_order=OuterRef("pk"), entry_type=entry_type)
+    if active_only:
+        entries = entries.filter(reversal__isnull=True)
+    total = entries.order_by().values("purchase_order").annotate(total=Sum("amount")).values("total")
+    return Coalesce(Subquery(total, output_field=_MONEY_FIELD), Value(Decimal("0.00")), output_field=_MONEY_FIELD)
+
+
+def annotate_payment_summary(queryset):
+    """Annotate POs with ordered_gross_total_db, net_paid_db and
+    payment_status_db, matching the PurchaseOrder properties exactly
+    (per-line GST rounding for tax-exclusive gst_invoice POs)."""
+    from .models import PurchaseOrder, PurchaseOrderLine, PurchaseOrderPayment
+
+    discounted = F("unit_price") * F("quantity_ordered") - F("line_discount_amount")
+    with_gst = Round(
+        ExpressionWrapper(discounted * (1 + F("tax_rate") / 100), output_field=_MONEY_FIELD), 2,
+    )
+    line_amount = Case(
+        When(
+            purchase_order__purchase_tax_treatment=PurchaseOrder.TAX_GST_INVOICE,
+            purchase_order__amounts_include_tax=False,
+            then=with_gst,
+        ),
+        default=discounted,
+        output_field=_MONEY_FIELD,
+    )
+    line_total = (
+        PurchaseOrderLine.objects.filter(purchase_order=OuterRef("pk"))
+        .order_by().values("purchase_order").annotate(total=Sum(line_amount)).values("total")
+    )
+    missing_rate = PurchaseOrderLine.objects.filter(
+        purchase_order=OuterRef("pk"), tax_rate__isnull=True,
+    )
+    ordered = Case(
+        When(purchase_tax_treatment__isnull=True, then=Value(None, output_field=_MONEY_FIELD)),
+        When(
+            Q(purchase_tax_treatment=PurchaseOrder.TAX_GST_INVOICE, amounts_include_tax=False)
+            & Q(_missing_tax_rate=True),
+            then=Value(None, output_field=_MONEY_FIELD),
+        ),
+        default=Coalesce(Subquery(line_total, output_field=_MONEY_FIELD), Value(Decimal("0.00"))),
+        output_field=_MONEY_FIELD,
+    )
+
+    queryset = queryset.annotate(_missing_tax_rate=Exists(missing_rate))
+    net = ExpressionWrapper(
+        _ledger_sum(PurchaseOrderPayment.TYPE_PAYMENT, True)
+        - _ledger_sum(PurchaseOrderPayment.TYPE_VENDOR_REFUND, True),
+        output_field=_MONEY_FIELD,
+    )
+    queryset = queryset.annotate(ordered_gross_total_db=ordered, net_paid_db=net)
+    return queryset.annotate(
+        payment_status_db=Case(
+            When(net_paid_db=0, then=Value("unpaid")),
+            When(ordered_gross_total_db__isnull=False, net_paid_db__gte=F("ordered_gross_total_db"), then=Value("paid")),
+            default=Value("partially_paid"),
+            output_field=CharField(),
+        )
+    )
+

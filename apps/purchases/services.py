@@ -77,14 +77,21 @@ def _issue_problems(po, lines):
         problems.append(f"Warehouse {po.warehouse} is inactive.")
     if po.expected_date and po.expected_date < po.order_date:
         problems.append("Expected date cannot be before the order date.")
+    # DEC-010: the purchase tax treatment is chosen explicitly per PO.
+    if po.purchase_tax_treatment is None:
+        problems.append("Choose the purchase tax treatment (GST invoice or no GST invoice).")
+    elif po.purchase_tax_treatment == PurchaseOrder.TAX_NO_GST_INVOICE and po.amounts_include_tax:
+        problems.append("A no-GST-invoice purchase cannot include tax: prices must exclude tax.")
     for number, line in enumerate(lines, start=1):
         label = f"Line {number} ({line.variant.sku})"
         if not line.variant.is_active:
             problems.append(f"{label}: variant is inactive.")
         if line.variant.is_decant:
             problems.append(f"{label}: decants cannot be purchased.")
-        if po.amounts_include_tax and line.tax_rate is None:
-            problems.append(f"{label}: tax rate is required because prices include tax.")
+        if po.purchase_tax_treatment == PurchaseOrder.TAX_GST_INVOICE and line.tax_rate is None:
+            problems.append(f"{label}: tax rate is required for a GST-invoice purchase.")
+        if po.purchase_tax_treatment == PurchaseOrder.TAX_NO_GST_INVOICE and line.tax_rate is not None:
+            problems.append(f"{label}: a no-GST-invoice purchase must have no tax rate.")
     return problems
 
 

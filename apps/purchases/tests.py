@@ -84,6 +84,9 @@ class _POBase(TestCase):
         self.variant = _variant("SKU-PO-100ML")
 
     def _po(self, **kwargs):
+        # DEC-010: new POs need an explicit tax treatment. Tests default to
+        # no_gst_invoice (no line tax rates); GST tests pass gst_invoice.
+        kwargs.setdefault("purchase_tax_treatment", "no_gst_invoice")
         kwargs.setdefault("supplier", self.supplier)
         kwargs.setdefault("warehouse", self.warehouse)
         return PurchaseOrder.objects.create(created_by=self.user, **kwargs)
@@ -255,7 +258,7 @@ class PurchaseOrderWorkflowTests(_POBase):
         self._assert_issue_blocked(po, "decants cannot be purchased")
 
     def test_issue_requires_tax_rate_when_prices_include_tax(self):
-        po = self._po(amounts_include_tax=True)
+        po = self._po(amounts_include_tax=True, purchase_tax_treatment="gst_invoice")
         self._line(po)
         self._assert_issue_blocked(po, "tax rate is required")
 
@@ -407,6 +410,7 @@ class PurchaseOrderAdminTests(_POBase):
         data = {
             "supplier": self.supplier.pk, "warehouse": self.warehouse.pk,
             "order_date": "2026-09-26", "notes": "", "vendor_reference": "Q-1",
+            "purchase_tax_treatment": "no_gst_invoice",
             f"{prefix}-TOTAL_FORMS": "1", f"{prefix}-INITIAL_FORMS": "0",
             f"{prefix}-MIN_NUM_FORMS": "0", f"{prefix}-MAX_NUM_FORMS": "1000",
             f"{prefix}-0-variant": self.variant.pk, f"{prefix}-0-quantity_ordered": "4",
@@ -508,7 +512,7 @@ class _GRNBase(_POBase):
 
     def setUp(self):
         super().setUp()
-        self.po = self._po()
+        self.po = self._po(purchase_tax_treatment="gst_invoice")
         self.po_line = self._line(self.po, quantity_ordered=10, tax_rate=Decimal("18"))
         services.issue_purchase_order(self.po, self.user)
 
@@ -695,7 +699,7 @@ class GoodsReceiptPostingTests(_GRNBase):
         self.assertEqual(line.tax_rate, Decimal("18.00"))
 
     def test_tax_inclusive_cost_snapshot(self):
-        draft = self._po(amounts_include_tax=True)
+        draft = self._po(amounts_include_tax=True, purchase_tax_treatment="gst_invoice")
         po_line = self._line(draft, quantity_ordered=2, unit_price=Decimal("1180"), tax_rate=Decimal("18"))
         services.issue_purchase_order(draft, self.user)
         receipt = self._receipt(draft)
@@ -910,7 +914,9 @@ class GoodsReceiptConcurrencyTests(TransactionTestCase):
         )
         self.supplier = Supplier.objects.create(name="Concurrent Vendor")
         self.variant = _variant("SKU-GRN-CONC")
-        self.po = PurchaseOrder.objects.create(supplier=self.supplier, warehouse=self.warehouse)
+        self.po = PurchaseOrder.objects.create(
+            supplier=self.supplier, warehouse=self.warehouse, purchase_tax_treatment="no_gst_invoice",
+        )
         self.po_line = PurchaseOrderLine.objects.create(
             purchase_order=self.po, variant=self.variant, quantity_ordered=10,
             unit_price=Decimal("100"),
@@ -976,7 +982,9 @@ class GoodsReceiptConcurrencyTests(TransactionTestCase):
     def test_missing_stock_row_created_once_by_concurrent_posts(self):
         # Two POs so the PO lock does not serialise the two postings; both
         # must create the same missing retail + damaged rows.
-        other_po = PurchaseOrder.objects.create(supplier=self.supplier, warehouse=self.warehouse)
+        other_po = PurchaseOrder.objects.create(
+            supplier=self.supplier, warehouse=self.warehouse, purchase_tax_treatment="no_gst_invoice",
+        )
         other_line = PurchaseOrderLine.objects.create(
             purchase_order=other_po, variant=self.variant, quantity_ordered=5,
             unit_price=Decimal("100"),
@@ -2903,3 +2911,198 @@ class InventoryStockAddPathRemovedTests(_POBase):
         self.assertNotIn(StockMovement.REASON_PURCHASE, reasons)
         self.assertNotIn(StockMovement.REASON_OPENING_STOCK, reasons)
         self.assertIn(StockMovement.REASON_STOCKTAKING_RESULTS, reasons)
+
+
+# ── DEC-010: purchase tax treatment and supplier payment ledger ─────────────
+
+from apps.purchases.models import PurchaseOrderPayment  # noqa: E402
+
+GST = PurchaseOrder.TAX_GST_INVOICE
+NO_GST = PurchaseOrder.TAX_NO_GST_INVOICE
+PAYMENT = PurchaseOrderPayment.TYPE_PAYMENT
+REFUND = PurchaseOrderPayment.TYPE_VENDOR_REFUND
+REVERSAL = PurchaseOrderPayment.TYPE_REVERSAL
+
+
+class PurchaseTaxTreatmentTests(_POBase):
+    def test_new_po_has_no_default_treatment(self):
+        po = PurchaseOrder.objects.create(supplier=self.supplier, warehouse=self.warehouse)
+        self.assertIsNone(po.purchase_tax_treatment)
+
+    def test_treatment_editable_only_in_draft(self):
+        self.assertIn("purchase_tax_treatment", PurchaseOrder.EDITABLE_DRAFT_FIELDS)
+        self.assertNotIn("purchase_tax_treatment", PurchaseOrder.EDITABLE_OPEN_FIELDS)
+        self.assertNotIn("purchase_tax_treatment", PurchaseOrder.EDITABLE_FINAL_FIELDS)
+
+    def _assert_blocked(self, po, message):
+        with self.assertRaisesMessage(services.PurchaseOrderError, message):
+            services.issue_purchase_order(po, self.user)
+        po.refresh_from_db()
+        self.assertEqual(po.status, PurchaseOrder.STATUS_DRAFT)
+
+    def test_issue_requires_treatment(self):
+        po = self._po(purchase_tax_treatment=None)
+        self._line(po)
+        self._assert_blocked(po, "tax treatment")
+
+    def test_gst_invoice_requires_rate_on_every_line(self):
+        for include_tax in (False, True):
+            po = self._po(purchase_tax_treatment=GST, amounts_include_tax=include_tax)
+            self._line(po, tax_rate=Decimal("18"))
+            self._line(po, variant=_variant(f"SKU-GSTNR-{include_tax}"), tax_rate=None)
+            self._assert_blocked(po, "tax rate is required")
+
+    def test_gst_invoice_with_rates_issues(self):
+        po = self._po(purchase_tax_treatment=GST)
+        self._line(po, tax_rate=Decimal("18"))
+        self.assertEqual(services.issue_purchase_order(po, self.user).status, PurchaseOrder.STATUS_ISSUED)
+
+    def test_no_gst_invoice_refuses_tax_rate(self):
+        po = self._po(purchase_tax_treatment=NO_GST)
+        self._line(po, tax_rate=Decimal("18"))
+        self._assert_blocked(po, "no tax rate")
+
+    def test_no_gst_invoice_refuses_tax_inclusive_prices(self):
+        po = self._po(purchase_tax_treatment=NO_GST, amounts_include_tax=True)
+        self._line(po)
+        self._assert_blocked(po, "prices must exclude tax")
+
+    def test_no_gst_invoice_allows_hsn(self):
+        po = self._po(purchase_tax_treatment=NO_GST)
+        self._line(po, hsn_code="3303")
+        self.assertEqual(services.issue_purchase_order(po, self.user).status, PurchaseOrder.STATUS_ISSUED)
+
+
+class OrderedGrossTotalTests(_POBase):
+    def test_gst_exclusive_adds_tax_rounded_per_line(self):
+        po = self._po(purchase_tax_treatment=GST)
+        # 3 x 33.33 = 99.99 x 1.18 = 117.9882 -> 117.99
+        self._line(po, quantity_ordered=3, unit_price=Decimal("33.33"), tax_rate=Decimal("18"))
+        # 2 x 100 - 10 = 190 x 1.05 = 199.50
+        self._line(
+            po, variant=_variant("SKU-OGT-2"), quantity_ordered=2, unit_price=Decimal("100"),
+            line_discount_amount=Decimal("10"), tax_rate=Decimal("5"),
+        )
+        self.assertEqual(po.ordered_gross_total, Decimal("317.49"))
+
+    def test_gst_inclusive_is_discounted_amount(self):
+        po = self._po(purchase_tax_treatment=GST, amounts_include_tax=True)
+        self._line(po, quantity_ordered=2, unit_price=Decimal("1180"), tax_rate=Decimal("18"))
+        self.assertEqual(po.ordered_gross_total, Decimal("2360.00"))
+
+    def test_no_gst_is_agreed_amount(self):
+        po = self._po(purchase_tax_treatment=NO_GST)
+        self._line(po, quantity_ordered=4, unit_price=Decimal("2500"), line_discount_amount=Decimal("100"))
+        self.assertEqual(po.ordered_gross_total, Decimal("9900.00"))
+
+    def test_unclassified_has_no_total(self):
+        po = self._po(purchase_tax_treatment=None)
+        self._line(po)
+        self.assertIsNone(po.ordered_gross_total)
+
+
+def _entry(po, entry_type, amount, user, **extra):
+    if entry_type != REVERSAL:
+        extra.setdefault("method", PurchaseOrderPayment.METHOD_CASH)
+    return PurchaseOrderPayment.objects.create(
+        purchase_order=po, entry_type=entry_type, amount=Decimal(amount),
+        entry_date=timezone.localdate(), recorded_by=user, **extra,
+    )
+
+
+class PurchaseOrderPaymentModelTests(_POBase):
+    def setUp(self):
+        super().setUp()
+        self.po = self._po(purchase_tax_treatment=NO_GST)
+
+    def _integrity(self, **kwargs):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            PurchaseOrderPayment.objects.create(
+                purchase_order=self.po, entry_date=timezone.localdate(), recorded_by=self.user, **kwargs,
+            )
+
+    def test_amount_must_be_positive(self):
+        for amount in ("0", "-5"):
+            self._integrity(entry_type=PAYMENT, amount=Decimal(amount), method="cash")
+
+    def test_reversal_shape(self):
+        payment = _entry(self.po, PAYMENT, "100", self.user)
+        self._integrity(entry_type=REVERSAL, amount=Decimal("100"), reversal_reason="x")
+        self._integrity(entry_type=PAYMENT, amount=Decimal("100"), method="cash", reverses=payment)
+        self._integrity(entry_type=REVERSAL, amount=Decimal("100"), reverses=payment, reversal_reason="")
+        self._integrity(
+            entry_type=REVERSAL, amount=Decimal("100"), reverses=payment, reversal_reason="x", method="cash",
+        )
+
+    def test_payment_and_refund_require_method(self):
+        self._integrity(entry_type=PAYMENT, amount=Decimal("1"), method="")
+        self._integrity(entry_type=REFUND, amount=Decimal("1"), method="")
+
+    def test_one_reversal_per_entry(self):
+        payment = _entry(self.po, PAYMENT, "100", self.user)
+        _entry(self.po, REVERSAL, "100", self.user, reverses=payment, reversal_reason="wrong PO")
+        self._integrity(entry_type=REVERSAL, amount=Decimal("100"), reverses=payment, reversal_reason="again")
+
+    def test_entries_are_immutable(self):
+        payment = _entry(self.po, PAYMENT, "100", self.user)
+        payment.notes = "edited"
+        with self.assertRaises(ValidationError):
+            payment.save()
+        with self.assertRaises(ValidationError):
+            payment.delete()
+        self.assertTrue(PurchaseOrderPayment.objects.filter(pk=payment.pk, notes="").exists())
+
+
+class PurchaseOrderPaymentSummaryTests(_POBase):
+    def setUp(self):
+        super().setUp()
+        self.po = self._po(purchase_tax_treatment=NO_GST)
+        self._line(self.po, quantity_ordered=1, unit_price=Decimal("1000"))
+
+    def _summary(self):
+        po = PurchaseOrder.objects.get(pk=self.po.pk)
+        return (po.gross_payments, po.vendor_refunds, po.reversals, po.net_paid,
+                po.remaining_against_po, po.payment_status)
+
+    def test_unpaid(self):
+        self.assertEqual(
+            self._summary(), (Decimal("0"), Decimal("0"), Decimal("0"), Decimal("0"), Decimal("1000.00"), "unpaid"),
+        )
+
+    def test_partial_then_paid(self):
+        _entry(self.po, PAYMENT, "400", self.user)
+        self.assertEqual(self._summary()[3:], (Decimal("400"), Decimal("600.00"), "partially_paid"))
+        _entry(self.po, PAYMENT, "600", self.user)
+        self.assertEqual(self._summary()[3:], (Decimal("1000"), Decimal("0.00"), "paid"))
+
+    def test_refunds_and_reversals(self):
+        p1 = _entry(self.po, PAYMENT, "700", self.user)
+        _entry(self.po, PAYMENT, "300", self.user)
+        refund = _entry(self.po, REFUND, "200", self.user)
+        _entry(self.po, REVERSAL, "700", self.user, reverses=p1, reversal_reason="wrong amount")
+        # gross 1000; reversed payment 700; active refund 200 -> net 300 - 200 = 100
+        self.assertEqual(
+            self._summary(),
+            (Decimal("1000"), Decimal("200"), Decimal("700"), Decimal("100"), Decimal("900.00"), "partially_paid"),
+        )
+        _entry(self.po, REVERSAL, "200", self.user, reverses=refund, reversal_reason="refund entered twice")
+        self.assertEqual(self._summary()[1:4], (Decimal("0"), Decimal("900"), Decimal("300")))
+
+    def test_sql_annotation_matches_properties(self):
+        gst_excl = self._po(purchase_tax_treatment=GST)
+        self._line(gst_excl, quantity_ordered=3, unit_price=Decimal("33.33"), tax_rate=Decimal("18"))
+        gst_incl = self._po(purchase_tax_treatment=GST, amounts_include_tax=True)
+        self._line(gst_incl, quantity_ordered=2, unit_price=Decimal("1180"), tax_rate=Decimal("18"))
+        unclassified = self._po(purchase_tax_treatment=None)
+        self._line(unclassified)
+        p = _entry(self.po, PAYMENT, "400", self.user)
+        _entry(self.po, REFUND, "50", self.user)
+        _entry(self.po, REVERSAL, "400", self.user, reverses=p, reversal_reason="x")
+        _entry(gst_excl, PAYMENT, "117.99", self.user)
+        for po in selectors.annotate_payment_summary(PurchaseOrder.objects.all()):
+            fresh = PurchaseOrder.objects.get(pk=po.pk)
+            self.assertEqual(
+                (po.ordered_gross_total_db, po.net_paid_db, po.payment_status_db),
+                (fresh.ordered_gross_total, fresh.net_paid, fresh.payment_status),
+                po.po_number,
+            )

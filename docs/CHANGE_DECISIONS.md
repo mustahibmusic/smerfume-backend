@@ -32,6 +32,9 @@ Not recorded.
 - `docs/DATABASE_DESIGN.md`
 - Memory file: `project_zoho_inventory.md`
 
+### Amendment (DEC-010, 2026-10-20)
+Django may keep, for procurement operations, each purchase order's purchase tax treatment and an operational supplier payment ledger (payments, vendor refunds and reversals). These are not accounting records. Zoho Books remains authoritative for vendor bills, accounting, GST compliance, input-tax treatment, credit notes and the final accounts-payable balance.
+
 ---
 
 ## DEC-002 — SMS Provider: MSG91 Selected
@@ -324,6 +327,48 @@ orders.
 ### Related Documentation
 - `docs/superpowers/specs/2026-09-26-booked-incoming-inventory-design.md`
 - `docs/INVENTORY_MANAGEMENT.md`
+
+---
+
+## DEC-010 — Purchase Tax Treatment and Operational Supplier Payment Ledger on Purchase Orders
+
+### Original Product Bible Requirement
+Section 6 and DEC-001 place billing and accounting in Zoho Books. Django procurement (purchase orders, goods receipts) was operational only, assumed GST pricing through optional per-line tax snapshots, and recorded no supplier payments.
+
+### Updated Decision
+1. **Purchase tax treatment per PO.** Each purchase order records `purchase_tax_treatment`: `gst_invoice` or `no_gst_invoice`. Staff choose it explicitly while the PO is a draft (no default); it is locked once the PO is issued. It is never inferred from the supplier, the payment method, or cash/UPI use.
+2. **Issue validation.** `gst_invoice`: every line requires a tax rate, whether or not prices include tax. `no_gst_invoice`: prices must exclude tax (`amounts_include_tax` false), lines carry no tax rate, and no GST is added. HSN is optional for both and allowed on `no_gst_invoice` lines.
+3. **Ordered gross total.** `ordered_gross_total` is the operational ordered amount: including GST for `gst_invoice`, the agreed amount for `no_gst_invoice`. It is not necessarily the final vendor-bill liability.
+4. **Operational supplier payment ledger.** One append-only ledger per PO with entry types:
+   - `payment`: money paid to the supplier.
+   - `vendor_refund`: money the supplier actually returned (a real business event).
+   - `reversal`: a Django entry was recorded incorrectly. Linked to the original `payment` or `vendor_refund`, full amount only, reason required, at most one per entry, and a reversal cannot itself be reversed.
+   Each entry records amount, date, method, reference/UTR, notes, who recorded it and when. References are required for bank transfer, UPI, cheque and card; optional for cash; "other" needs a reference or meaningful notes.
+5. **Derived values.** `gross_payments`, `vendor_refunds`, `reversals`, `net_paid`, `remaining_against_po` and `payment_status` (unpaid / partially paid / paid). These describe operational PO-payment coverage only; `remaining_against_po` is not the accounting balance due. Net paid can never exceed `ordered_gross_total` or fall below zero.
+6. **Allowed by PO status.** New payments and vendor refunds while the PO is issued, partially received, received or closed; never while draft or cancelled. Closing a PO ends procurement, not supplier settlement. A PO cannot be cancelled while net paid is not zero.
+7. **Independence.** Payment state and the PO goods lifecycle (draft / issued / partially received / received / closed / cancelled) never change each other. Inventory, goods receipt and booked-incoming logic are unchanged.
+8. **Existing POs.** Purchase orders created before this decision may have no tax treatment. They are shown as unclassified and accept no payments until a Manager classifies them once (validated against their lines). No automatic backfill.
+9. **Deferred.** Vendor bills, invoice tracking (invoice received / number / date) and advance payments on draft POs.
+10. **Boundary.** Django records operational facts: the tax treatment selected by staff, PO commercial totals, payments, vendor refunds and reversals. Zoho Books remains authoritative for vendor bills, accounting, GST compliance, input-tax treatment, credit notes and the final accounts-payable balance.
+
+### Reason
+Some suppliers sell with a GST invoice and some without (lower price, cash or UPI), sometimes the same supplier on different purchases. Staff need correct PO totals and visibility of supplier payments without depending on Zoho for day-to-day procurement.
+
+### Impact
+- `apps/purchases`: `PurchaseOrder.purchase_tax_treatment` (nullable for existing POs only), a new append-only `PurchaseOrderPayment` ledger, payment services, admin workflows, and issue-validation changes.
+- New permissions for recording payments/refunds, reversing entries and classifying existing POs.
+- No change to inventory, goods receipts or booked incoming stock.
+- DEC-001 amended (see above).
+
+### Status
+**APPROVED** — not yet implemented.
+
+### Date
+2026-10-20
+
+### Related Documentation
+- DEC-001 (amended)
+- DEC-007 (future Zoho reconciliation)
 
 ---
 

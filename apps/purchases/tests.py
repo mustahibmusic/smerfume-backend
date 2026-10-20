@@ -3106,3 +3106,234 @@ class PurchaseOrderPaymentSummaryTests(_POBase):
                 (fresh.ordered_gross_total, fresh.net_paid, fresh.payment_status),
                 po.po_number,
             )
+
+
+class SupplierPaymentServiceTests(_POBase):
+    def setUp(self):
+        super().setUp()
+        self.po = self._po(purchase_tax_treatment=NO_GST)
+        self._line(self.po, quantity_ordered=1, unit_price=Decimal("1000"))
+        services.issue_purchase_order(self.po, self.user)
+
+    def _pay(self, amount="100", method="upi", reference="UTR1", po=None, **kwargs):
+        return services.record_po_payment(
+            po or self.po, amount=Decimal(amount), entry_date=kwargs.pop("entry_date", timezone.localdate()),
+            method=method, reference=reference, notes=kwargs.pop("notes", ""), user=self.user,
+        )
+
+    def _refund(self, amount="100", method="upi", reference="RF1"):
+        return services.record_vendor_refund(
+            self.po, amount=Decimal(amount), entry_date=timezone.localdate(),
+            method=method, reference=reference, notes="", user=self.user,
+        )
+
+    def _reverse(self, entry, reason="entered on the wrong PO"):
+        return services.reverse_po_payment_entry(entry, reason=reason, user=self.user)
+
+    def _net(self):
+        return PurchaseOrder.objects.get(pk=self.po.pk).net_paid
+
+    def test_record_payment(self):
+        entry = self._pay("400")
+        self.assertEqual(
+            (entry.entry_type, entry.amount, entry.method, entry.reference, entry.recorded_by),
+            (PAYMENT, Decimal("400"), "upi", "UTR1", self.user),
+        )
+        self.assertEqual(self._net(), Decimal("400"))
+
+    def test_payment_allowed_statuses(self):
+        for status in (PurchaseOrder.STATUS_DRAFT, PurchaseOrder.STATUS_CANCELLED):
+            PurchaseOrder.objects.filter(pk=self.po.pk).update(status=status)
+            with self.assertRaises(services.SupplierPaymentError, msg=status):
+                self._pay()
+        for status in (PurchaseOrder.STATUS_PARTIALLY_RECEIVED, PurchaseOrder.STATUS_RECEIVED,
+                       PurchaseOrder.STATUS_CLOSED, PurchaseOrder.STATUS_ISSUED):
+            PurchaseOrder.objects.filter(pk=self.po.pk).update(status=status)
+            self._pay("10")
+        self.assertEqual(self._net(), Decimal("40"))
+
+    def test_unclassified_po_refuses_payments(self):
+        PurchaseOrder.objects.filter(pk=self.po.pk).update(purchase_tax_treatment=None)
+        with self.assertRaisesMessage(services.SupplierPaymentError, "tax treatment"):
+            self._pay()
+
+    def test_cannot_exceed_ordered_gross_total(self):
+        self._pay("900")
+        with self.assertRaisesMessage(services.SupplierPaymentError, "exceed"):
+            self._pay("100.01")
+        self._pay("100")
+        self.assertEqual(PurchaseOrder.objects.get(pk=self.po.pk).payment_status, "paid")
+
+    def test_amount_and_date_validation(self):
+        for amount in ("0", "-1"):
+            with self.assertRaises(services.SupplierPaymentError):
+                self._pay(amount)
+        with self.assertRaisesMessage(services.SupplierPaymentError, "future"):
+            self._pay(entry_date=timezone.localdate() + datetime.timedelta(days=1))
+        self.assertEqual(self._net(), Decimal("0"))
+
+    def test_reference_rules(self):
+        for method in ("bank_transfer", "upi", "cheque", "card"):
+            with self.assertRaisesMessage(services.SupplierPaymentError, "reference", msg=method):
+                self._pay(method=method, reference="  ")
+        self._pay(method="cash", reference="")
+        with self.assertRaises(services.SupplierPaymentError):
+            self._pay(method="other", reference="", notes="short")
+        self._pay(method="other", reference="", notes="Paid via vendor's agent in person")
+        self._pay(method="other", reference="AGENT-7")
+        self.assertEqual(PurchaseOrderPayment.objects.filter(purchase_order=self.po).count(), 3)
+
+    def test_vendor_refund_capped_at_net_paid(self):
+        with self.assertRaises(services.SupplierPaymentError):
+            self._refund("1")
+        self._pay("300")
+        with self.assertRaisesMessage(services.SupplierPaymentError, "net paid"):
+            self._refund("300.01")
+        refund = self._refund("100")
+        self.assertEqual(refund.entry_type, REFUND)
+        self.assertEqual(self._net(), Decimal("200"))
+
+    def test_reverse_payment_and_refund(self):
+        payment = self._pay("500")
+        refund = self._refund("200")
+        reversal = self._reverse(refund)
+        self.assertEqual(
+            (reversal.entry_type, reversal.amount, reversal.reverses, reversal.method, reversal.recorded_by),
+            (REVERSAL, Decimal("200"), refund, "", self.user),
+        )
+        self.assertEqual(self._net(), Decimal("500"))
+        self._reverse(payment)
+        self.assertEqual(self._net(), Decimal("0"))
+
+    def test_reversal_rules(self):
+        payment = self._pay("500")
+        with self.assertRaisesMessage(services.SupplierPaymentError, "reason"):
+            self._reverse(payment, reason=" ")
+        reversal = self._reverse(payment)
+        with self.assertRaisesMessage(services.SupplierPaymentError, "already reversed"):
+            self._reverse(payment)
+        with self.assertRaisesMessage(services.SupplierPaymentError, "cannot be reversed"):
+            self._reverse(reversal)
+
+    def test_reversal_cannot_make_net_paid_negative(self):
+        payment = self._pay("100")
+        self._refund("100")
+        with self.assertRaisesMessage(services.SupplierPaymentError, "below zero"):
+            self._reverse(payment)
+
+    def test_reversing_refund_cannot_exceed_total(self):
+        self._pay("1000")
+        refund = self._refund("200")
+        self._pay("200")
+        with self.assertRaisesMessage(services.SupplierPaymentError, "exceed"):
+            self._reverse(refund)
+
+    def test_cancel_guard(self):
+        payment = self._pay("100")
+        with self.assertRaisesMessage(services.PurchaseOrderError, "payments"):
+            services.cancel_purchase_order(self.po, self.user, "vendor backed out")
+        self._reverse(payment)
+        services.cancel_purchase_order(self.po, self.user, "vendor backed out")
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_CANCELLED)
+
+    def test_cancelled_po_stays_at_zero(self):
+        payment = self._pay("100")
+        refund = self._refund("100")
+        services.cancel_purchase_order(self.po, self.user, "vendor backed out")
+        for entry in (payment, refund):
+            with self.assertRaises(services.SupplierPaymentError):
+                self._reverse(entry)
+
+    def test_payments_never_touch_po_status_stock_or_bookings(self):
+        PurchaseOrderLine.objects.filter(purchase_order=self.po).update(confirmed_booked_quantity=1)
+        stock_before = list(InventoryStock.objects.values_list("pk", "quantity", "quantity_reserved"))
+        movements_before = StockMovement.objects.count()
+        payment = self._pay("1000")
+        refund = self._refund("100")
+        self._reverse(refund)
+        self._reverse(payment)
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, PurchaseOrder.STATUS_ISSUED)
+        self.assertEqual(list(InventoryStock.objects.values_list("pk", "quantity", "quantity_reserved")), stock_before)
+        self.assertEqual(StockMovement.objects.count(), movements_before)
+        self.assertEqual(self.po.lines.get().confirmed_booked_quantity, 1)
+        self.assertFalse(GoodsReceipt.objects.filter(purchase_order=self.po).exists())
+
+
+class SetTaxTreatmentServiceTests(_POBase):
+    def _legacy(self, tax_rate=None, include_tax=False, status=PurchaseOrder.STATUS_ISSUED):
+        po = self._po(purchase_tax_treatment=None, amounts_include_tax=include_tax)
+        self._line(po, tax_rate=tax_rate)
+        PurchaseOrder.objects.filter(pk=po.pk).update(status=status)
+        return PurchaseOrder.objects.get(pk=po.pk)
+
+    def test_classify_unclassified_po(self):
+        po = self._legacy(tax_rate=Decimal("18"))
+        services.set_po_tax_treatment(po, GST, self.user)
+        po.refresh_from_db()
+        self.assertEqual(po.purchase_tax_treatment, GST)
+
+    def test_validates_against_lines(self):
+        with self.assertRaisesMessage(services.PurchaseOrderError, "tax rate"):
+            services.set_po_tax_treatment(self._legacy(tax_rate=None), GST, self.user)
+        with self.assertRaisesMessage(services.PurchaseOrderError, "no tax rate"):
+            services.set_po_tax_treatment(self._legacy(tax_rate=Decimal("18")), NO_GST, self.user)
+        with self.assertRaisesMessage(services.PurchaseOrderError, "exclude tax"):
+            services.set_po_tax_treatment(
+                self._legacy(tax_rate=None, include_tax=True), NO_GST, self.user,
+            )
+
+    def test_only_once_and_not_on_draft_or_cancelled(self):
+        po = self._legacy(tax_rate=None)
+        services.set_po_tax_treatment(po, NO_GST, self.user)
+        with self.assertRaisesMessage(services.PurchaseOrderError, "already"):
+            services.set_po_tax_treatment(po, NO_GST, self.user)
+        for status in (PurchaseOrder.STATUS_DRAFT, PurchaseOrder.STATUS_CANCELLED):
+            with self.assertRaises(services.PurchaseOrderError, msg=status):
+                services.set_po_tax_treatment(self._legacy(status=status), NO_GST, self.user)
+        with self.assertRaises(services.PurchaseOrderError):
+            services.set_po_tax_treatment(self._legacy(), "something_else", self.user)
+
+
+class SupplierPaymentConcurrencyTests(TransactionTestCase):
+    def setUp(self):
+        Warehouse.objects.filter(is_default=True).delete()
+        warehouse = Warehouse.objects.create(name="Smerfume Default", is_default=True)
+        self.user = User.objects.create_superuser(
+            username="payconc", email="payconc@example.com", password="testpass123",
+        )
+        self.po = PurchaseOrder.objects.create(
+            supplier=Supplier.objects.create(name="Pay Vendor"), warehouse=warehouse,
+            purchase_tax_treatment=NO_GST,
+        )
+        PurchaseOrderLine.objects.create(
+            purchase_order=self.po, variant=_variant("SKU-PAY-CONC"), quantity_ordered=1,
+            unit_price=Decimal("1000"),
+        )
+        services.issue_purchase_order(self.po, self.user)
+
+    def test_concurrent_payments_cannot_exceed_total(self):
+        results = []
+        barrier = threading.Barrier(2)
+
+        def run():
+            barrier.wait()
+            try:
+                services.record_po_payment(
+                    self.po, amount=Decimal("600"), entry_date=timezone.localdate(),
+                    method="cash", reference="", notes="", user=self.user,
+                )
+                results.append("ok")
+            except services.SupplierPaymentError:
+                results.append("refused")
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(results), ["ok", "refused"])
+        self.assertEqual(PurchaseOrder.objects.get(pk=self.po.pk).net_paid, Decimal("600"))

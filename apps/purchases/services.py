@@ -32,6 +32,7 @@ from .models import (
     GoodsReceiptLine,
     PurchaseOrder,
     PurchaseOrderLine,
+    PurchaseOrderPayment,
     ReceiptDiscrepancy,
 )
 
@@ -66,6 +67,20 @@ def _check_transition(po, new_status):
         )
 
 
+def _tax_treatment_problems(treatment, amounts_include_tax, lines):
+    """DEC-010 line rules for a purchase tax treatment."""
+    problems = []
+    if treatment == PurchaseOrder.TAX_NO_GST_INVOICE and amounts_include_tax:
+        problems.append("A no-GST-invoice purchase cannot include tax: prices must exclude tax.")
+    for number, line in enumerate(lines, start=1):
+        label = f"Line {number} ({line.variant.sku})"
+        if treatment == PurchaseOrder.TAX_GST_INVOICE and line.tax_rate is None:
+            problems.append(f"{label}: tax rate is required for a GST-invoice purchase.")
+        if treatment == PurchaseOrder.TAX_NO_GST_INVOICE and line.tax_rate is not None:
+            problems.append(f"{label}: a no-GST-invoice purchase must have no tax rate.")
+    return problems
+
+
 def _issue_problems(po, lines):
     """Everything that blocks issuing, as readable messages."""
     problems = []
@@ -80,18 +95,14 @@ def _issue_problems(po, lines):
     # DEC-010: the purchase tax treatment is chosen explicitly per PO.
     if po.purchase_tax_treatment is None:
         problems.append("Choose the purchase tax treatment (GST invoice or no GST invoice).")
-    elif po.purchase_tax_treatment == PurchaseOrder.TAX_NO_GST_INVOICE and po.amounts_include_tax:
-        problems.append("A no-GST-invoice purchase cannot include tax: prices must exclude tax.")
     for number, line in enumerate(lines, start=1):
         label = f"Line {number} ({line.variant.sku})"
         if not line.variant.is_active:
             problems.append(f"{label}: variant is inactive.")
         if line.variant.is_decant:
             problems.append(f"{label}: decants cannot be purchased.")
-        if po.purchase_tax_treatment == PurchaseOrder.TAX_GST_INVOICE and line.tax_rate is None:
-            problems.append(f"{label}: tax rate is required for a GST-invoice purchase.")
-        if po.purchase_tax_treatment == PurchaseOrder.TAX_NO_GST_INVOICE and line.tax_rate is not None:
-            problems.append(f"{label}: a no-GST-invoice purchase must have no tax rate.")
+    if po.purchase_tax_treatment is not None:
+        problems += _tax_treatment_problems(po.purchase_tax_treatment, po.amounts_include_tax, lines)
     return problems
 
 
@@ -128,6 +139,11 @@ def cancel_purchase_order(po, user, reason):
             f"{po.po_number} has posted goods receipts and cannot be cancelled."
         )
     _refuse_active_incoming(po, "cancelled")
+    if po.net_paid:
+        raise PurchaseOrderError(
+            f"{po.po_number} has supplier payments recorded (net {po.net_paid}). Reverse them or "
+            "record the vendor refund so net paid is zero before cancelling."
+        )
 
     po.status = PurchaseOrder.STATUS_CANCELLED
     po.cancelled_by = user
@@ -681,3 +697,138 @@ def set_confirmed_booked_quantity(line, quantity, performed_by, note):
     line.confirmed_booked_quantity = quantity
     line.save(update_fields=["confirmed_booked_quantity", "updated_at"])
     return line, change
+
+
+# --- DEC-010: purchase tax treatment classification and supplier payments ---
+# Operational records only; Zoho Books is authoritative for accounting.
+# Every function locks the PO row first (same lock order as the rest of
+# this module) and never touches stock, goods receipts, reservations,
+# incoming allocations, booked quantities or PO status.
+
+
+class SupplierPaymentError(Exception):
+    """Raised when a supplier payment ledger entry is not allowed."""
+
+
+@transaction.atomic
+def set_po_tax_treatment(po, treatment, user):
+    """One-time classification of a pre-DEC-010 purchase order that has no
+    tax treatment. Drafts choose it on the form instead."""
+    po = _lock(po)
+    if treatment not in dict(PurchaseOrder.TAX_TREATMENT_CHOICES):
+        raise PurchaseOrderError("Choose GST invoice or no GST invoice.")
+    if po.purchase_tax_treatment is not None:
+        raise PurchaseOrderError(f"{po.po_number} already has a tax treatment.")
+    if po.status in (PurchaseOrder.STATUS_DRAFT, PurchaseOrder.STATUS_CANCELLED):
+        raise PurchaseOrderError(
+            f"{po.po_number} is {po.get_status_display().lower()}; only issued or later purchase "
+            "orders are classified here (drafts choose it on the form)."
+        )
+    lines = list(po.lines.select_related("variant").order_by("pk"))
+    problems = _tax_treatment_problems(treatment, po.amounts_include_tax, lines)
+    if problems:
+        raise PurchaseOrderError(" ".join(problems))
+    po.purchase_tax_treatment = treatment
+    po.save(update_fields=["purchase_tax_treatment", "updated_at"])
+    return po
+
+
+def _check_entry_input(amount, entry_date, method, reference, notes):
+    if amount is None or amount <= 0:
+        raise SupplierPaymentError("Amount must be greater than zero.")
+    if entry_date > timezone.localdate():
+        raise SupplierPaymentError("The date cannot be in the future.")
+    if method not in dict(PurchaseOrderPayment.METHOD_CHOICES):
+        raise SupplierPaymentError("Choose a payment method.")
+    reference = (reference or "").strip()
+    notes = (notes or "").strip()
+    if method in PurchaseOrderPayment.REFERENCE_REQUIRED_METHODS and not reference:
+        raise SupplierPaymentError("A reference (UTR, cheque or card slip number) is required for this method.")
+    if method == PurchaseOrderPayment.METHOD_OTHER and not reference and len(notes) < 10:
+        raise SupplierPaymentError("For 'other', enter a reference or notes explaining the payment.")
+    return reference, notes
+
+
+def _lock_payable_po(po):
+    po = _lock(po)
+    if po.status not in PurchaseOrder.PAYABLE_STATUSES:
+        raise SupplierPaymentError(
+            f"{po.po_number} is {po.get_status_display().lower()}; payments can be recorded only "
+            "once it is issued (and not after cancellation)."
+        )
+    if po.purchase_tax_treatment is None:
+        raise SupplierPaymentError(
+            f"{po.po_number} has no purchase tax treatment yet; a manager must classify it first."
+        )
+    return po
+
+
+@transaction.atomic
+def record_po_payment(po, amount, entry_date, method, reference, notes, user):
+    """Record money paid to the supplier. Net paid can never exceed the
+    PO's ordered_gross_total."""
+    po = _lock_payable_po(po)
+    reference, notes = _check_entry_input(amount, entry_date, method, reference, notes)
+    total = po.ordered_gross_total
+    new_net = po.net_paid + amount
+    if total is None or new_net > total:
+        raise SupplierPaymentError(
+            f"This payment would make net paid {new_net}, which would exceed the ordered gross "
+            f"total of {total}."
+        )
+    return PurchaseOrderPayment.objects.create(
+        purchase_order=po, entry_type=PurchaseOrderPayment.TYPE_PAYMENT, amount=amount,
+        entry_date=entry_date, method=method, reference=reference, notes=notes, recorded_by=user,
+    )
+
+
+@transaction.atomic
+def record_vendor_refund(po, amount, entry_date, method, reference, notes, user):
+    """Record money the supplier actually returned. Cannot exceed net paid."""
+    po = _lock_payable_po(po)
+    reference, notes = _check_entry_input(amount, entry_date, method, reference, notes)
+    net = po.net_paid
+    if amount > net:
+        raise SupplierPaymentError(f"A vendor refund cannot exceed net paid ({net}).")
+    return PurchaseOrderPayment.objects.create(
+        purchase_order=po, entry_type=PurchaseOrderPayment.TYPE_VENDOR_REFUND, amount=amount,
+        entry_date=entry_date, method=method, reference=reference, notes=notes, recorded_by=user,
+    )
+
+
+@transaction.atomic
+def reverse_po_payment_entry(entry, reason, user):
+    """Correct a wrongly recorded payment or vendor refund with a linked,
+    full-amount reversal. Net paid must stay between zero and the ordered
+    gross total, and a cancelled PO must stay at zero."""
+    reason = (reason or "").strip()
+    if not reason:
+        raise SupplierPaymentError("A reversal reason is required.")
+    po = _lock(entry.purchase_order)
+    entry = PurchaseOrderPayment.objects.select_for_update().get(pk=entry.pk)
+    if entry.entry_type == PurchaseOrderPayment.TYPE_REVERSAL:
+        raise SupplierPaymentError("A reversal cannot be reversed.")
+    if PurchaseOrderPayment.objects.filter(reverses=entry).exists():
+        raise SupplierPaymentError("This entry is already reversed.")
+    net = po.net_paid
+    if entry.entry_type == PurchaseOrderPayment.TYPE_PAYMENT:
+        new_net = net - entry.amount
+    else:
+        new_net = net + entry.amount
+    if new_net < 0:
+        raise SupplierPaymentError(
+            "Reversing this payment would take net paid below zero. Reverse the vendor refund first."
+        )
+    total = po.ordered_gross_total
+    if total is not None and new_net > total:
+        raise SupplierPaymentError(
+            f"Reversing this refund would make net paid {new_net}, which would exceed the ordered "
+            f"gross total of {total}."
+        )
+    if po.status == PurchaseOrder.STATUS_CANCELLED and new_net != 0:
+        raise SupplierPaymentError(f"{po.po_number} is cancelled; its net paid must stay at zero.")
+    return PurchaseOrderPayment.objects.create(
+        purchase_order=po, entry_type=PurchaseOrderPayment.TYPE_REVERSAL, amount=entry.amount,
+        entry_date=timezone.localdate(), reverses=entry, reversal_reason=reason, recorded_by=user,
+    )
+

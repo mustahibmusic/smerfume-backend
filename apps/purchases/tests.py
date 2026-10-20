@@ -491,8 +491,12 @@ class PurchaseOrderAdminTests(_POBase):
         items = {item["title"]: item for item in groups["Purchases"]}
         self.assertEqual(
             list(items),
-            ["Vendors", "Purchase Orders", "Goods Receipts", "Receipt Discrepancies",
-             "Booked Quantity History"],
+            ["Vendors", "Purchase Orders", "Goods Receipts", "Supplier Payments",
+             "Receipt Discrepancies", "Booked Quantity History"],
+        )
+        self.assertEqual(
+            str(items["Supplier Payments"]["link"]),
+            reverse("admin:purchases_purchaseorderpayment_changelist"),
         )
         self.assertEqual(
             str(items["Goods Receipts"]["link"]),
@@ -3337,3 +3341,191 @@ class SupplierPaymentConcurrencyTests(TransactionTestCase):
             t.join()
         self.assertEqual(sorted(results), ["ok", "refused"])
         self.assertEqual(PurchaseOrder.objects.get(pk=self.po.pk).net_paid, Decimal("600"))
+
+
+from django.contrib.admin.models import LogEntry  # noqa: E402
+
+from apps.core.test_utils import AdminQueryCountMixin  # noqa: E402
+
+
+def _purchases_staff(username, *codenames):
+    staff = User.objects.create_user(
+        username=username, email=f"{username}@example.com", password="testpass123", is_staff=True,
+    )
+    staff.user_permissions.add(
+        *Permission.objects.filter(content_type__app_label="purchases", codename__in=codenames)
+    )
+    return staff
+
+
+FINANCE_PERMS = ("view_purchaseorder", "view_purchaseorderpayment", "record_po_payment", "reverse_po_payment")
+
+
+class SupplierPaymentAdminTests(_POBase):
+    def setUp(self):
+        super().setUp()
+        self.po = self._po(purchase_tax_treatment=NO_GST)
+        self._line(self.po, quantity_ordered=1, unit_price=Decimal("1000"))
+        services.issue_purchase_order(self.po, self.user)
+
+    def _url(self, name, po=None):
+        return reverse(f"admin:purchases_purchaseorder_{name}", args=[(po or self.po).pk])
+
+    def _pay_data(self, **overrides):
+        data = {
+            "amount": "250.00", "entry_date": timezone.localdate().isoformat(),
+            "method": "upi", "reference": "UTR-9", "notes": "",
+        }
+        data.update(overrides)
+        return data
+
+    def test_add_form_requires_tax_treatment_without_default(self):
+        request = RequestFactory().get("/")
+        request.user = self.user
+        form_class = PurchaseOrderAdmin(PurchaseOrder, django_admin.site).get_form(request, None)
+        field = form_class.base_fields["purchase_tax_treatment"]
+        self.assertTrue(field.required)
+        self.assertIsNone(form_class().initial.get("purchase_tax_treatment"))
+
+    def test_tax_treatment_readonly_after_issue(self):
+        request = RequestFactory().get("/")
+        request.user = self.user
+        model_admin = PurchaseOrderAdmin(PurchaseOrder, django_admin.site)
+        self.po.refresh_from_db()
+        self.assertIn("purchase_tax_treatment", model_admin.get_readonly_fields(request, self.po))
+
+    def test_payment_panel_uses_operational_labels(self):
+        services.record_po_payment(
+            self.po, amount=Decimal("250"), entry_date=timezone.localdate(), method="cash",
+            reference="", notes="", user=self.user,
+        )
+        self.client.force_login(self.user)
+        resp = self.client.get(reverse("admin:purchases_purchaseorder_change", args=[self.po.pk]))
+        self.assertContains(resp, "Supplier payments (operational)")
+        self.assertContains(resp, "Remaining against PO (operational)")
+        self.assertContains(resp, "Ordered gross total")
+        self.assertContains(resp, "750.00")
+        self.assertNotContains(resp, "Balance due")
+
+    def test_record_payment_requires_permission(self):
+        self.client.force_login(_purchases_staff("pobuyer2", "view_purchaseorder", "change_purchaseorder"))
+        self.assertEqual(self.client.post(self._url("record_payment"), self._pay_data()).status_code, 403)
+        self.assertFalse(PurchaseOrderPayment.objects.exists())
+
+    def test_record_payment_flow_and_log(self):
+        finance = _purchases_staff("finance1", *FINANCE_PERMS)
+        self.client.force_login(finance)
+        resp = self.client.get(self._url("record_payment"))
+        self.assertContains(resp, 'name="reference"')
+        self.assertFalse(PurchaseOrderPayment.objects.exists())
+        self.client.post(self._url("record_payment"), self._pay_data())
+        entry = PurchaseOrderPayment.objects.get()
+        self.assertEqual((entry.amount, entry.recorded_by), (Decimal("250.00"), finance))
+        self.assertTrue(LogEntry.objects.filter(object_id=str(self.po.pk)).exists())
+
+    def test_service_error_shown(self):
+        self.client.force_login(_purchases_staff("finance2", *FINANCE_PERMS))
+        resp = self.client.post(self._url("record_payment"), self._pay_data(amount="5000"), follow=True)
+        self.assertContains(resp, "exceed")
+        self.assertFalse(PurchaseOrderPayment.objects.exists())
+
+    def test_record_vendor_refund(self):
+        services.record_po_payment(
+            self.po, amount=Decimal("500"), entry_date=timezone.localdate(), method="cash",
+            reference="", notes="", user=self.user,
+        )
+        self.client.force_login(_purchases_staff("finance3", *FINANCE_PERMS))
+        self.client.post(self._url("record_vendor_refund"), self._pay_data(amount="100", reference="RF-1"))
+        self.assertTrue(PurchaseOrderPayment.objects.filter(entry_type=REFUND, amount=Decimal("100")).exists())
+
+    def test_reverse_entry(self):
+        payment = services.record_po_payment(
+            self.po, amount=Decimal("500"), entry_date=timezone.localdate(), method="cash",
+            reference="", notes="", user=self.user,
+        )
+        self.client.force_login(_purchases_staff("finance4", *FINANCE_PERMS))
+        resp = self.client.get(self._url("reverse_payment_entry"))
+        self.assertContains(resp, 'name="entry"')
+        self.client.post(self._url("reverse_payment_entry"), {"entry": payment.pk, "reason": "wrong PO"})
+        self.assertTrue(PurchaseOrderPayment.objects.filter(entry_type=REVERSAL, reverses=payment).exists())
+
+    def test_reverse_requires_reverse_permission(self):
+        payment = services.record_po_payment(
+            self.po, amount=Decimal("500"), entry_date=timezone.localdate(), method="cash",
+            reference="", notes="", user=self.user,
+        )
+        self.client.force_login(_purchases_staff("recorderonly", "view_purchaseorder", "record_po_payment"))
+        resp = self.client.post(self._url("reverse_payment_entry"), {"entry": payment.pk, "reason": "x"})
+        self.assertEqual(resp.status_code, 403)
+
+    def test_payment_actions_hidden_on_draft_and_cancelled(self):
+        request = RequestFactory().get("/")
+        request.user = self.user
+        model_admin = PurchaseOrderAdmin(PurchaseOrder, django_admin.site)
+        self.assertTrue(model_admin.has_record_payment_permission(request, self.po.pk))
+        draft = self._po(purchase_tax_treatment=NO_GST)
+        self.assertFalse(model_admin.has_record_payment_permission(request, draft.pk))
+        PurchaseOrder.objects.filter(pk=self.po.pk).update(status=PurchaseOrder.STATUS_CANCELLED)
+        self.assertFalse(model_admin.has_record_payment_permission(request, self.po.pk))
+
+    def test_set_tax_treatment_is_manager_only(self):
+        legacy = self._po(purchase_tax_treatment=None)
+        self._line(legacy, tax_rate=Decimal("18"))
+        PurchaseOrder.objects.filter(pk=legacy.pk).update(status=PurchaseOrder.STATUS_RECEIVED)
+        url = self._url("set_tax_treatment", legacy)
+        self.client.force_login(_purchases_staff("finance5", *FINANCE_PERMS))
+        self.assertEqual(self.client.post(url, {"treatment": GST}).status_code, 403)
+        self.client.force_login(_purchases_staff("manager1", "view_purchaseorder", "set_po_tax_treatment"))
+        self.client.post(url, {"treatment": GST})
+        legacy.refresh_from_db()
+        self.assertEqual(legacy.purchase_tax_treatment, GST)
+        request = RequestFactory().get("/")
+        request.user = self.user
+        self.assertFalse(
+            PurchaseOrderAdmin(PurchaseOrder, django_admin.site).has_set_tax_treatment_permission(request, legacy.pk)
+        )
+
+    def test_list_payment_status_and_treatment_filters(self):
+        services.record_po_payment(
+            self.po, amount=Decimal("1000"), entry_date=timezone.localdate(), method="cash",
+            reference="", notes="", user=self.user,
+        )
+        unpaid = self._po(purchase_tax_treatment=GST)
+        self.client.force_login(self.user)
+        url = reverse("admin:purchases_purchaseorder_changelist")
+        paid = set(self.client.get(url, {"payment_status": "paid"}).context["cl"].result_list)
+        self.assertEqual(paid, {self.po})
+        gst = set(self.client.get(url, {"purchase_tax_treatment__exact": GST}).context["cl"].result_list)
+        self.assertEqual(gst, {unpaid})
+
+
+class SupplierPaymentLedgerAdminTests(AdminQueryCountMixin, _POBase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.user)
+
+    def test_ledger_admin_is_read_only(self):
+        from apps.purchases.admin import PurchaseOrderPaymentAdmin
+        request = RequestFactory().get("/")
+        request.user = self.user
+        model_admin = PurchaseOrderPaymentAdmin(PurchaseOrderPayment, django_admin.site)
+        self.assertFalse(model_admin.has_add_permission(request))
+        self.assertFalse(model_admin.has_change_permission(request))
+        self.assertFalse(model_admin.has_delete_permission(request))
+
+    def test_ledger_search_by_reference(self):
+        po = self._po(purchase_tax_treatment=NO_GST)
+        self._line(po, quantity_ordered=1, unit_price=Decimal("1000"))
+        services.issue_purchase_order(po, self.user)
+        entry = services.record_po_payment(
+            po, amount=Decimal("10"), entry_date=timezone.localdate(), method="upi",
+            reference="UTR-FIND-ME", notes="", user=self.user,
+        )
+        resp = self.client.get(reverse("admin:purchases_purchaseorderpayment_changelist"), {"q": "FIND-ME"})
+        self.assertEqual(list(resp.context["cl"].result_list), [entry])
+
+    def test_po_list_query_count_is_flat(self):
+        def make(i):
+            po = self._po(purchase_tax_treatment=NO_GST)
+            self._line(po, variant=_variant(f"SKU-PAYQ-{i}"), quantity_ordered=1, unit_price=Decimal("100"))
+        self.assertChangelistQueriesFlat(reverse("admin:purchases_purchaseorder_changelist"), make)

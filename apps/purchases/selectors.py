@@ -316,3 +316,14 @@ def annotate_payment_summary(queryset):
         )
     )
 
+
+def reversible_payment_entries(po):
+    """Payments and vendor refunds of a PO that have not been reversed."""
+    from .models import PurchaseOrderPayment
+
+    return PurchaseOrderPayment.objects.filter(
+        purchase_order_id=po.pk,
+        entry_type__in=[PurchaseOrderPayment.TYPE_PAYMENT, PurchaseOrderPayment.TYPE_VENDOR_REFUND],
+        reversal__isnull=True,
+    ).order_by("entry_date", "pk")
+

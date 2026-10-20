@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django import forms
 from django.contrib import admin, messages
 from django.db.models import Count, Q, Sum
@@ -20,11 +22,13 @@ from apps.inventory.models import Supplier, Warehouse
 from . import selectors
 from . import services as po_services
 from .models import (
+    PAYMENT_STATUS_CHOICES,
     BookedQuantityChange,
     GoodsReceipt,
     GoodsReceiptLine,
     PurchaseOrder,
     PurchaseOrderLine,
+    PurchaseOrderPayment,
     ReceiptDiscrepancy,
 )
 
@@ -207,6 +211,55 @@ class OpeningReceiptForm(forms.Form):
         self.fields["received_date"].initial = timezone.localdate()
 
 
+class SupplierPaymentForm(forms.Form):
+    amount = forms.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal("0.01"))
+    entry_date = forms.DateField(widget=UnfoldAdminDateWidget, label="Date")
+    method = forms.ChoiceField(choices=PurchaseOrderPayment.METHOD_CHOICES, widget=UnfoldAdminSelectWidget)
+    reference = forms.CharField(
+        required=False, max_length=100, widget=UnfoldAdminTextInputWidget,
+        help_text="UTR, cheque or card slip number. Optional for cash.",
+    )
+    notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["entry_date"].initial = timezone.localdate()
+
+
+class ReversePaymentEntryForm(forms.Form):
+    entry = forms.ModelChoiceField(queryset=PurchaseOrderPayment.objects.none(), widget=UnfoldAdminSelectWidget)
+    reason = forms.CharField(widget=UnfoldAdminTextareaWidget, help_text="Why the original entry was wrong.")
+
+    def __init__(self, *args, po, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["entry"].queryset = selectors.reversible_payment_entries(po)
+        self.fields["entry"].label_from_instance = lambda e: (
+            f"{e.entry_date} {e.get_entry_type_display()} {e.amount} ({e.get_method_display()} {e.reference})"
+        )
+
+
+class SetTaxTreatmentForm(forms.Form):
+    treatment = forms.ChoiceField(
+        choices=PurchaseOrder.TAX_TREATMENT_CHOICES, widget=UnfoldAdminSelectWidget,
+        label="Purchase tax treatment",
+    )
+
+
+class PaymentStatusFilter(admin.SimpleListFilter):
+    """Operational PO-payment coverage (DEC-010), from the SQL annotation."""
+
+    title = "payment status"
+    parameter_name = "payment_status"
+
+    def lookups(self, request, model_admin):
+        return PAYMENT_STATUS_CHOICES
+
+    def queryset(self, request, queryset):
+        if self.value() in dict(PAYMENT_STATUS_CHOICES):
+            return queryset.filter(payment_status_db=self.value())
+        return queryset
+
+
 class OverduePurchaseOrderFilter(admin.SimpleListFilter):
     """Still expecting goods (issued or partially received) after the
     expected date."""
@@ -234,26 +287,40 @@ class PurchaseOrderAdmin(ModelAdmin):
     inlines = [PurchaseOrderLineInline]
     list_display = (
         "po_number", "supplier", "warehouse", "order_date", "expected_date",
-        "status_label", "line_count", "order_value", "created_by",
+        "status_label", "line_count", "ordered_gross_total_display", "net_paid_display",
+        "payment_status_label", "created_by",
     )
-    list_filter = ("status", OverduePurchaseOrderFilter, "supplier", "warehouse", "order_date")
+    list_filter = (
+        "status", PaymentStatusFilter, "purchase_tax_treatment", OverduePurchaseOrderFilter,
+        "supplier", "warehouse", "order_date",
+    )
     search_fields = (
         "po_number", "supplier__name", "supplier__vendor_code",
         "vendor_reference", "lines__variant__sku",
     )
     list_select_related = ("supplier", "warehouse", "created_by")
-    actions_detail = ["issue_po", "receive_goods", "confirm_booked", "close_po", "cancel_po"]
+    actions_detail = [
+        "issue_po", "receive_goods", "confirm_booked", "close_po", "cancel_po",
+        "record_payment", "record_vendor_refund", "reverse_payment_entry", "set_tax_treatment",
+    ]
     fieldsets = (
         ("Purchase order", {"fields": (
             "number", "status", "supplier", "warehouse", "order_date", "expected_date",
         )}),
-        ("Vendor terms", {"fields": ("vendor_reference", "amounts_include_tax")}),
+        ("Vendor terms", {"fields": ("vendor_reference", "purchase_tax_treatment", "amounts_include_tax")}),
         ("Notes", {"fields": ("notes",)}),
         ("Receiving", {"fields": ("open_discrepancies", "awaiting_orders")}),
         ("Totals", {"fields": (
             "total_gross_amount", "total_discount_amount",
             "total_discounted_amount", "total_taxable_value",
         )}),
+        ("Supplier payments (operational)", {
+            "fields": ("supplier_payments",),
+            "description": (
+                "Operational payment tracking against this PO only. Not the accounting "
+                "balance: Zoho Books is authoritative for vendor bills and amounts owed."
+            ),
+        }),
         ("Audit", {"fields": AUDIT_FIELDS, "classes": ("collapse",)}),
     )
     TOTAL_FIELDS = (
@@ -262,7 +329,7 @@ class PurchaseOrderAdmin(ModelAdmin):
     )
 
     def get_queryset(self, request):
-        return (
+        return selectors.annotate_payment_summary(
             super().get_queryset(request)
             .annotate(_line_count=Count("lines"))
             .prefetch_related("lines")
@@ -275,14 +342,14 @@ class PurchaseOrderAdmin(ModelAdmin):
     def get_readonly_fields(self, request, obj=None):
         always = (
             "number", "status", "open_discrepancies", "awaiting_orders",
-            *self.TOTAL_FIELDS, *AUDIT_FIELDS,
+            *self.TOTAL_FIELDS, "supplier_payments", *AUDIT_FIELDS,
         )
         if obj is None:
             return always
         editable = set(obj.editable_fields())
         header = (
             "supplier", "warehouse", "order_date", "expected_date",
-            "vendor_reference", "amounts_include_tax", "notes",
+            "vendor_reference", "purchase_tax_treatment", "amounts_include_tax", "notes",
         )
         return always + tuple(f for f in header if f not in editable)
 
@@ -296,7 +363,11 @@ class PurchaseOrderAdmin(ModelAdmin):
 
     def get_form(self, request, obj=None, **kwargs):
         request._po_supplier_id = obj.supplier_id if obj else None
-        return super().get_form(request, obj, **kwargs)
+        form = super().get_form(request, obj, **kwargs)
+        # DEC-010: drafts must choose the tax treatment explicitly (no default).
+        if "purchase_tax_treatment" in form.base_fields:
+            form.base_fields["purchase_tax_treatment"].required = True
+        return form
 
     def save_model(self, request, obj, form, change):
         if not change:
@@ -316,9 +387,61 @@ class PurchaseOrderAdmin(ModelAdmin):
     def line_count(self, obj):
         return obj._line_count
 
-    @admin.display(description="Order value")
-    def order_value(self, obj):
-        return obj.total_discounted_amount
+    @admin.display(description="Ordered gross total", ordering="ordered_gross_total_db")
+    def ordered_gross_total_display(self, obj):
+        value = getattr(obj, "ordered_gross_total_db", None)
+        if obj.purchase_tax_treatment is None:
+            return "Unclassified"
+        return "-" if value is None else value
+
+    @admin.display(description="Net paid", ordering="net_paid_db")
+    def net_paid_display(self, obj):
+        return getattr(obj, "net_paid_db", None)
+
+    @display(description="Payment", label={"Unpaid": "danger", "Partially paid": "warning", "Paid": "success"})
+    def payment_status_label(self, obj):
+        return dict(PAYMENT_STATUS_CHOICES).get(getattr(obj, "payment_status_db", None), "-")
+
+    @admin.display(description="Supplier payments")
+    def supplier_payments(self, obj):
+        """Operational coverage and the full ledger (read-only)."""
+        if not obj.pk:
+            return "-"
+        summary = obj.payment_summary()
+        total = obj.ordered_gross_total
+        remaining = obj.remaining_against_po
+        figures = [
+            ("Purchase tax treatment", obj.get_purchase_tax_treatment_display() or "Unclassified"),
+            ("Ordered gross total", "-" if total is None else total),
+            ("Gross payments", summary["gross_payments"]),
+            ("Vendor refunds", summary["vendor_refunds"]),
+            ("Reversals", summary["reversals"]),
+            ("Net paid", summary["net_paid"]),
+            ("Remaining against PO (operational)", "-" if remaining is None else remaining),
+            ("Payment status", dict(PAYMENT_STATUS_CHOICES)[obj.payment_status]),
+        ]
+        entries = obj.payment_entries.select_related("recorded_by", "reverses").order_by("entry_date", "pk")
+        rows = format_html_join(
+            "", "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            (
+                (
+                    e.entry_date, e.get_entry_type_display(), e.amount, e.get_method_display() or "-",
+                    e.reference or "-", e.notes or e.reversal_reason or "-", e.recorded_by,
+                    f"reverses #{e.reverses_id}" if e.reverses_id else (
+                        "reversed" if hasattr(e, "reversal") else "-"
+                    ),
+                )
+                for e in entries
+            ),
+        )
+        return format_html(
+            "<table><tbody>{}</tbody></table>"
+            "<table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Method</th>"
+            "<th>Reference</th><th>Notes / reason</th><th>Recorded by</th><th>Link</th></tr></thead>"
+            "<tbody>{}</tbody></table>",
+            format_html_join("", "<tr><th>{}</th><td>{}</td></tr>", figures),
+            rows or format_html('<tr><td colspan="8">{}</td></tr>', "No entries"),
+        )
 
     @admin.display(description="Open receipt discrepancies")
     def open_discrepancies(self, obj):
@@ -389,6 +512,35 @@ class PurchaseOrderAdmin(ModelAdmin):
         if object_id is None:
             return True
         return PurchaseOrder.objects.filter(pk=object_id, status__in=status).exists()
+
+    def _payable(self, object_id):
+        if object_id is None:
+            return True
+        return PurchaseOrder.objects.filter(
+            pk=object_id, status__in=PurchaseOrder.PAYABLE_STATUSES, purchase_tax_treatment__isnull=False,
+        ).exists()
+
+    def has_record_payment_permission(self, request, object_id=None):
+        return request.user.has_perm("purchases.record_po_payment") and self._payable(object_id)
+
+    def has_record_vendor_refund_permission(self, request, object_id=None):
+        return request.user.has_perm("purchases.record_po_payment") and self._payable(object_id)
+
+    def has_reverse_payment_entry_permission(self, request, object_id=None):
+        if not request.user.has_perm("purchases.reverse_po_payment"):
+            return False
+        if object_id is None:
+            return True
+        return selectors.reversible_payment_entries(PurchaseOrder(pk=object_id)).exists()
+
+    def has_set_tax_treatment_permission(self, request, object_id=None):
+        if not request.user.has_perm("purchases.set_po_tax_treatment"):
+            return False
+        if object_id is None:
+            return True
+        return PurchaseOrder.objects.filter(pk=object_id, purchase_tax_treatment__isnull=True).exclude(
+            status__in=[PurchaseOrder.STATUS_DRAFT, PurchaseOrder.STATUS_CANCELLED]
+        ).exists()
 
     def has_issue_permission(self, request, object_id=None):
         return request.user.has_perm("purchases.issue_purchaseorder") and self._po_in_status(
@@ -550,6 +702,101 @@ class PurchaseOrderAdmin(ModelAdmin):
             f"Cancel purchase order {po.po_number} for {po.supplier}. This cannot be "
             "undone. The order stays on record as cancelled.",
             "Cancel purchase order", "bg-red-600",
+        )
+
+    def _ledger_entry_action(self, request, object_id, service, title, message, button_label, verb):
+        po = get_object_or_404(PurchaseOrder, pk=object_id)
+        form = SupplierPaymentForm(request.POST or None)
+        if request.method == "POST" and form.is_valid():
+            data = form.cleaned_data
+            try:
+                entry = service(
+                    po, amount=data["amount"], entry_date=data["entry_date"], method=data["method"],
+                    reference=data["reference"], notes=data["notes"], user=request.user,
+                )
+            except po_services.SupplierPaymentError as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+            else:
+                self.log_change(request, po, f"{verb} {entry.amount} ({entry.get_method_display()}).")
+                self.message_user(request, f"{verb} {entry.amount} on {po.po_number}.", level=messages.SUCCESS)
+            return redirect(self._change_url(po))
+        summary = po.payment_summary()
+        rows = [
+            f"Ordered gross total: {po.ordered_gross_total}",
+            f"Net paid: {summary['net_paid']}",
+            f"Remaining against PO (operational): {po.remaining_against_po}",
+        ]
+        return self._action_page(request, po, title, form, message, button_label, "bg-primary-600", rows=rows)
+
+    @action(description="Record payment", url_path="record-payment", permissions=["record_payment"], icon="payments")
+    def record_payment(self, request, object_id):
+        """GET shows the form; only POST records, through the service."""
+        return self._ledger_entry_action(
+            request, object_id, po_services.record_po_payment, "Record supplier payment",
+            "Record money paid to the supplier against this PO. Operational record only; "
+            "the entry cannot be edited later (use a reversal if it is wrong).",
+            "Record payment", "Recorded payment",
+        )
+
+    @action(
+        description="Record vendor refund", url_path="record-vendor-refund",
+        permissions=["record_vendor_refund"], icon="currency_exchange",
+    )
+    def record_vendor_refund(self, request, object_id):
+        return self._ledger_entry_action(
+            request, object_id, po_services.record_vendor_refund, "Record vendor refund",
+            "Record money the supplier actually returned. It reduces net paid and cannot exceed it. "
+            "To correct a wrongly entered payment, use Reverse entry instead.",
+            "Record vendor refund", "Recorded vendor refund",
+        )
+
+    @action(
+        description="Reverse entry", url_path="reverse-payment-entry",
+        permissions=["reverse_payment_entry"], icon="undo",
+    )
+    def reverse_payment_entry(self, request, object_id):
+        po = get_object_or_404(PurchaseOrder, pk=object_id)
+        form = ReversePaymentEntryForm(request.POST or None, po=po)
+        if request.method == "POST" and form.is_valid():
+            entry = form.cleaned_data["entry"]
+            try:
+                po_services.reverse_po_payment_entry(entry, form.cleaned_data["reason"], request.user)
+            except po_services.SupplierPaymentError as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+            else:
+                self.log_change(request, po, f"Reversed {entry.get_entry_type_display().lower()} {entry.amount}.")
+                self.message_user(request, f"Entry reversed on {po.po_number}.", level=messages.SUCCESS)
+            return redirect(self._change_url(po))
+        return self._action_page(
+            request, po, f"Reverse an entry on {po.po_number}", form,
+            "Use this only when a payment or vendor refund was recorded incorrectly. The full amount "
+            "is reversed and the original entry stays on record.",
+            "Reverse entry", "bg-red-600", rows=[f"Net paid: {po.net_paid}"],
+        )
+
+    @action(
+        description="Set tax treatment", url_path="set-tax-treatment",
+        permissions=["set_tax_treatment"], icon="rule",
+    )
+    def set_tax_treatment(self, request, object_id):
+        """Manager-only, one-time classification of a pre-DEC-010 PO."""
+        po = get_object_or_404(PurchaseOrder, pk=object_id)
+        form = SetTaxTreatmentForm(request.POST or None)
+        if request.method == "POST" and form.is_valid():
+            try:
+                po_services.set_po_tax_treatment(po, form.cleaned_data["treatment"], request.user)
+            except po_services.PurchaseOrderError as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+            else:
+                po.refresh_from_db()
+                self.log_change(request, po, f"Classified as {po.get_purchase_tax_treatment_display()}.")
+                self.message_user(request, f"{po.po_number} classified.", level=messages.SUCCESS)
+            return redirect(self._change_url(po))
+        return self._action_page(
+            request, po, f"Set tax treatment for {po.po_number}", form,
+            "This PO was created before purchase tax treatment existed. Choose it once; it is "
+            "checked against the PO lines and cannot be changed afterwards.",
+            "Set tax treatment", "bg-primary-600",
         )
 
     def _action_page(self, request, po, title, form, message, button_label, button_class,
@@ -1163,3 +1410,35 @@ class BookedQuantityChangeAdmin(ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+@admin.register(PurchaseOrderPayment)
+class PurchaseOrderPaymentAdmin(ModelAdmin):
+    """DEC-010 supplier payment ledger. Read-only for everyone: entries are
+    recorded and reversed only from the purchase order page."""
+
+    list_display = (
+        "entry_date", "purchase_order", "vendor", "entry_type", "amount", "method",
+        "reference", "recorded_by", "reverses",
+    )
+    list_filter = ("entry_type", "method")
+    search_fields = (
+        "purchase_order__po_number", "purchase_order__supplier__name",
+        "purchase_order__supplier__vendor_code", "reference",
+    )
+    date_hierarchy = "entry_date"
+    list_select_related = ("purchase_order__supplier", "recorded_by", "reverses")
+
+    @admin.display(description="Vendor", ordering="purchase_order__supplier__name")
+    def vendor(self, obj):
+        return obj.purchase_order.supplier
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+

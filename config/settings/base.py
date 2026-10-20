@@ -438,6 +438,11 @@ UNFOLD = {
                         "admin:purchases_goodsreceipt_changelist", "purchases.view_goodsreceipt",
                     ),
                     _nav_item(
+                        "Supplier Payments", "payments",
+                        "admin:purchases_purchaseorderpayment_changelist",
+                        "purchases.view_purchaseorderpayment",
+                    ),
+                    _nav_item(
                         "Receipt Discrepancies", "report_problem",
                         "admin:purchases_receiptdiscrepancy_changelist",
                         "purchases.view_receiptdiscrepancy",

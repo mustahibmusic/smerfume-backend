@@ -1,3 +1,5 @@
+import uuid
+
 from django.contrib.postgres.indexes import GinIndex
 from django.core.exceptions import ValidationError
 from django.db import models
@@ -267,6 +269,14 @@ class ProductVariant(BaseModel):
         return self.display_name()
 
 
+def variant_image_upload_to(instance, filename):
+    """Gallery files get a fresh UUID name in a per-variant folder, so an
+    edited image is always a new storage object (no overwrite, no stale
+    caches). The uploaded name is ignored apart from its extension."""
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else "webp"
+    return f"catalog/variant_images/{instance.variant.public_id}/{uuid.uuid4().hex}.{extension}"
+
+
 class ProductVariantImage(BaseModel):
     """One image for a ProductVariant's gallery. role=primary is the
     canonical image for the product page, structured data, Open Graph,
@@ -275,7 +285,7 @@ class ProductVariantImage(BaseModel):
     Deleting the primary/secondary image never auto-promotes another image
     into that role; a human has to choose the replacement explicitly."""
 
-    MAX_IMAGES_PER_VARIANT = 10
+    MAX_IMAGES_PER_VARIANT = 20
 
     ROLE_PRIMARY = "primary"
     ROLE_SECONDARY = "secondary"
@@ -290,7 +300,7 @@ class ProductVariantImage(BaseModel):
     variant = models.ForeignKey(
         ProductVariant, on_delete=models.CASCADE, related_name="images"
     )
-    image = models.ImageField(upload_to="catalog/variant_images/")
+    image = models.ImageField(upload_to=variant_image_upload_to)
     role = models.CharField(max_length=10, choices=ROLE_CHOICES, default=ROLE_GALLERY)
     alt_text = models.CharField(
         max_length=255, blank=True,
@@ -299,12 +309,20 @@ class ProductVariantImage(BaseModel):
     sort_order = models.PositiveSmallIntegerField(
         default=0, help_text="Deterministic gallery order, lowest first."
     )
+    # Set by apps.catalog.image_services from the processed image (not
+    # ImageField.width_field, which would open the file on every load of a
+    # row whose dimensions are empty). Null for rows created before the
+    # gallery manager until backfill_variant_image_dimensions runs.
+    width = models.PositiveIntegerField(null=True, blank=True, editable=False)
+    height = models.PositiveIntegerField(null=True, blank=True, editable=False)
+    # SHA-256 of the stored (normalised) bytes; "" for legacy rows.
+    content_hash = models.CharField(max_length=64, blank=True, default="", editable=False)
 
     class Meta:
         ordering = ["sort_order", "id"]
         constraints = [
             # At most one primary / one secondary per variant. Gallery has
-            # no such limit (besides the shared 10-image cap enforced in
+            # no such limit (besides the shared image cap enforced in
             # clean()). DB-level, so it holds even outside the admin.
             models.UniqueConstraint(
                 fields=["variant"], condition=models.Q(role="primary"),
@@ -313,6 +331,10 @@ class ProductVariantImage(BaseModel):
             models.UniqueConstraint(
                 fields=["variant"], condition=models.Q(role="secondary"),
                 name="unique_secondary_image_per_variant",
+            ),
+            models.UniqueConstraint(
+                fields=["variant", "content_hash"], condition=~models.Q(content_hash=""),
+                name="unique_image_hash_per_variant",
             ),
         ]
 

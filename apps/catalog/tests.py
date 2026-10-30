@@ -824,7 +824,7 @@ class ProductVariantImageModelTests(TestCase):
             selling_price=Decimal("900.00"), sku="TEST-IMG-VARIANT",
         )
 
-    def test_max_10_images_per_variant_enforced(self):
+    def test_max_images_per_variant_enforced(self):
         for i in range(ProductVariantImage.MAX_IMAGES_PER_VARIANT):
             ProductVariantImage.objects.create(
                 variant=self.variant, image=_fake_image(f"g{i}.jpg"), role=ProductVariantImage.ROLE_GALLERY,
@@ -1391,3 +1391,87 @@ class ImageProcessingTests(TestCase):
         with mock.patch.object(image_processing, "MAX_OUTPUT_BYTES", 100):
             with self.assertRaisesMessage(ImageRejected, "5 MB"):
                 process_image(_real_image())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16. Variant image gallery — metadata fields, storage names, backfill
+# ─────────────────────────────────────────────────────────────────────────────
+
+from io import StringIO  # noqa: E402
+
+from django.core.management import call_command  # noqa: E402
+
+from .models import variant_image_upload_to  # noqa: E402
+
+
+def _gallery_variant(sku="GALLERY-SKU"):
+    brand, _ = Brand.objects.get_or_create(name="GalleryBrand", slug="gallerybrand")
+    category, _ = Category.objects.get_or_create(name="GalleryCat", slug="gallerycat")
+    product, _ = Product.objects.get_or_create(
+        name="GalleryProduct", slug="galleryproduct", brand=brand, category=category,
+    )
+    edition, _ = ProductEdition.objects.get_or_create(product=product, gender="unisex", concentration="edp")
+    return ProductVariant.objects.create(
+        edition=edition, size_ml=100, mrp=Decimal("1000.00"), selling_price=Decimal("900.00"), sku=sku,
+    )
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class VariantImageMetadataTests(TestCase):
+    def setUp(self):
+        self.variant = _gallery_variant()
+
+    def test_limit_is_20(self):
+        self.assertEqual(ProductVariantImage.MAX_IMAGES_PER_VARIANT, 20)
+
+    def test_upload_name_is_unique_per_variant_folder(self):
+        image = ProductVariantImage(variant=self.variant)
+        first = variant_image_upload_to(image, "anything.webp")
+        second = variant_image_upload_to(image, "anything.webp")
+        self.assertTrue(first.startswith(f"catalog/variant_images/{self.variant.public_id}/"))
+        self.assertTrue(first.endswith(".webp"))
+        self.assertNotEqual(first, second)
+        self.assertNotIn("anything", first)
+
+    def test_dimensions_and_hash_default_empty(self):
+        image = ProductVariantImage.objects.create(variant=self.variant, image=_fake_image())
+        self.assertEqual((image.width, image.height, image.content_hash), (None, None, ""))
+
+    def test_hash_unique_per_variant_when_set(self):
+        ProductVariantImage.objects.create(variant=self.variant, image=_fake_image(), content_hash="a" * 64)
+        ProductVariantImage.objects.create(
+            variant=_gallery_variant("OTHER-SKU"), image=_fake_image(), content_hash="a" * 64,
+        )
+        ProductVariantImage.objects.create(variant=self.variant, image=_fake_image())
+        ProductVariantImage.objects.create(variant=self.variant, image=_fake_image())
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                ProductVariantImage.objects.create(variant=self.variant, image=_fake_image(), content_hash="a" * 64)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class BackfillVariantImageDimensionsTests(TestCase):
+    def setUp(self):
+        self.variant = _gallery_variant()
+
+    def _run(self):
+        out = StringIO()
+        call_command("backfill_variant_image_dimensions", stdout=out, stderr=StringIO())
+        return out.getvalue()
+
+    def test_fills_missing_dimensions_and_is_rerunnable(self):
+        image = ProductVariantImage.objects.create(variant=self.variant, image=_real_image(size=(1500, 900)))
+        output = self._run()
+        image.refresh_from_db()
+        self.assertEqual((image.width, image.height), (1500, 900))
+        self.assertIn("1 updated", output)
+        self.assertIn("0 updated", self._run())
+
+    def test_broken_or_missing_files_reported_not_fatal(self):
+        broken = ProductVariantImage.objects.create(variant=self.variant, image=_fake_image("broken.jpg"))
+        missing = ProductVariantImage.objects.create(variant=self.variant, image=_real_image())
+        missing.image.storage.delete(missing.image.name)
+        output = self._run()
+        self.assertIn("2 failed", output)
+        broken.refresh_from_db()
+        self.assertIsNone(broken.width)

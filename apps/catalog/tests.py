@@ -1681,3 +1681,54 @@ class VariantImageRoleConcurrencyTests(TransactionTestCase):
             thread.join()
         self.assertEqual(errors, [])
         self.assertEqual(variant.images.filter(role=PRIMARY).count(), 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 18. Variant image gallery — API additions (order unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class VariantImageGalleryAPITests(CatalogTestBase):
+    def setUp(self):
+        super().setUp()
+        self.variant = self.edition_sauvage.variants.get()
+        # Gallery first by sort_order on purpose: the API order must stay
+        # sort_order, id (the role-first order is gated on a storefront check).
+        self.gallery = ProductVariantImage.objects.create(
+            variant=self.variant, image=_fake_image("gallery.jpg"), role=GALLERY, sort_order=0,
+            width=2000, height=1500,
+        )
+        self.secondary = ProductVariantImage.objects.create(
+            variant=self.variant, image=_fake_image("secondary.jpg"), role=SECONDARY, sort_order=1,
+        )
+        self.primary = ProductVariantImage.objects.create(
+            variant=self.variant, image=_fake_image("primary.jpg"), role=PRIMARY, sort_order=2,
+        )
+
+    def _variant_payload(self):
+        response = self.client.get(detail_url("sauvage"))
+        return self._edition(response, "sauvage-edp")["variants"][0]
+
+    def test_images_order_is_still_sort_order_then_id(self):
+        roles = [image["role"] for image in self._variant_payload()["images"]]
+        self.assertEqual(roles, [GALLERY, SECONDARY, PRIMARY])
+
+    def test_secondary_image_field(self):
+        variant = self._variant_payload()
+        self.assertEqual(variant["secondary_image"]["public_id"], str(self.secondary.public_id))
+        self.assertEqual(variant["primary_image"]["public_id"], str(self.primary.public_id))
+        self.secondary.delete()
+        self.assertIsNone(self._variant_payload()["secondary_image"])
+
+    def test_width_height_on_each_image(self):
+        images = {image["role"]: image for image in self._variant_payload()["images"]}
+        self.assertEqual((images[GALLERY]["width"], images[GALLERY]["height"]), (2000, 1500))
+        self.assertIsNone(images[PRIMARY]["width"])
+
+    def test_existing_fields_unchanged(self):
+        variant = self._variant_payload()
+        for key in ("public_id", "sku", "image", "size_ml", "is_decant", "mrp", "selling_price",
+                    "images", "primary_image", "is_available"):
+            self.assertIn(key, variant)
+        for key in ("public_id", "image", "role", "alt_text", "sort_order"):
+            self.assertIn(key, variant["images"][0])

@@ -1266,3 +1266,128 @@ class CatalogAdminQueryCountTests(AdminQueryCountMixin, TestCase):
                 concentration="edp", gender="unisex",
             )
         self.assertChangelistQueriesFlat("/admin/catalog/productedition/", make)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15. Variant image gallery — image validation and normalisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+import io  # noqa: E402
+import hashlib  # noqa: E402
+from unittest import mock  # noqa: E402
+
+from PIL import Image  # noqa: E402
+
+from . import image_processing  # noqa: E402
+from .image_processing import ImageRejected, process_image  # noqa: E402
+
+
+def _real_image(size=(1600, 1200), fmt="JPEG", mode="RGB", color=(200, 30, 30), name=None, exif=None, **save_kwargs):
+    """A genuine encoded image generated with Pillow."""
+    image = Image.new(mode, size, color)
+    buffer = io.BytesIO()
+    if exif is not None:
+        save_kwargs["exif"] = exif.tobytes()
+    image.save(buffer, fmt, **save_kwargs)
+    extension = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp", "GIF": "gif"}[fmt]
+    return SimpleUploadedFile(name or f"photo.{extension}", buffer.getvalue(), content_type=f"image/{extension}")
+
+
+def _decode(processed):
+    return Image.open(io.BytesIO(processed.content))
+
+
+class ImageProcessingTests(TestCase):
+    def test_jpeg_png_webp_accepted_and_stored_as_webp(self):
+        for fmt in ("JPEG", "PNG", "WEBP"):
+            with self.subTest(fmt=fmt):
+                processed = process_image(_real_image(fmt=fmt))
+                self.assertEqual(processed.extension, "webp")
+                self.assertEqual(_decode(processed).format, "WEBP")
+                self.assertEqual((processed.width, processed.height), (1600, 1200))
+                self.assertEqual(processed.sha256, hashlib.sha256(processed.content).hexdigest())
+
+    def test_resized_to_2000_longest_side_keeping_aspect(self):
+        processed = process_image(_real_image(size=(3000, 1500)))
+        self.assertEqual((processed.width, processed.height), (2000, 1000))
+        self.assertEqual(_decode(processed).size, (2000, 1000))
+
+    def test_never_upscaled(self):
+        processed = process_image(_real_image(size=(1300, 1250)))
+        self.assertEqual((processed.width, processed.height), (1300, 1250))
+
+    def test_shortest_side_below_600_rejected(self):
+        with self.assertRaisesMessage(ImageRejected, "600"):
+            process_image(_real_image(size=(599, 1200)))
+
+    def test_low_resolution_warns_but_saves(self):
+        processed = process_image(_real_image(size=(900, 900)))
+        self.assertEqual(len(processed.warnings), 1)
+        self.assertIn("1200", processed.warnings[0])
+        self.assertEqual(process_image(_real_image(size=(1200, 1300))).warnings, ())
+
+    def test_oversized_input_rejected_before_decoding(self):
+        with self.assertRaisesMessage(ImageRejected, "6000"):
+            process_image(_real_image(size=(6001, 700)))
+
+    def test_upload_over_15_mb_rejected(self):
+        big = SimpleUploadedFile("big.jpg", b"\0" * (15 * 1024 * 1024 + 1), content_type="image/jpeg")
+        with self.assertRaisesMessage(ImageRejected, "15 MB"):
+            process_image(big)
+
+    def test_gif_svg_heic_and_garbage_rejected(self):
+        svg = SimpleUploadedFile("logo.svg", b'<svg xmlns="http://www.w3.org/2000/svg"/>', content_type="image/svg+xml")
+        garbage = SimpleUploadedFile("photo.jpg", b"not-an-image", content_type="image/jpeg")
+        for upload in (_real_image(fmt="GIF", mode="P", color=1), svg, garbage):
+            with self.subTest(name=upload.name):
+                with self.assertRaises(ImageRejected):
+                    process_image(upload)
+
+    def test_animated_webp_rejected(self):
+        frames = [Image.new("RGB", (800, 800), color) for color in ((255, 0, 0), (0, 255, 0))]
+        buffer = io.BytesIO()
+        frames[0].save(buffer, "WEBP", save_all=True, append_images=frames[1:], duration=100)
+        upload = SimpleUploadedFile("anim.webp", buffer.getvalue(), content_type="image/webp")
+        with self.assertRaisesMessage(ImageRejected, "nimated"):
+            process_image(upload)
+
+    def test_truncated_image_rejected(self):
+        whole = _real_image().read()
+        upload = SimpleUploadedFile("cut.jpg", whole[: len(whole) // 2], content_type="image/jpeg")
+        with self.assertRaises(ImageRejected):
+            process_image(upload)
+
+    def test_exif_orientation_applied_and_metadata_removed(self):
+        exif = Image.Exif()
+        exif[0x0112] = 6  # rotate 90 degrees clockwise when displayed
+        exif[0x010F] = "SecretCam"
+        processed = process_image(_real_image(size=(1600, 1000), exif=exif))
+        self.assertEqual((processed.width, processed.height), (1000, 1600))
+        decoded = _decode(processed)
+        self.assertEqual(dict(decoded.getexif()), {})
+        self.assertNotIn(b"SecretCam", processed.content)
+
+    def test_cmyk_converted_to_rgb(self):
+        processed = process_image(_real_image(mode="CMYK", color=(0, 200, 200, 0)))
+        self.assertEqual(_decode(processed).mode, "RGB")
+
+    def test_transparency_kept(self):
+        processed = process_image(_real_image(fmt="PNG", mode="RGBA", color=(10, 20, 30, 0)))
+        self.assertEqual(_decode(processed).mode, "RGBA")
+        opaque = process_image(_real_image(fmt="PNG", mode="RGBA", color=(10, 20, 30, 255)))
+        self.assertEqual(_decode(opaque).mode, "RGB")
+
+    def test_same_input_gives_same_hash(self):
+        self.assertEqual(process_image(_real_image()).sha256, process_image(_real_image()).sha256)
+
+    def test_fallback_formats_without_webp(self):
+        with mock.patch.object(image_processing.features, "check", return_value=False):
+            transparent = process_image(_real_image(fmt="PNG", mode="RGBA", color=(1, 2, 3, 0)))
+            opaque = process_image(_real_image())
+        self.assertEqual((transparent.extension, _decode(transparent).format), ("png", "PNG"))
+        self.assertEqual((opaque.extension, _decode(opaque).format), ("jpg", "JPEG"))
+
+    def test_final_file_over_limit_rejected(self):
+        with mock.patch.object(image_processing, "MAX_OUTPUT_BYTES", 100):
+            with self.assertRaisesMessage(ImageRejected, "5 MB"):
+                process_image(_real_image())

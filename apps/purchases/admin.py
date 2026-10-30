@@ -327,6 +327,31 @@ class PurchaseOrderAdmin(ModelAdmin):
         "total_gross_amount", "total_discount_amount",
         "total_discounted_amount", "total_taxable_value",
     )
+    # DEC-010: supplier payment data is shown only to users who may view the
+    # payment ledger. Ordered gross total stays visible (order value).
+    PAYMENT_LIST_COLUMNS = ("net_paid_display", "payment_status_label")
+
+    @staticmethod
+    def _can_view_payments(request):
+        return request.user.has_perm("purchases.view_purchaseorderpayment")
+
+    def get_list_display(self, request):
+        columns = super().get_list_display(request)
+        if self._can_view_payments(request):
+            return columns
+        return tuple(c for c in columns if c not in self.PAYMENT_LIST_COLUMNS)
+
+    def get_list_filter(self, request):
+        filters = super().get_list_filter(request)
+        if self._can_view_payments(request):
+            return filters
+        return tuple(f for f in filters if f is not PaymentStatusFilter)
+
+    def get_fieldsets(self, request, obj=None):
+        fieldsets = super().get_fieldsets(request, obj)
+        if self._can_view_payments(request):
+            return fieldsets
+        return tuple(fs for fs in fieldsets if "supplier_payments" not in fs[1]["fields"])
 
     def get_queryset(self, request):
         return selectors.annotate_payment_summary(

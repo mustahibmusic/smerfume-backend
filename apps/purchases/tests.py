@@ -3499,6 +3499,78 @@ class SupplierPaymentAdminTests(_POBase):
         self.assertEqual(gst, {unpaid})
 
 
+class SupplierPaymentVisibilityTests(_POBase):
+    """Supplier payment data on PO admin pages needs view_purchaseorderpayment."""
+
+    def setUp(self):
+        super().setUp()
+        self.po = self._po(purchase_tax_treatment=NO_GST)
+        self._line(self.po, quantity_ordered=1, unit_price=Decimal("1000"))
+        services.issue_purchase_order(self.po, self.user)
+        services.record_po_payment(
+            self.po, amount=Decimal("250"), entry_date=timezone.localdate(), method="upi",
+            reference="UTR-SECRET-1", notes="", user=self.user,
+        )
+
+    def _group_staff(self, username, group_name):
+        from io import StringIO
+
+        from django.contrib.auth.models import Group
+        from django.core.management import call_command
+
+        call_command("setup_staff_groups", stdout=StringIO())
+        staff = User.objects.create_user(
+            username=username, email=f"{username}@example.com", password="testpass123", is_staff=True,
+        )
+        staff.groups.add(Group.objects.get(name=group_name))
+        return staff
+
+    def _change_page(self, user):
+        self.client.force_login(user)
+        return self.client.get(reverse("admin:purchases_purchaseorder_change", args=[self.po.pk]))
+
+    def _changelist(self, user):
+        self.client.force_login(user)
+        cl = self.client.get(reverse("admin:purchases_purchaseorder_changelist")).context["cl"]
+        return list(cl.list_display), [spec.title for spec in cl.filter_specs]
+
+    def assertSeesPayments(self, user):
+        resp = self._change_page(user)
+        for text in ("Supplier payments (operational)", "UTR-SECRET-1", "Net paid", "Remaining against PO"):
+            self.assertContains(resp, text)
+        columns, filters = self._changelist(user)
+        self.assertIn("net_paid_display", columns)
+        self.assertIn("payment_status_label", columns)
+        self.assertIn("payment status", filters)
+
+    def assertCannotSeePayments(self, user):
+        resp = self._change_page(user)
+        self.assertEqual(resp.status_code, 200)
+        for text in (
+            "Supplier payments (operational)", "UTR-SECRET-1", "Net paid", "Remaining against PO",
+            "Gross payments", "Vendor refunds", "Reversals", "Payment status",
+        ):
+            self.assertNotContains(resp, text)
+        columns, filters = self._changelist(user)
+        self.assertNotIn("net_paid_display", columns)
+        self.assertNotIn("payment_status_label", columns)
+        self.assertNotIn("payment status", filters)
+        self.assertIn("ordered_gross_total_display", columns)
+
+    def test_user_with_ledger_view_permission_sees_payments(self):
+        self.assertSeesPayments(_purchases_staff("ledgerviewer", "view_purchaseorder", "view_purchaseorderpayment"))
+
+    def test_user_without_ledger_view_permission_cannot_see_payments(self):
+        self.assertCannotSeePayments(_purchases_staff("poviewer", "view_purchaseorder"))
+
+    def test_warehouse_group_cannot_see_payments(self):
+        self.assertCannotSeePayments(self._group_staff("warehouse1", "Warehouse"))
+
+    def test_finance_and_manager_groups_still_see_payments(self):
+        self.assertSeesPayments(self._group_staff("finance9", "Finance"))
+        self.assertSeesPayments(self._group_staff("manager9", "Manager"))
+
+
 class SupplierPaymentLedgerAdminTests(AdminQueryCountMixin, _POBase):
     def setUp(self):
         super().setUp()

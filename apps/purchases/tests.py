@@ -5064,3 +5064,51 @@ class PaidThroughGroupedSelectTests(_PrivateStorageMixin, _PaymentServiceBase):
         self.assertEqual(resp.status_code, 200)
         self.assertIn("paid_through", resp.context["form"].errors)
         self.assertFalse(PurchaseOrderPayment.objects.exists())
+
+    def test_owner_and_employee_kinds_group_after_card(self):
+        _account("Amex Corporate", PaymentAccount.KIND_CARD)
+        _account("Owner's Capital", PaymentAccount.KIND_OWNER)
+        _account("Employee Reimbursements", PaymentAccount.KIND_EMPLOYEE)
+        groups = [label for label, _ in self._optgroups(self._record_page().content.decode())]
+        self.assertEqual(groups, ["Cash", "Bank", "UPI", "Card", "Owner", "Employee-paid"])
+
+
+class PaymentAccountKindMigrationTests(TransactionTestCase):
+    """0010 retires the 'Other' kind without guessing what an Other account is."""
+
+    before = [("purchases", "0009_supplier_payment_drafts_constraints")]
+    after = [("purchases", "0010_payment_account_kinds")]
+
+    def setUp(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.before)
+        self.Account = self.executor.loader.project_state(self.before).apps.get_model("purchases", "PaymentAccount")
+
+    def tearDown(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        PaymentAccount.objects.filter(kind="other").delete()
+        executor = MigrationExecutor(connection)
+        executor.migrate(executor.loader.graph.leaf_nodes())
+
+    def _migrate(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(self.after)
+
+    def test_existing_card_and_bank_accounts_pass_unchanged(self):
+        self.Account.objects.create(name="Amex", kind="card")
+        self.Account.objects.create(name="HDFC Bank", kind="bank")
+        self._migrate()
+        self.assertEqual(
+            sorted(PaymentAccount.objects.values_list("name", "kind")), [("Amex", "card"), ("HDFC Bank", "bank")],
+        )
+
+    def test_existing_other_account_stops_migration_with_its_name(self):
+        self.Account.objects.create(name="Misc Ledger", kind="other")
+        with self.assertRaisesMessage(RuntimeError, "Misc Ledger"):
+            self._migrate()

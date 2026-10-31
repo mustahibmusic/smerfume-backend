@@ -796,26 +796,33 @@ class ReceiptDiscrepancy(BaseModel):
 
 
 class PaymentAccount(BaseModel):
-    """DEC-011 "Paid Through": the source a supplier payment was made from
-    (e.g. Petty Cash, a bank account, a UPI account). A label only: no
-    balances, account numbers, IFSC, reconciliation data or credentials.
-    Deactivated, never deleted (payments reference it)."""
+    """DEC-011 "Paid Through": the ledger account a supplier payment was paid
+    from, named as it appears in Zoho Books (e.g. Petty Cash, HDFC Bank,
+    Owner's Capital, Employee Reimbursements). A pointer only: Zoho Books
+    keeps the ledger. No balances, postings, account numbers, IFSC,
+    reconciliation data or credentials. Deactivated, never deleted
+    (payments reference it)."""
 
+    # Declaration order is the group order in the Paid Through dropdown.
     KIND_CASH = "cash"
     KIND_BANK = "bank"
     KIND_UPI = "upi"
     KIND_CARD = "card"
-    KIND_OTHER = "other"
+    KIND_OWNER = "owner"
+    KIND_EMPLOYEE = "employee"
     KIND_CHOICES = (
         (KIND_CASH, "Cash"),
         (KIND_BANK, "Bank"),
         (KIND_UPI, "UPI"),
         (KIND_CARD, "Card"),
-        (KIND_OTHER, "Other"),
+        (KIND_OWNER, "Owner"),
+        (KIND_EMPLOYEE, "Employee-paid"),
     )
 
     name = models.CharField(
-        max_length=80, help_text="A label only, e.g. \"HDFC Current ••1234\". No full account numbers.",
+        max_length=80,
+        help_text="The ledger account's name exactly as in Zoho Books, e.g. \"Petty Cash\", \"HDFC Bank\", "
+                  "\"Owner's Capital\". No account numbers.",
     )
     kind = models.CharField(max_length=10, choices=KIND_CHOICES)
 

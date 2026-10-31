@@ -1905,8 +1905,9 @@ class PurchaseOrderPaymentAdmin(ModelAdmin):
 
 @admin.register(PaymentAccount)
 class PaymentAccountAdmin(ModelAdmin):
-    """DEC-011 Paid Through list: a label and kind only. No balances, full
-    account numbers, IFSC or credentials. Deactivate instead of deleting."""
+    """DEC-011 Paid Through list: Zoho Books ledger account names and kinds
+    only. No balances, account numbers, IFSC or credentials. Deactivate
+    instead of deleting."""
 
     list_display = ("name", "kind", "is_active")
     list_filter = ("kind", "is_active")

@@ -47,7 +47,6 @@ from rest_framework.test import APIClient
 
 from apps.inventory.models import InventoryStock, Warehouse
 
-from .admin import ProductVariantImageInline
 from .models import (
     Brand,
     Category,
@@ -824,7 +823,7 @@ class ProductVariantImageModelTests(TestCase):
             selling_price=Decimal("900.00"), sku="TEST-IMG-VARIANT",
         )
 
-    def test_max_10_images_per_variant_enforced(self):
+    def test_max_images_per_variant_enforced(self):
         for i in range(ProductVariantImage.MAX_IMAGES_PER_VARIANT):
             ProductVariantImage.objects.create(
                 variant=self.variant, image=_fake_image(f"g{i}.jpg"), role=ProductVariantImage.ROLE_GALLERY,
@@ -915,13 +914,12 @@ class ProductVariantImageModelTests(TestCase):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ProductVariantImageAdminTests(TestCase):
-    def test_inline_max_num_matches_model_limit(self):
-        self.assertEqual(ProductVariantImageInline.max_num, ProductVariantImage.MAX_IMAGES_PER_VARIANT)
+    def test_variant_admin_has_no_image_inline(self):
+        # Gallery images are written only through apps.catalog.image_services
+        # (Manage Images page); the old inline write path is gone.
+        from apps.catalog.admin import ProductVariantAdmin
 
-    def test_inline_enforces_max_num_server_side(self):
-        # validate_max=True is what makes max_num a real server-side cap
-        # instead of just a UI hint that a crafted POST could bypass.
-        self.assertTrue(ProductVariantImageInline.validate_max)
+        self.assertEqual(list(ProductVariantAdmin.inlines), [])
 
 
 class ProductVariantAdminListTests(CatalogTestBase):
@@ -1266,3 +1264,727 @@ class CatalogAdminQueryCountTests(AdminQueryCountMixin, TestCase):
                 concentration="edp", gender="unisex",
             )
         self.assertChangelistQueriesFlat("/admin/catalog/productedition/", make)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15. Variant image gallery — image validation and normalisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+import io  # noqa: E402
+import hashlib  # noqa: E402
+from unittest import mock  # noqa: E402
+
+from PIL import Image  # noqa: E402
+
+from . import image_processing  # noqa: E402
+from .image_processing import ImageRejected, process_image  # noqa: E402
+
+
+def _real_image(size=(1600, 1200), fmt="JPEG", mode="RGB", color=(200, 30, 30), name=None, exif=None, **save_kwargs):
+    """A genuine encoded image generated with Pillow."""
+    image = Image.new(mode, size, color)
+    buffer = io.BytesIO()
+    if exif is not None:
+        save_kwargs["exif"] = exif.tobytes()
+    image.save(buffer, fmt, **save_kwargs)
+    extension = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp", "GIF": "gif"}[fmt]
+    return SimpleUploadedFile(name or f"photo.{extension}", buffer.getvalue(), content_type=f"image/{extension}")
+
+
+def _decode(processed):
+    return Image.open(io.BytesIO(processed.content))
+
+
+class ImageProcessingTests(TestCase):
+    def test_jpeg_png_webp_accepted_and_stored_as_webp(self):
+        for fmt in ("JPEG", "PNG", "WEBP"):
+            with self.subTest(fmt=fmt):
+                processed = process_image(_real_image(fmt=fmt))
+                self.assertEqual(processed.extension, "webp")
+                self.assertEqual(_decode(processed).format, "WEBP")
+                self.assertEqual((processed.width, processed.height), (1600, 1200))
+                self.assertEqual(processed.sha256, hashlib.sha256(processed.content).hexdigest())
+
+    def test_resized_to_2000_longest_side_keeping_aspect(self):
+        processed = process_image(_real_image(size=(3000, 1500)))
+        self.assertEqual((processed.width, processed.height), (2000, 1000))
+        self.assertEqual(_decode(processed).size, (2000, 1000))
+
+    def test_never_upscaled(self):
+        processed = process_image(_real_image(size=(1300, 1250)))
+        self.assertEqual((processed.width, processed.height), (1300, 1250))
+
+    def test_shortest_side_below_600_rejected(self):
+        with self.assertRaisesMessage(ImageRejected, "600"):
+            process_image(_real_image(size=(599, 1200)))
+
+    def test_low_resolution_warns_but_saves(self):
+        processed = process_image(_real_image(size=(900, 900)))
+        self.assertEqual(len(processed.warnings), 1)
+        self.assertIn("1200", processed.warnings[0])
+        self.assertEqual(process_image(_real_image(size=(1200, 1300))).warnings, ())
+
+    def test_oversized_input_rejected_before_decoding(self):
+        with self.assertRaisesMessage(ImageRejected, "6000"):
+            process_image(_real_image(size=(6001, 700)))
+
+    def test_upload_over_15_mb_rejected(self):
+        big = SimpleUploadedFile("big.jpg", b"\0" * (15 * 1024 * 1024 + 1), content_type="image/jpeg")
+        with self.assertRaisesMessage(ImageRejected, "15 MB"):
+            process_image(big)
+
+    def test_gif_svg_heic_and_garbage_rejected(self):
+        svg = SimpleUploadedFile("logo.svg", b'<svg xmlns="http://www.w3.org/2000/svg"/>', content_type="image/svg+xml")
+        garbage = SimpleUploadedFile("photo.jpg", b"not-an-image", content_type="image/jpeg")
+        for upload in (_real_image(fmt="GIF", mode="P", color=1), svg, garbage):
+            with self.subTest(name=upload.name):
+                with self.assertRaises(ImageRejected):
+                    process_image(upload)
+
+    def test_animated_webp_rejected(self):
+        frames = [Image.new("RGB", (800, 800), color) for color in ((255, 0, 0), (0, 255, 0))]
+        buffer = io.BytesIO()
+        frames[0].save(buffer, "WEBP", save_all=True, append_images=frames[1:], duration=100)
+        upload = SimpleUploadedFile("anim.webp", buffer.getvalue(), content_type="image/webp")
+        with self.assertRaisesMessage(ImageRejected, "nimated"):
+            process_image(upload)
+
+    def test_truncated_image_rejected(self):
+        whole = _real_image().read()
+        upload = SimpleUploadedFile("cut.jpg", whole[: len(whole) // 2], content_type="image/jpeg")
+        with self.assertRaises(ImageRejected):
+            process_image(upload)
+
+    def test_exif_orientation_applied_and_metadata_removed(self):
+        exif = Image.Exif()
+        exif[0x0112] = 6  # rotate 90 degrees clockwise when displayed
+        exif[0x010F] = "SecretCam"
+        processed = process_image(_real_image(size=(1600, 1000), exif=exif))
+        self.assertEqual((processed.width, processed.height), (1000, 1600))
+        decoded = _decode(processed)
+        self.assertEqual(dict(decoded.getexif()), {})
+        self.assertNotIn(b"SecretCam", processed.content)
+
+    def test_cmyk_converted_to_rgb(self):
+        processed = process_image(_real_image(mode="CMYK", color=(0, 200, 200, 0)))
+        self.assertEqual(_decode(processed).mode, "RGB")
+
+    def test_transparency_kept(self):
+        processed = process_image(_real_image(fmt="PNG", mode="RGBA", color=(10, 20, 30, 0)))
+        self.assertEqual(_decode(processed).mode, "RGBA")
+        opaque = process_image(_real_image(fmt="PNG", mode="RGBA", color=(10, 20, 30, 255)))
+        self.assertEqual(_decode(opaque).mode, "RGB")
+
+    def test_same_input_gives_same_hash(self):
+        self.assertEqual(process_image(_real_image()).sha256, process_image(_real_image()).sha256)
+
+    def test_fallback_formats_without_webp(self):
+        with mock.patch.object(image_processing.features, "check", return_value=False):
+            transparent = process_image(_real_image(fmt="PNG", mode="RGBA", color=(1, 2, 3, 0)))
+            opaque = process_image(_real_image())
+        self.assertEqual((transparent.extension, _decode(transparent).format), ("png", "PNG"))
+        self.assertEqual((opaque.extension, _decode(opaque).format), ("jpg", "JPEG"))
+
+    def test_final_file_over_limit_rejected(self):
+        with mock.patch.object(image_processing, "MAX_OUTPUT_BYTES", 100):
+            with self.assertRaisesMessage(ImageRejected, "5 MB"):
+                process_image(_real_image())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16. Variant image gallery — metadata fields, storage names, backfill
+# ─────────────────────────────────────────────────────────────────────────────
+
+from io import StringIO  # noqa: E402
+
+from django.core.management import call_command  # noqa: E402
+
+from .models import variant_image_upload_to  # noqa: E402
+
+
+def _gallery_variant(sku="GALLERY-SKU"):
+    brand, _ = Brand.objects.get_or_create(name="GalleryBrand", slug="gallerybrand")
+    category, _ = Category.objects.get_or_create(name="GalleryCat", slug="gallerycat")
+    product, _ = Product.objects.get_or_create(
+        name="GalleryProduct", slug="galleryproduct", brand=brand, category=category,
+    )
+    edition, _ = ProductEdition.objects.get_or_create(product=product, gender="unisex", concentration="edp")
+    return ProductVariant.objects.create(
+        edition=edition, size_ml=100, mrp=Decimal("1000.00"), selling_price=Decimal("900.00"), sku=sku,
+    )
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class VariantImageMetadataTests(TestCase):
+    def setUp(self):
+        self.variant = _gallery_variant()
+
+    def test_limit_is_20(self):
+        self.assertEqual(ProductVariantImage.MAX_IMAGES_PER_VARIANT, 20)
+
+    def test_upload_name_is_unique_per_variant_folder(self):
+        image = ProductVariantImage(variant=self.variant)
+        first = variant_image_upload_to(image, "anything.webp")
+        second = variant_image_upload_to(image, "anything.webp")
+        self.assertTrue(first.startswith(f"catalog/variant_images/{self.variant.public_id}/"))
+        self.assertTrue(first.endswith(".webp"))
+        self.assertNotEqual(first, second)
+        self.assertNotIn("anything", first)
+
+    def test_dimensions_and_hash_default_empty(self):
+        image = ProductVariantImage.objects.create(variant=self.variant, image=_fake_image())
+        self.assertEqual((image.width, image.height, image.content_hash), (None, None, ""))
+
+    def test_hash_unique_per_variant_when_set(self):
+        ProductVariantImage.objects.create(variant=self.variant, image=_fake_image(), content_hash="a" * 64)
+        ProductVariantImage.objects.create(
+            variant=_gallery_variant("OTHER-SKU"), image=_fake_image(), content_hash="a" * 64,
+        )
+        ProductVariantImage.objects.create(variant=self.variant, image=_fake_image())
+        ProductVariantImage.objects.create(variant=self.variant, image=_fake_image())
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                ProductVariantImage.objects.create(variant=self.variant, image=_fake_image(), content_hash="a" * 64)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class BackfillVariantImageDimensionsTests(TestCase):
+    def setUp(self):
+        self.variant = _gallery_variant()
+
+    def _run(self):
+        out = StringIO()
+        call_command("backfill_variant_image_dimensions", stdout=out, stderr=StringIO())
+        return out.getvalue()
+
+    def test_fills_missing_dimensions_and_is_rerunnable(self):
+        image = ProductVariantImage.objects.create(variant=self.variant, image=_real_image(size=(1500, 900)))
+        output = self._run()
+        image.refresh_from_db()
+        self.assertEqual((image.width, image.height), (1500, 900))
+        self.assertIn("1 updated", output)
+        self.assertIn("0 updated", self._run())
+
+    def test_broken_or_missing_files_reported_not_fatal(self):
+        broken = ProductVariantImage.objects.create(variant=self.variant, image=_fake_image("broken.jpg"))
+        missing = ProductVariantImage.objects.create(variant=self.variant, image=_real_image())
+        missing.image.storage.delete(missing.image.name)
+        output = self._run()
+        self.assertIn("2 failed", output)
+        broken.refresh_from_db()
+        self.assertIsNone(broken.width)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 17. Variant image gallery — services
+# ─────────────────────────────────────────────────────────────────────────────
+
+import threading  # noqa: E402
+
+from django.contrib.admin.models import LogEntry  # noqa: E402
+from django.contrib.auth import get_user_model  # noqa: E402
+from django.db import connection  # noqa: E402
+from django.test import TransactionTestCase  # noqa: E402
+
+from . import image_services  # noqa: E402
+from .image_services import VariantImageError  # noqa: E402
+
+PRIMARY = ProductVariantImage.ROLE_PRIMARY
+SECONDARY = ProductVariantImage.ROLE_SECONDARY
+GALLERY = ProductVariantImage.ROLE_GALLERY
+
+
+def _photo(shade, size=(1400, 1400), fmt="JPEG"):
+    return _real_image(size=size, fmt=fmt, color=(shade, 40, 90))
+
+
+def _staff(username="imagestaff"):
+    return get_user_model().objects.create_user(
+        username=username, email=f"{username}@example.com", password="testpass123", is_staff=True,
+    )
+
+
+def _image_storage():
+    return ProductVariantImage._meta.get_field("image").storage
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class VariantImageServiceTests(TestCase):
+    def setUp(self):
+        self.variant = _gallery_variant()
+        self.user = _staff()
+
+    def _add(self, *files):
+        return image_services.add_variant_images(self.variant, list(files), self.user)
+
+    def test_add_creates_gallery_images_with_metadata(self):
+        result = self._add(_photo(10), _photo(20, size=(3000, 1500)))
+        self.assertEqual(result.rejected, [])
+        first, second = result.created
+        self.assertEqual([first.role, second.role], [GALLERY, GALLERY])
+        self.assertEqual([first.sort_order, second.sort_order], [0, 1])
+        self.assertEqual((second.width, second.height), (2000, 1000))
+        self.assertEqual(len(first.content_hash), 64)
+        self.assertTrue(first.image.name.startswith(f"catalog/variant_images/{self.variant.public_id}/"))
+        self.assertTrue(first.image.name.endswith(".webp"))
+        self.assertTrue(_image_storage().exists(first.image.name))
+        self.assertTrue(LogEntry.objects.filter(object_id=str(self.variant.pk), user=self.user).exists())
+
+    def test_bad_files_rejected_others_saved(self):
+        garbage = SimpleUploadedFile("broken.jpg", b"nope", content_type="image/jpeg")
+        result = self._add(_photo(10), garbage)
+        self.assertEqual(len(result.created), 1)
+        self.assertEqual(result.rejected[0][0], "broken.jpg")
+
+    def test_low_resolution_warning_returned(self):
+        result = self._add(_photo(10, size=(800, 800)))
+        self.assertEqual(len(result.created), 1)
+        self.assertEqual(result.warnings[0][0], "photo.jpg")
+
+    def test_duplicates_rejected_in_batch_and_against_gallery(self):
+        self._add(_photo(10))
+        result = self._add(_photo(10), _photo(30), _photo(30))
+        self.assertEqual(len(result.created), 1)
+        self.assertEqual(len(result.rejected), 2)
+        self.assertIn("already", result.rejected[0][1])
+
+    def test_new_images_appended_after_existing(self):
+        ProductVariantImage.objects.create(variant=self.variant, image=_fake_image(), sort_order=7)
+        created = self._add(_photo(10)).created[0]
+        self.assertEqual(created.sort_order, 8)
+
+    def test_image_limit_enforced(self):
+        for i in range(ProductVariantImage.MAX_IMAGES_PER_VARIANT - 1):
+            ProductVariantImage.objects.create(variant=self.variant, image=_fake_image(f"g{i}.jpg"))
+        result = self._add(_photo(10), _photo(20))
+        self.assertEqual(len(result.created), 1)
+        self.assertIn("20", result.rejected[0][1])
+
+    def test_too_many_files_in_one_request(self):
+        with self.assertRaisesMessage(VariantImageError, "20"):
+            self._add(*[_photo(i) for i in range(21)])
+
+    def test_role_change_demotes_current_holder_first(self):
+        a, b = self._add(_photo(10), _photo(20)).created
+        image_services.set_variant_image_role(a, PRIMARY, self.user)
+        image_services.set_variant_image_role(b, PRIMARY, self.user)
+        a.refresh_from_db()
+        b.refresh_from_db()
+        self.assertEqual((a.role, b.role), (GALLERY, PRIMARY))
+        image_services.set_variant_image_role(a, SECONDARY, self.user)
+        image_services.set_variant_image_role(b, SECONDARY, self.user)
+        a.refresh_from_db()
+        b.refresh_from_db()
+        self.assertEqual((a.role, b.role), (GALLERY, SECONDARY))
+        self.assertFalse(self.variant.images.filter(role=PRIMARY).exists())
+
+    def test_set_gallery_and_invalid_role(self):
+        image = self._add(_photo(10)).created[0]
+        image_services.set_variant_image_role(image, PRIMARY, self.user)
+        image_services.set_variant_image_role(image, GALLERY, self.user)
+        image.refresh_from_db()
+        self.assertEqual(image.role, GALLERY)
+        with self.assertRaises(VariantImageError):
+            image_services.set_variant_image_role(image, "hero", self.user)
+
+    def test_remove_primary_never_promotes_another(self):
+        a, b = self._add(_photo(10), _photo(20)).created
+        image_services.set_variant_image_role(a, PRIMARY, self.user)
+        name = a.image.name
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            image_services.remove_variant_image(a, self.user)
+        self.assertTrue(_image_storage().exists(name))  # kept until commit
+        for callback in callbacks:
+            callback()
+        self.assertFalse(_image_storage().exists(name))
+        self.assertFalse(ProductVariantImage.objects.filter(pk=a.pk).exists())
+        b.refresh_from_db()
+        self.assertEqual(b.role, GALLERY)
+
+    def test_reorder(self):
+        a, b, c = self._add(_photo(10), _photo(20), _photo(30)).created
+        image_services.reorder_variant_images(self.variant, [c.public_id, a.public_id, b.public_id], self.user)
+        orders = dict(self.variant.images.values_list("pk", "sort_order"))
+        self.assertEqual((orders[c.pk], orders[a.pk], orders[b.pk]), (0, 1, 2))
+        for bad in ([a.public_id, b.public_id], [a.public_id, a.public_id, b.public_id], ["not-a-uuid"]):
+            with self.assertRaises(VariantImageError):
+                image_services.reorder_variant_images(self.variant, bad, self.user)
+
+    def test_alt_text(self):
+        image = self._add(_photo(10)).created[0]
+        image_services.update_variant_image_alt_text(image, "  Front view  ", self.user)
+        image.refresh_from_db()
+        self.assertEqual(image.alt_text, "Front view")
+        with self.assertRaises(VariantImageError):
+            image_services.update_variant_image_alt_text(image, "x" * 256, self.user)
+
+    def test_replace_writes_new_file_and_deletes_old_after_commit(self):
+        image = self._add(_photo(10)).created[0]
+        old_name = image.image.name
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            image_services.replace_variant_image(image, _photo(99, size=(1800, 1200)), self.user)
+        image.refresh_from_db()
+        self.assertNotEqual(image.image.name, old_name)
+        self.assertEqual((image.width, image.height), (1800, 1200))
+        self.assertTrue(_image_storage().exists(old_name))
+        for callback in callbacks:
+            callback()
+        self.assertFalse(_image_storage().exists(old_name))
+        self.assertTrue(_image_storage().exists(image.image.name))
+
+    def test_replace_with_duplicate_of_another_image_refused(self):
+        a, b = self._add(_photo(10), _photo(20)).created
+        with self.assertRaisesMessage(VariantImageError, "already"):
+            image_services.replace_variant_image(b, _photo(10), self.user)
+
+    def test_failed_replace_removes_new_file(self):
+        image = self._add(_photo(10)).created[0]
+        folder = f"catalog/variant_images/{self.variant.public_id}"
+        before = set(_image_storage().listdir(folder)[1])
+        with mock.patch.object(ProductVariantImage, "save", side_effect=RuntimeError("db down")):
+            with self.assertRaises(RuntimeError):
+                image_services.replace_variant_image(image, _photo(55), self.user)
+        self.assertEqual(set(_image_storage().listdir(folder)[1]), before)
+
+    def test_display_order(self):
+        a, b, c = self._add(_photo(10), _photo(20), _photo(30)).created
+        image_services.set_variant_image_role(c, PRIMARY, self.user)
+        image_services.set_variant_image_role(b, SECONDARY, self.user)
+        ordered = list(image_services.display_ordered_images(self.variant.images.all()))
+        self.assertEqual(ordered, [c, b, a])
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class VariantImageRoleConcurrencyTests(TransactionTestCase):
+    def test_concurrent_primary_changes_keep_one_primary(self):
+        variant = _gallery_variant()
+        user = _staff()
+        a, b = image_services.add_variant_images(variant, [_photo(10), _photo(20)], user).created
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def promote(image):
+            try:
+                barrier.wait()
+                image_services.set_variant_image_role(image, PRIMARY, user)
+            except Exception as exc:  # reported by the assertion below
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=promote, args=(image,)) for image in (a, b)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(variant.images.filter(role=PRIMARY).count(), 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 18. Variant image gallery — API additions (order unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class VariantImageGalleryAPITests(CatalogTestBase):
+    def setUp(self):
+        super().setUp()
+        self.variant = self.edition_sauvage.variants.get()
+        # Gallery first by sort_order on purpose: the API order must stay
+        # sort_order, id (the role-first order is gated on a storefront check).
+        self.gallery = ProductVariantImage.objects.create(
+            variant=self.variant, image=_fake_image("gallery.jpg"), role=GALLERY, sort_order=0,
+            width=2000, height=1500,
+        )
+        self.secondary = ProductVariantImage.objects.create(
+            variant=self.variant, image=_fake_image("secondary.jpg"), role=SECONDARY, sort_order=1,
+        )
+        self.primary = ProductVariantImage.objects.create(
+            variant=self.variant, image=_fake_image("primary.jpg"), role=PRIMARY, sort_order=2,
+        )
+
+    def _variant_payload(self):
+        response = self.client.get(detail_url("sauvage"))
+        return self._edition(response, "sauvage-edp")["variants"][0]
+
+    def test_images_order_is_still_sort_order_then_id(self):
+        roles = [image["role"] for image in self._variant_payload()["images"]]
+        self.assertEqual(roles, [GALLERY, SECONDARY, PRIMARY])
+
+    def test_secondary_image_field(self):
+        variant = self._variant_payload()
+        self.assertEqual(variant["secondary_image"]["public_id"], str(self.secondary.public_id))
+        self.assertEqual(variant["primary_image"]["public_id"], str(self.primary.public_id))
+        self.secondary.delete()
+        self.assertIsNone(self._variant_payload()["secondary_image"])
+
+    def test_width_height_on_each_image(self):
+        images = {image["role"]: image for image in self._variant_payload()["images"]}
+        self.assertEqual((images[GALLERY]["width"], images[GALLERY]["height"]), (2000, 1500))
+        self.assertIsNone(images[PRIMARY]["width"])
+
+    def test_existing_fields_unchanged(self):
+        variant = self._variant_payload()
+        for key in ("public_id", "sku", "image", "size_ml", "is_decant", "mrp", "selling_price",
+                    "images", "primary_image", "is_available"):
+            self.assertIn(key, variant)
+        for key in ("public_id", "image", "role", "alt_text", "sort_order"):
+            self.assertIn(key, variant["images"][0])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 19. Variant image gallery — Manage Images admin page
+# ─────────────────────────────────────────────────────────────────────────────
+
+import json  # noqa: E402
+
+from django.contrib.auth.models import Permission  # noqa: E402
+from django.urls import reverse  # noqa: E402
+
+from apps.core.test_utils import AdminQueryCountMixin  # noqa: E402
+
+
+def _catalog_staff(username, *codenames, superuser=False):
+    model = get_user_model()
+    if superuser:
+        return model.objects.create_superuser(username=username, email=f"{username}@example.com", password="x")
+    user = _staff(username)
+    user.user_permissions.add(*Permission.objects.filter(content_type__app_label="catalog", codename__in=codenames))
+    return user
+
+
+VIEW_PERMS = ("view_productvariant", "view_productvariantimage")
+ALL_IMAGE_PERMS = VIEW_PERMS + (
+    "change_productvariant", "add_productvariantimage", "change_productvariantimage", "delete_productvariantimage",
+)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class ManageImagesAdminTests(TestCase):
+    def setUp(self):
+        self.variant = _gallery_variant()
+        self.manager = _catalog_staff("catmanager", *ALL_IMAGE_PERMS)
+        self.viewer = _catalog_staff("catviewer", *VIEW_PERMS)
+        self.image = image_services.add_variant_images(self.variant, [_photo(10)], self.manager).created[0]
+
+    def _url(self, name, *extra):
+        return reverse(f"admin:catalog_productvariant_{name}", args=[self.variant.pk, *extra])
+
+    def _json(self, response):
+        return json.loads(response.content)
+
+    def test_manage_page_renders_grid_for_manager(self):
+        self.client.force_login(self.manager)
+        response = self.client.get(self._url("images"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.image.image.url)
+        self.assertContains(response, "1 of 20")
+        self.assertContains(response, 'name="images"')
+        self.assertContains(response, "Make primary")
+
+    def test_viewer_sees_grid_without_controls(self):
+        self.client.force_login(self.viewer)
+        response = self.client.get(self._url("images"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.image.image.url)
+        self.assertNotContains(response, 'name="images"')
+        self.assertNotContains(response, "Make primary")
+
+    def test_page_title_and_heading(self):
+        import re
+
+        self.client.force_login(self.manager)
+        html = self.client.get(self._url("images")).content.decode()
+        title = re.search(r"<title>(.*?)</title>", html, re.S).group(1).strip()
+        self.assertTrue(title.startswith("Manage images |"), title)
+        self.assertNotIn("SKU", title)
+        self.assertIn('<h1 class="vg-title">Manage images</h1>', html)
+        self.assertIn(f"{self.variant.display_name()} · SKU {self.variant.sku}", html)
+
+    def test_editor_loaded_only_for_change_permission(self):
+        self.client.force_login(self.manager)
+        response = self.client.get(self._url("images"))
+        self.assertContains(response, "vendor/cropperjs/1.7.0/cropper.min.js")
+        self.assertContains(response, 'id="vg-editor"')
+        self.assertContains(response, self._url("image_replace", self.image.public_id))
+        self.client.force_login(self.viewer)
+        response = self.client.get(self._url("images"))
+        self.assertNotContains(response, "cropper.min.js")
+        self.assertNotContains(response, 'id="vg-editor"')
+
+    def test_page_needs_view_permissions(self):
+        self.client.force_login(_catalog_staff("variantonly", "view_productvariant"))
+        self.assertEqual(self.client.get(self._url("images")).status_code, 403)
+
+    def test_mutations_refused_without_permission(self):
+        self.client.force_login(self.viewer)
+        posts = [
+            (self._url("images_upload"), {"images": _photo(20)}),
+            (self._url("images_reorder"), {"order": json.dumps([str(self.image.public_id)])}),
+            (self._url("image_role", self.image.public_id), {"role": PRIMARY}),
+            (self._url("image_alt_text", self.image.public_id), {"alt_text": "x"}),
+            (self._url("image_replace", self.image.public_id), {"image": _photo(30)}),
+            (self._url("image_remove", self.image.public_id), {}),
+        ]
+        for url, data in posts:
+            with self.subTest(url=url):
+                self.assertEqual(self.client.post(url, data).status_code, 403)
+        self.image.refresh_from_db()
+        self.assertEqual((self.image.role, self.image.alt_text), (GALLERY, ""))
+        self.assertEqual(self.variant.images.count(), 1)
+
+    def test_get_never_changes_state(self):
+        self.client.force_login(self.manager)
+        for name in ("images_upload", "images_reorder"):
+            self.assertEqual(self.client.get(self._url(name)).status_code, 405)
+        for name in ("image_role", "image_alt_text", "image_replace"):
+            self.assertEqual(self.client.get(self._url(name, self.image.public_id)).status_code, 405)
+        response = self.client.get(self._url("image_remove", self.image.public_id))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, '<h1 class="vg-title">Remove image</h1>', html=True)
+        self.assertTrue(ProductVariantImage.objects.filter(pk=self.image.pk).exists())
+
+    def test_upload_json_and_form_fallback(self):
+        self.client.force_login(self.manager)
+        garbage = SimpleUploadedFile("bad.jpg", b"nope", content_type="image/jpeg")
+        response = self.client.post(
+            self._url("images_upload"), {"images": [_photo(20), garbage]}, HTTP_ACCEPT="application/json",
+        )
+        payload = self._json(response)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(payload["created"]), 1)
+        self.assertEqual(payload["rejected"][0]["name"], "bad.jpg")
+        response = self.client.post(self._url("images_upload"), {"images": [_photo(30)]})
+        self.assertRedirects(response, self._url("images"), fetch_redirect_response=False)
+        self.assertEqual(self.variant.images.count(), 3)
+
+    def test_role_alt_text_reorder_remove(self):
+        self.client.force_login(self.manager)
+        other = image_services.add_variant_images(self.variant, [_photo(40)], self.manager).created[0]
+        self.client.post(self._url("image_role", other.public_id), {"role": PRIMARY})
+        self.client.post(self._url("image_alt_text", other.public_id), {"alt_text": "Front"})
+        self.client.post(
+            self._url("images_reorder"), {"order": json.dumps([str(other.public_id), str(self.image.public_id)])},
+        )
+        other.refresh_from_db()
+        self.assertEqual((other.role, other.alt_text, other.sort_order), (PRIMARY, "Front", 0))
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(self._url("image_remove", other.public_id))
+        self.assertRedirects(response, self._url("images"), fetch_redirect_response=False)
+        self.assertFalse(ProductVariantImage.objects.filter(pk=other.pk).exists())
+
+    def test_service_errors_are_reported(self):
+        self.client.force_login(self.manager)
+        response = self.client.post(
+            self._url("image_role", self.image.public_id), {"role": "hero"}, HTTP_ACCEPT="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("primary", self._json(response)["error"])
+
+    def test_replace_via_admin(self):
+        self.client.force_login(self.manager)
+        old_name = self.image.image.name
+        response = self.client.post(
+            self._url("image_replace", self.image.public_id), {"image": _photo(77, size=(1500, 1000))},
+            HTTP_ACCEPT="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.image.refresh_from_db()
+        self.assertNotEqual(self.image.image.name, old_name)
+        self.assertEqual(self._json(response)["image"]["width"], 1500)
+
+    def test_image_of_another_variant_is_404(self):
+        foreign = image_services.add_variant_images(_gallery_variant("FOREIGN"), [_photo(50)], self.manager).created[0]
+        self.client.force_login(self.manager)
+        response = self.client.post(self._url("image_role", foreign.public_id), {"role": PRIMARY})
+        self.assertEqual(response.status_code, 404)
+
+    def test_csrf_enforced(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.manager)
+        response = client.post(self._url("image_role", self.image.public_id), {"role": PRIMARY})
+        self.assertEqual(response.status_code, 403)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class VariantChangePageGalleryTests(TestCase):
+    def setUp(self):
+        self.variant = _gallery_variant()
+        self.manager = _catalog_staff("catmanager2", *ALL_IMAGE_PERMS)
+        self.client.force_login(self.manager)
+
+    def _change_page(self):
+        return self.client.get(reverse("admin:catalog_productvariant_change", args=[self.variant.pk]))
+
+    def test_inline_and_legacy_upload_removed(self):
+        response = self._change_page()
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, 'name="images-TOTAL_FORMS"')
+        self.assertNotContains(response, 'name="image"')
+        self.assertNotContains(response, "Legacy image")
+        self.assertContains(response, "Manage images")
+        self.assertContains(response, reverse("admin:catalog_productvariant_images", args=[self.variant.pk]))
+
+    def test_add_page_has_no_image_upload(self):
+        self.client.force_login(_catalog_staff("catsuper2", superuser=True))
+        response = self.client.get(reverse("admin:catalog_productvariant_add"))
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, 'name="image"')
+        self.assertNotContains(response, 'name="images-TOTAL_FORMS"')
+
+    def test_preview_lists_gallery_and_count(self):
+        image = image_services.add_variant_images(self.variant, [_photo(10)], self.manager).created[0]
+        image_services.set_variant_image_role(image, PRIMARY, self.manager)
+        response = self._change_page()
+        self.assertContains(response, image.image.url)
+        self.assertContains(response, "1 of 20")
+        self.assertContains(response, "Primary")
+
+    def test_legacy_image_shown_read_only_when_present(self):
+        ProductVariant.objects.filter(pk=self.variant.pk).update(image="catalog/variants/legacy.jpg")
+        response = self._change_page()
+        self.assertContains(response, "Legacy image (not used by the gallery)")
+        self.assertContains(response, "legacy.jpg")
+        self.assertNotContains(response, 'name="image"')
+
+    def test_saving_variant_keeps_legacy_image(self):
+        ProductVariant.objects.filter(pk=self.variant.pk).update(image="catalog/variants/legacy.jpg")
+        data = {
+            "is_active": "on", "edition": self.variant.edition_id, "sku": self.variant.sku, "size_ml": 100,
+            "mrp": "1000.00", "selling_price": "950.00", "shipping_surcharge": "0",
+        }
+        response = self.client.post(reverse("admin:catalog_productvariant_change", args=[self.variant.pk]), data)
+        self.assertEqual(response.status_code, 302)
+        self.variant.refresh_from_db()
+        self.assertEqual((self.variant.selling_price, self.variant.image.name), (Decimal("950.00"), "catalog/variants/legacy.jpg"))
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class VariantListGalleryColumnTests(AdminQueryCountMixin, TestCase):
+    def setUp(self):
+        self.user = _catalog_staff("catsuper", superuser=True)
+        self.client.force_login(self.user)
+
+    def test_list_shows_primary_then_legacy_fallback(self):
+        from apps.catalog.admin import ProductVariantAdmin
+
+        with_primary = _gallery_variant("LIST-1")
+        image = image_services.add_variant_images(with_primary, [_photo(10)], self.user).created[0]
+        image_services.set_variant_image_role(image, PRIMARY, self.user)
+        legacy_only = _gallery_variant("LIST-2")
+        ProductVariant.objects.filter(pk=legacy_only.pk).update(image="catalog/variants/legacy.jpg")
+        model_admin = ProductVariantAdmin(ProductVariant, django_admin.site)
+        request = RequestFactory().get("/")
+        request.user = self.user
+        rows = {v.pk: v for v in model_admin.get_queryset(request)}
+        self.assertIn(image.image.url, model_admin.image_preview(rows[with_primary.pk]))
+        self.assertIn("legacy.jpg", model_admin.image_preview(rows[legacy_only.pk]))
+        self.assertEqual(model_admin.image_count(rows[with_primary.pk]), "1 / 20")
+
+    def test_list_query_count_is_flat(self):
+        def make(i):
+            variant = _gallery_variant(f"FLAT-{i}")
+            ProductVariantImage.objects.create(variant=variant, image=_fake_image(), role=PRIMARY)
+        self.assertChangelistQueriesFlat(reverse("admin:catalog_productvariant_changelist"), make)

@@ -1,0 +1,25 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block extrahead %}{{ block.super }}
+<link rel="stylesheet" href="{% static 'catalog/admin/variant_gallery.css' %}">
+{% endblock %}
+
+{% block breadcrumbs %}{% endblock %}
+
+{% block content %}
+<div class="vg-page vg-confirm">
+    <h1 class="vg-title">Remove image</h1>
+    <p class="vg-lead">Remove this {{ image.get_role_display|lower }} image from {{ variant.display_name }}?</p>
+    <img class="vg-confirm-image" src="{{ image.image.url }}" alt="{{ image.alt_text }}">
+    <p class="vg-hint">
+        The file is deleted. No other image takes over its role{% if image.role != "gallery" %}; choose a new
+        {{ image.get_role_display|lower }} image afterwards{% endif %}.
+    </p>
+    <form method="post">
+        {% csrf_token %}
+        <button type="submit" class="vg-button vg-button-danger">Remove image</button>
+        <a href="{{ back_url }}" class="vg-button">Go back</a>
+    </form>
+</div>
+{% endblock %}

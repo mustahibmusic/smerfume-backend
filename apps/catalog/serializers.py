@@ -35,7 +35,9 @@ class PerfumeNoteSerializer(serializers.ModelSerializer):
 class ProductVariantImageSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductVariantImage
-        fields = ("public_id", "image", "role", "alt_text", "sort_order")
+        # width/height: pixel size for layout; null for older images until
+        # backfill_variant_image_dimensions runs.
+        fields = ("public_id", "image", "role", "alt_text", "sort_order", "width", "height")
 
 
 class ProductVariantSerializer(serializers.ModelSerializer):
@@ -45,21 +47,30 @@ class ProductVariantSerializer(serializers.ModelSerializer):
 
     images = ProductVariantImageSerializer(many=True, read_only=True)
     primary_image = serializers.SerializerMethodField()
+    secondary_image = serializers.SerializerMethodField()
     is_available = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductVariant
         fields = (
             "public_id", "sku", "image", "size_ml", "is_decant", "mrp", "selling_price",
-            "images", "primary_image", "is_available",
+            "images", "primary_image", "secondary_image", "is_available",
         )
+
+    def _image_with_role(self, obj, role):
+        for img in obj.images.all():
+            if img.role == role:
+                return ProductVariantImageSerializer(img, context=self.context).data
+        return None
 
     @extend_schema_field(ProductVariantImageSerializer(allow_null=True))
     def get_primary_image(self, obj):
-        for img in obj.images.all():
-            if img.role == ProductVariantImage.ROLE_PRIMARY:
-                return ProductVariantImageSerializer(img, context=self.context).data
-        return None
+        return self._image_with_role(obj, ProductVariantImage.ROLE_PRIMARY)
+
+    @extend_schema_field(ProductVariantImageSerializer(allow_null=True))
+    def get_secondary_image(self, obj):
+        """Product-card hover image only; never the canonical/SEO image."""
+        return self._image_with_role(obj, ProductVariantImage.ROLE_SECONDARY)
 
     @extend_schema_field(serializers.BooleanField())
     def get_is_available(self, obj):

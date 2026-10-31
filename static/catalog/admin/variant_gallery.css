@@ -1,0 +1,80 @@
+/* Manage Images page (variant gallery). Plain CSS: Unfold's compiled
+   Tailwind build does not include arbitrary utility classes. */
+.vg-page { max-width: 1200px; font-size: 14px; }
+.vg-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.vg-title { margin: 0 0 4px; font-size: 20px; font-weight: 700; }
+.vg-lead { margin: 0 0 8px; font-size: 15px; }
+.vg-hint { margin: 0 0 16px; font-size: 13px; opacity: .75; }
+.vg-status { min-height: 1.2em; font-size: 13px; }
+.vg-button {
+    display: inline-block; padding: 6px 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid rgba(127, 127, 127, .45); background: transparent; color: inherit;
+    font: inherit; font-weight: 600; text-decoration: none; line-height: 1.3;
+}
+.vg-button:hover:not(:disabled) { background: rgba(127, 127, 127, .12); }
+.vg-button:focus-visible, .vg-card:focus-within { outline: 2px solid #9333ea; outline-offset: 2px; }
+.vg-button:disabled { opacity: .5; cursor: not-allowed; }
+.vg-button-small { padding: 3px 8px; font-size: 12px; }
+.vg-button-primary { background: #9333ea; border-color: #9333ea; color: #fff; }
+.vg-button-primary:hover:not(:disabled) { background: #7e22ce; }
+.vg-button-danger { background: #dc2626; border-color: #dc2626; color: #fff; }
+
+.vg-upload { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 16px; }
+.vg-dropzone {
+    flex: 1 1 320px; display: flex; flex-direction: column; gap: 6px; padding: 16px; border-radius: 8px;
+    border: 2px dashed rgba(127, 127, 127, .45); cursor: pointer;
+}
+.vg-dropzone.is-over { border-color: #9333ea; background: rgba(147, 51, 234, .06); }
+.vg-upload-errors { flex-basis: 100%; margin: 0; color: #dc2626; font-size: 13px; white-space: pre-line; }
+
+.vg-grid {
+    list-style: none; margin: 0; padding: 0; display: grid; gap: 16px;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+}
+.vg-card {
+    display: flex; flex-direction: column; gap: 8px; padding: 10px; border-radius: 8px;
+    border: 1px solid rgba(127, 127, 127, .3);
+}
+.vg-card[draggable="true"] { cursor: grab; }
+.vg-card.is-dragging { opacity: .4; }
+.vg-card.is-drop-target { border-color: #9333ea; }
+.vg-thumb { position: relative; aspect-ratio: 1 / 1; border-radius: 6px; overflow: hidden; background: rgba(127, 127, 127, .1); }
+.vg-thumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.vg-badge { position: absolute; top: 6px; left: 6px; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; color: #fff; background: rgba(0, 0, 0, .55); }
+.vg-badge-primary { background: #16a34a; }
+.vg-badge-secondary { background: #2563eb; }
+.vg-meta { margin: 0; font-size: 12px; opacity: .75; }
+.vg-actions, .vg-move { display: flex; flex-wrap: wrap; gap: 6px; }
+.vg-actions form { margin: 0; }
+.vg-alt { display: flex; gap: 6px; align-items: flex-end; margin: 0; }
+.vg-alt label { flex: 1; display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+.vg-alt input { width: 100%; padding: 4px 6px; border-radius: 6px; border: 1px solid rgba(127, 127, 127, .45); background: transparent; color: inherit; font: inherit; }
+.vg-remove { color: #dc2626; font-size: 12px; font-weight: 600; align-self: flex-start; }
+.vg-empty { opacity: .75; }
+.vg-confirm-image { max-width: 320px; max-height: 320px; border-radius: 8px; margin: 8px 0; display: block; }
+.vg-confirm form { display: flex; gap: 12px; }
+
+/* margin:auto restores <dialog> centring removed by Tailwind's reset. */
+.vg-editor { margin: auto; width: min(1100px, calc(100vw - 32px)); max-height: calc(100vh - 32px); padding: 16px; border-radius: 10px; border: 1px solid rgba(127, 127, 127, .4); color: inherit; background: var(--color-base-50, #fff); }
+.vg-editor::backdrop { background: rgba(0, 0, 0, .55); }
+.dark .vg-editor { background: var(--color-base-900, #111827); }
+.vg-editor h2 { margin: 0 0 12px; font-size: 16px; font-weight: 700; }
+.vg-editor-body { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 16px; }
+.vg-editor-stage { height: min(70vh, 640px); background: rgba(127, 127, 127, .12); }
+.vg-editor-stage img { display: block; max-width: 100%; }
+.vg-editor-side { display: flex; flex-direction: column; gap: 10px; }
+.vg-editor-label { margin: 0; font-size: 12px; font-weight: 600; }
+.vg-editor-preview { max-width: 240px; max-height: 240px; border-radius: 6px; background: repeating-conic-gradient(rgba(127,127,127,.25) 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+.vg-editor-tools, .vg-editor-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+.vg-editor-adjust { display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.vg-editor-adjust input { width: 100%; }
+.vg-editor-message { min-height: 1.2em; margin: 0; font-size: 12px; }
+
+@media (max-width: 800px) {
+    .vg-editor-body { grid-template-columns: 1fr; }
+    .vg-editor-stage { height: 50vh; }
+}
+
+@media (max-width: 640px) {
+    .vg-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+}

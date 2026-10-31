@@ -11,6 +11,7 @@ Tests for apps.purchases (P1B — purchase orders).
     Discrepancy*/POClose*Tests    — P1D discrepancies, resolve, PO close
 """
 
+import re
 import threading
 from decimal import Decimal
 from unittest import mock
@@ -28,6 +29,7 @@ from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.text import capfirst
+from unfold.enums import ActionVariant
 from unfold.widgets import UnfoldAdminDecimalFieldWidget
 
 from apps.catalog.models import Brand, Category, Product, ProductEdition, ProductVariant
@@ -4651,6 +4653,192 @@ class SupplierPaymentFormAdminTests(_PrivateStorageMixin, _PaymentServiceBase):
         services.reverse_po_payment_entry(entry, reason="dup", user=self.user)
         after = (self._count_queries(po_url), self._count_queries(list_url), self._count_queries(self._record_url()))
         self.assertEqual(baseline, after)
+
+
+class RecordPaymentPrefillAndActionStyleTests(_PaymentServiceBase):
+    """Record Payment defaults Amount to the remaining against the PO
+    (posted entries only, DEC-011), and PO detail actions carry Unfold
+    variants for visual hierarchy without changing who may use them."""
+
+    def _record_url(self, po=None):
+        return reverse("admin:purchases_purchaseorder_record_payment", args=[(po or self.po).pk])
+
+    def _entry_url(self, entry):
+        return reverse("admin:purchases_purchaseorder_payment_entry", args=[entry.public_id])
+
+    def _change_url(self):
+        return reverse("admin:purchases_purchaseorder_change", args=[self.po.pk])
+
+    def _data(self, button, **overrides):
+        data = {
+            "amount": "250.00", "entry_date": timezone.localdate().isoformat(), "method": "upi",
+            "reference": "UTR-31", "notes": "", "paid_through": self.account.pk, button: "1",
+        }
+        data.update(overrides)
+        return data
+
+    def _amount_shown(self, resp):
+        self.assertEqual(resp.status_code, 200)
+        return resp.context["form"]["amount"].value()
+
+    def _summary(self, resp):
+        return dict(resp.context["summary_rows"])
+
+    def _action_classes(self, resp, url):
+        match = re.search(r'<li class="([^"]*)"[^>]*>\s*<a href="' + re.escape(url) + '"', resp.content.decode())
+        return match.group(1).split() if match else None
+
+    # Amount default ------------------------------------------------------
+
+    def test_new_payment_defaults_to_full_remaining(self):
+        self.client.force_login(self.user)
+        resp = self.client.get(self._record_url())
+        self.assertEqual(self._amount_shown(resp), Decimal("1000.00"))
+        self.assertContains(resp, 'value="1000.00"')
+        self.assertEqual(self._summary(resp)["Remaining against PO (operational)"], Decimal("1000.00"))
+
+    def test_partially_paid_po_defaults_to_remaining(self):
+        self._post(amount=Decimal("400"))
+        self.client.force_login(self.user)
+        resp = self.client.get(self._record_url())
+        self.assertEqual(self._amount_shown(resp), Decimal("600.00"))
+        summary = self._summary(resp)
+        # The default and the summary come from the same value.
+        self.assertEqual(summary["Remaining against PO (operational)"], self._amount_shown(resp))
+        self.assertEqual(summary["Net paid (posted)"], Decimal("400.00"))
+        self.assertEqual(summary["Payment status"], "Partially paid")
+        self.assertEqual((summary["Purchase order"], str(summary["Vendor"])), (self.po.po_number, "PO Vendor"))
+
+    def test_drafts_do_not_reduce_the_default(self):
+        self._post(amount=Decimal("400"))
+        self._create_draft(amount=Decimal("300"), paid_through=None)
+        self.client.force_login(self.user)
+        resp = self.client.get(self._record_url())
+        self.assertEqual(self._amount_shown(resp), Decimal("600.00"))
+        self.assertEqual(self._summary(resp)["Drafts (not counted)"], "1 totalling 300.00")
+
+    def test_editing_a_draft_keeps_its_amount(self):
+        self._post(amount=Decimal("400"))
+        draft = self._create_draft(amount=Decimal("300"), paid_through=None)
+        self.client.force_login(self.user)
+        resp = self.client.get(self._entry_url(draft))
+        self.assertEqual(self._amount_shown(resp), Decimal("300.00"))
+        self.assertContains(resp, 'value="300.00"')
+
+    def test_validation_error_keeps_submitted_amount(self):
+        self.client.force_login(self.user)
+        resp = self.client.post(self._record_url(), self._data("_draft", amount="0"))
+        self.assertEqual(self._amount_shown(resp), "0")
+        self.assertContains(resp, "greater than or equal to 0.01")
+        self.assertNotContains(resp, 'value="1000.00"')
+        # A service refusal (overpayment) re-renders with the typed amount too.
+        resp = self.client.post(self._record_url(), self._data("_post", amount="1500.00"))
+        self.assertEqual(self._amount_shown(resp), "1500.00")
+        self.assertContains(resp, "exceed")
+        self.assertFalse(PurchaseOrderPayment.objects.exists())
+
+    def test_less_than_default_posts_a_partial_payment(self):
+        self.client.force_login(self.user)
+        resp = self.client.post(self._record_url(), self._data("_post", amount="250.00"))
+        self.assertRedirects(resp, self._change_url(), fetch_redirect_response=False)
+        self.assertEqual(self._fresh().remaining_against_po, Decimal("750.00"))
+        self.assertEqual(self._amount_shown(self.client.get(self._record_url())), Decimal("750.00"))
+
+    # Amount widget ---------------------------------------------------------
+
+    def test_amount_uses_visible_unfold_widget(self):
+        self.client.force_login(self.user)
+        resp = self.client.get(self._record_url())
+        html = resp.content.decode()
+        tag = re.search(r'<input type="number" name="amount"[^>]*>', html).group(0)
+        classes = re.search(r'class="([^"]*)"', tag).group(1).split()
+        for css_class in ("border", "border-base-200", "bg-white", "rounded-default", "px-3", "py-2",
+                          "w-full", "focus:outline-primary-600", "group-[.errors]:border-red-600"):
+            self.assertIn(css_class, classes)
+        self.assertIn('id="id_amount"', tag)
+
+    def test_payment_template_only_uses_classes_unfold_ships(self):
+        # Unfold ships prebuilt Tailwind CSS, so a utility class it never
+        # uses has no styles at all. That is how inputs and gaps end up
+        # invisible on custom admin pages.
+        import os
+        import unfold
+
+        css_path = os.path.join(os.path.dirname(unfold.__file__), "static", "unfold", "css", "styles.css")
+        with open(css_path) as handle:
+            css = handle.read()
+        template = os.path.join(
+            settings.BASE_DIR, "apps", "purchases", "templates", "admin", "purchases", "supplier_payment_form.html",
+        )
+        with open(template) as handle:
+            source = handle.read()
+        classes = {
+            name for attr in re.findall(r'class="([^"{}%]*)"', source) for name in attr.split()
+        }
+        missing = sorted(c for c in classes if "." + re.sub(r"([:\[\]./])", r"\\\1", c) not in css)
+        self.assertEqual(missing, [])
+
+    # Fully paid POs -----------------------------------------------------------
+
+    def test_record_payment_hidden_when_fully_paid(self):
+        request = RequestFactory().get("/")
+        request.user = self.user
+        model_admin = PurchaseOrderAdmin(PurchaseOrder, django_admin.site)
+        self.assertTrue(model_admin.has_record_payment_permission(request, self.po.pk))
+        self._create_draft(amount=Decimal("1000"), paid_through=None)
+        # A draft is not a payment: the action stays.
+        self.assertTrue(model_admin.has_record_payment_permission(request, self.po.pk))
+        payment = self._post(amount=Decimal("1000"))
+        self.assertFalse(model_admin.has_record_payment_permission(request, self.po.pk))
+
+        self.client.force_login(self.user)
+        self.assertNotContains(self.client.get(self._change_url()), self._record_url())
+        self.assertEqual(self.client.get(self._record_url()).status_code, 403)
+        self.assertEqual(self.client.post(self._record_url(), self._data("_post")).status_code, 403)
+        # Refund and reversal stay available; the open draft stays editable.
+        self.assertTrue(model_admin.has_record_vendor_refund_permission(request, self.po.pk))
+        self.assertTrue(model_admin.has_reverse_payment_entry_permission(request, self.po.pk))
+        draft = PurchaseOrderPayment.objects.drafts().get()
+        self.assertEqual(self.client.get(self._entry_url(draft)).status_code, 200)
+
+        services.reverse_po_payment_entry(payment, reason="wrong amount", user=self.user)
+        self.assertTrue(model_admin.has_record_payment_permission(request, self.po.pk))
+
+    # Action styling ------------------------------------------------------
+
+    def test_action_variants(self):
+        variants = {
+            name: getattr(PurchaseOrderAdmin, name).variant
+            for name in PurchaseOrderAdmin.actions_detail
+        }
+        self.assertEqual(variants.pop("record_payment"), ActionVariant.PRIMARY)
+        self.assertEqual(variants.pop("record_vendor_refund"), ActionVariant.WARNING)
+        self.assertEqual(variants.pop("reverse_payment_entry"), ActionVariant.DANGER)
+        # Everything else stays neutral: not every button is highlighted.
+        self.assertEqual(set(variants.values()), {ActionVariant.DEFAULT})
+
+    def test_rendered_action_hierarchy(self):
+        self._post(amount=Decimal("400"))
+        self.client.force_login(self.user)
+        resp = self.client.get(self._change_url())
+        url = lambda name: reverse(f"admin:purchases_purchaseorder_{name}", args=[self.po.pk])  # noqa: E731
+        self.assertIn("bg-primary-600", self._action_classes(resp, url("record_payment")))
+        self.assertIn("bg-orange-600", self._action_classes(resp, url("record_vendor_refund")))
+        self.assertIn("bg-red-600", self._action_classes(resp, url("reverse_payment_entry")))
+        history = self._action_classes(resp, reverse("admin:purchases_purchaseorder_history", args=[self.po.pk]))
+        self.assertIn("border-base-200", history)
+        self.assertFalse([c for c in history if c.startswith("bg-")])
+
+    def test_styling_does_not_widen_permissions(self):
+        self._post(amount=Decimal("400"))
+        viewer = _purchases_staff("styleviewer", "view_purchaseorder", "view_purchaseorderpayment")
+        self.client.force_login(viewer)
+        resp = self.client.get(self._change_url())
+        for name in ("record_payment", "record_vendor_refund", "reverse_payment_entry"):
+            url = reverse(f"admin:purchases_purchaseorder_{name}", args=[self.po.pk])
+            with self.subTest(name=name):
+                self.assertNotContains(resp, url)
+                self.assertEqual(self.client.get(url).status_code, 403)
 
 
 # ── Draft PO line editing through the admin change form ─────────────────────

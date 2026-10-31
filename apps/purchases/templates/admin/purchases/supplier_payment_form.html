@@ -1,5 +1,11 @@
 {% extends "admin/base_site.html" %}
 
+{% block extrahead %}
+{{ block.super }}{{ form.media }}
+{# Select2 caps its list at 200px; give the grouped Paid Through list room. #}
+<style>.select2-container--admin-autocomplete .select2-results > .select2-results__options { max-height: 22rem; }</style>
+{% endblock %}
+
 {% block breadcrumbs %}{% endblock %}
 
 {% block content %}

@@ -497,8 +497,12 @@ class PurchaseOrderAdminTests(_POBase):
         items = {item["title"]: item for item in groups["Purchases"]}
         self.assertEqual(
             list(items),
-            ["Vendors", "Purchase Orders", "Goods Receipts", "Supplier Payments",
+            ["Vendors", "Purchase Orders", "Goods Receipts", "Supplier Payments", "Paid Through Accounts",
              "Receipt Discrepancies", "Booked Quantity History"],
+        )
+        self.assertEqual(
+            str(items["Paid Through Accounts"]["link"]),
+            reverse("admin:purchases_paymentaccount_changelist"),
         )
         self.assertEqual(
             str(items["Supplier Payments"]["link"]),
@@ -5064,6 +5068,10 @@ class PaidThroughGroupedSelectTests(_PrivateStorageMixin, _PaymentServiceBase):
         self.assertEqual(resp.status_code, 200)
         self.assertIn("paid_through", resp.context["form"].errors)
         self.assertFalse(PurchaseOrderPayment.objects.exists())
+
+    def test_empty_account_list_says_where_to_add_accounts(self):
+        PaymentAccount.objects.update(is_active=False)
+        self.assertContains(self._record_page(), "No Paid Through accounts yet")
 
     def test_owner_and_employee_kinds_group_after_card(self):
         _account("Amex Corporate", PaymentAccount.KIND_CARD)

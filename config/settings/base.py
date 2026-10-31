@@ -473,6 +473,11 @@ UNFOLD = {
                         "purchases.view_purchaseorderpayment",
                     ),
                     _nav_item(
+                        "Paid Through Accounts", "account_balance_wallet",
+                        "admin:purchases_paymentaccount_changelist",
+                        "purchases.view_paymentaccount",
+                    ),
+                    _nav_item(
                         "Receipt Discrepancies", "report_problem",
                         "admin:purchases_receiptdiscrepancy_changelist",
                         "purchases.view_receiptdiscrepancy",

@@ -5,7 +5,7 @@ from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
 from django.db import models
 from django.db.models import F, Q, Sum, Value
-from django.db.models.functions import Cast, Coalesce, Concat, Greatest, Length, LPad
+from django.db.models.functions import Cast, Coalesce, Concat, Greatest, Length, Lower, LPad
 from django.utils import timezone
 
 from apps.core.models import BaseModel
@@ -794,13 +794,66 @@ class ReceiptDiscrepancy(BaseModel):
             raise ValidationError(errors)
 
 
+class PaymentAccount(BaseModel):
+    """DEC-011 "Paid Through": the source a supplier payment was made from
+    (e.g. Petty Cash, a bank account, a UPI account). A label only: no
+    balances, account numbers, IFSC, reconciliation data or credentials.
+    Deactivated, never deleted (payments reference it)."""
+
+    KIND_CASH = "cash"
+    KIND_BANK = "bank"
+    KIND_UPI = "upi"
+    KIND_CARD = "card"
+    KIND_OTHER = "other"
+    KIND_CHOICES = (
+        (KIND_CASH, "Cash"),
+        (KIND_BANK, "Bank"),
+        (KIND_UPI, "UPI"),
+        (KIND_CARD, "Card"),
+        (KIND_OTHER, "Other"),
+    )
+
+    name = models.CharField(max_length=80, help_text="A label only, e.g. \"HDFC Current ••1234\". No full account numbers.")
+    kind = models.CharField(max_length=10, choices=KIND_CHOICES)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "payment account (paid through)"
+        verbose_name_plural = "payment accounts (paid through)"
+        constraints = [
+            models.UniqueConstraint(Lower("name"), name="payment_account_name_ci_unique"),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class PurchaseOrderPaymentQuerySet(models.QuerySet):
+    def posted(self):
+        """The only rows that count financially (DEC-011)."""
+        return self.filter(status=PurchaseOrderPayment.STATUS_POSTED)
+
+    def drafts(self):
+        return self.filter(status=PurchaseOrderPayment.STATUS_DRAFT)
+
+
 class PurchaseOrderPayment(BaseModel):
-    """DEC-010 operational supplier payment ledger. Append-only: rows are
-    never updated or deleted. A mistake is corrected with a reversal entry
-    (full amount, linked, reason required, at most one per entry, never
-    itself reversed). A vendor_refund is money the supplier actually
-    returned. Not an accounting record; Zoho Books is authoritative.
+    """DEC-010 operational supplier payment ledger. Posted rows are
+    append-only: never updated or deleted. A mistake is corrected with a
+    reversal entry (full amount, linked, reason required, at most one per
+    entry, never itself reversed). A vendor_refund is money the supplier
+    actually returned. DEC-011: a payment may first be a draft, which is
+    editable and deletable and never counts in any total until posted.
+    Not an accounting record; Zoho Books is authoritative.
     Written only through apps.purchases.services."""
+
+    STATUS_DRAFT = "draft"
+    STATUS_POSTED = "posted"
+    STATUS_CHOICES = (
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_POSTED, "Posted"),
+    )
+    PAYMENT_NUMBER_PREFIX = "SPAY-"
 
     TYPE_PAYMENT = "payment"
     TYPE_VENDOR_REFUND = "vendor_refund"
@@ -846,18 +899,33 @@ class PurchaseOrderPayment(BaseModel):
     recorded_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+"
     )
+    # DEC-011. Default draft: a row created without a status can never
+    # inflate totals; refunds/reversals created as drafts fail a constraint.
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+    payment_number = models.CharField(max_length=20, null=True, blank=True, unique=True, editable=False)
+    paid_through = models.ForeignKey(
+        PaymentAccount, on_delete=models.PROTECT, null=True, blank=True, related_name="payments",
+    )
+    posted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    posted_at = models.DateTimeField(null=True, blank=True)
+
+    objects = PurchaseOrderPaymentQuerySet.as_manager()
 
     class Meta:
         ordering = ["entry_date", "id"]
         verbose_name = "supplier payment entry"
         verbose_name_plural = "supplier payment entries"
         permissions = [
-            ("record_po_payment", "Can record supplier payments and vendor refunds"),
+            ("record_po_payment", "Can record supplier payment drafts and vendor refunds"),
+            ("post_po_payment", "Can post supplier payments"),
             ("reverse_po_payment", "Can reverse supplier payment entries"),
         ]
         indexes = [
             models.Index(fields=["purchase_order", "entry_type"], name="po_payment_po_type_idx"),
             models.Index(fields=["reference"], name="po_payment_reference_idx"),
+            models.Index(fields=["purchase_order", "status"], name="po_payment_po_status_idx"),
         ]
         constraints = [
             models.CheckConstraint(condition=Q(amount__gt=0), name="po_payment_amount_gt_0"),
@@ -874,16 +942,100 @@ class PurchaseOrderPayment(BaseModel):
                 condition=Q(entry_type="reversal") | ~Q(method=""),
                 name="po_payment_method_required",
             ),
+            # DEC-011
+            models.CheckConstraint(
+                condition=Q(status="posted") | Q(entry_type="payment"),
+                name="po_payment_draft_only_payment",
+            ),
+            models.CheckConstraint(
+                condition=(Q(entry_type="payment", status="posted") & Q(payment_number__isnull=False))
+                | (~Q(entry_type="payment", status="posted") & Q(payment_number__isnull=True)),
+                name="po_payment_number_iff_posted_payment",
+            ),
+            models.CheckConstraint(
+                condition=Q(payment_number__isnull=True) | Q(payment_number__regex=r"^SPAY-[0-9]{6,}$"),
+                name="po_payment_number_format",
+            ),
+            models.CheckConstraint(
+                condition=Q(status="draft", posted_at__isnull=True, posted_by__isnull=True)
+                | Q(status="posted", posted_at__isnull=False, posted_by__isnull=False),
+                name="po_payment_posted_audit",
+            ),
         ]
 
     def __str__(self):
         return f"{self.get_entry_type_display()} {self.amount} on {self.purchase_order}"
 
+    @property
+    def is_draft(self):
+        return self.status == self.STATUS_DRAFT
+
+    def _stored_status(self):
+        return type(self).objects.filter(pk=self.pk).values_list("status", flat=True).first()
+
     def save(self, *args, **kwargs):
-        if not self._state.adding:
+        # Only a stored draft may be updated (edited, or posted once).
+        if not self._state.adding and self._stored_status() != self.STATUS_DRAFT:
             raise ValidationError("Supplier payment entries cannot be changed; record a reversal instead.")
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
-        raise ValidationError("Supplier payment entries cannot be deleted; record a reversal instead.")
+        if self._stored_status() != self.STATUS_DRAFT:
+            raise ValidationError("Supplier payment entries cannot be deleted; record a reversal instead.")
+        return super().delete(*args, **kwargs)
+
+
+def _attachment_storage():
+    from django.core.files.storage import storages
+
+    return storages["private_documents"]
+
+
+def _attachment_path(instance, filename):
+    # filename is already a random uuid4 name set by the service.
+    today = timezone.localdate()
+    return f"supplier-payments/{today:%Y/%m}/{filename}"
+
+
+class SupplierPaymentAttachment(BaseModel):
+    """DEC-011 payment proof. Private storage, served only through a
+    permission-checked admin view. Removable only while the payment is a
+    draft; posted payments are add-only."""
+
+    MAX_PER_PAYMENT = 5
+    MAX_SIZE = 5 * 1024 * 1024
+    TYPE_PDF = "application/pdf"
+    TYPE_JPEG = "image/jpeg"
+    TYPE_PNG = "image/png"
+    TYPE_WEBP = "image/webp"
+    CONTENT_TYPE_CHOICES = (
+        (TYPE_PDF, "PDF"),
+        (TYPE_JPEG, "JPEG"),
+        (TYPE_PNG, "PNG"),
+        (TYPE_WEBP, "WebP"),
+    )
+
+    payment = models.ForeignKey(PurchaseOrderPayment, on_delete=models.PROTECT, related_name="attachments")
+    file = models.FileField(storage=_attachment_storage, upload_to=_attachment_path, max_length=255)
+    original_name = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=30, choices=CONTENT_TYPE_CHOICES)
+    size = models.PositiveIntegerField()
+    uploaded_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        verbose_name = "supplier payment attachment"
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(size__gt=0, size__lte=5 * 1024 * 1024), name="po_payment_attachment_size",
+            ),
+        ]
+
+    def __str__(self):
+        return self.original_name
+
+    def delete(self, *args, **kwargs):
+        if self.payment._stored_status() != PurchaseOrderPayment.STATUS_DRAFT:
+            raise ValidationError("Proof on a posted payment cannot be removed.")
+        return super().delete(*args, **kwargs)
 

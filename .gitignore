@@ -21,6 +21,7 @@ ENV/
 local_settings.py
 db.sqlite3
 media/
+private_media/
 staticfiles/
 
 # ── Database dumps / backups / keys / archives ─────────────────────────────────

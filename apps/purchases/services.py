@@ -13,7 +13,7 @@ discrepancies never do.
 from collections import defaultdict
 
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import connection, transaction
 from django.utils import timezone
 
 from apps.inventory.models import InventoryStock
@@ -733,6 +733,21 @@ def set_po_tax_treatment(po, treatment, user):
     return po
 
 
+def _posted_audit(user):
+    return {
+        "status": PurchaseOrderPayment.STATUS_POSTED, "posted_by": user, "posted_at": timezone.now(),
+    }
+
+
+def next_payment_number():
+    """DEC-011: next SPAY number from the database sequence. Concurrency-safe;
+    a transaction that rolls back after this leaves a gap, which is accepted."""
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT nextval('purchases_spay_seq')")
+        (value,) = cursor.fetchone()
+    return f"{PurchaseOrderPayment.PAYMENT_NUMBER_PREFIX}{value:06d}"
+
+
 def _check_entry_input(amount, entry_date, method, reference, notes):
     if amount is None or amount <= 0:
         raise SupplierPaymentError("Amount must be greater than zero.")
@@ -779,6 +794,7 @@ def record_po_payment(po, amount, entry_date, method, reference, notes, user):
     return PurchaseOrderPayment.objects.create(
         purchase_order=po, entry_type=PurchaseOrderPayment.TYPE_PAYMENT, amount=amount,
         entry_date=entry_date, method=method, reference=reference, notes=notes, recorded_by=user,
+        payment_number=next_payment_number(), **_posted_audit(user),
     )
 
 
@@ -793,6 +809,7 @@ def record_vendor_refund(po, amount, entry_date, method, reference, notes, user)
     return PurchaseOrderPayment.objects.create(
         purchase_order=po, entry_type=PurchaseOrderPayment.TYPE_VENDOR_REFUND, amount=amount,
         entry_date=entry_date, method=method, reference=reference, notes=notes, recorded_by=user,
+        **_posted_audit(user),
     )
 
 
@@ -830,5 +847,6 @@ def reverse_po_payment_entry(entry, reason, user):
     return PurchaseOrderPayment.objects.create(
         purchase_order=po, entry_type=PurchaseOrderPayment.TYPE_REVERSAL, amount=entry.amount,
         entry_date=timezone.localdate(), reverses=entry, reversal_reason=reason, recorded_by=user,
+        **_posted_audit(user),
     )
 

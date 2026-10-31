@@ -3005,12 +3005,24 @@ class OrderedGrossTotalTests(_POBase):
         self.assertIsNone(po.ordered_gross_total)
 
 
+def _posted_fields(entry_type, user, extra):
+    """DEC-011: rows written straight to the ledger in tests are posted, as
+    the services write them (payments carry an SPAY number)."""
+    extra.setdefault("status", PurchaseOrderPayment.STATUS_POSTED)
+    if extra["status"] == PurchaseOrderPayment.STATUS_POSTED:
+        extra.setdefault("posted_by", user)
+        extra.setdefault("posted_at", timezone.now())
+        if entry_type == PAYMENT:
+            extra.setdefault("payment_number", services.next_payment_number())
+    return extra
+
+
 def _entry(po, entry_type, amount, user, **extra):
     if entry_type != REVERSAL:
         extra.setdefault("method", PurchaseOrderPayment.METHOD_CASH)
     return PurchaseOrderPayment.objects.create(
         purchase_order=po, entry_type=entry_type, amount=Decimal(amount),
-        entry_date=timezone.localdate(), recorded_by=user, **extra,
+        entry_date=timezone.localdate(), recorded_by=user, **_posted_fields(entry_type, user, extra),
     )
 
 
@@ -3020,6 +3032,7 @@ class PurchaseOrderPaymentModelTests(_POBase):
         self.po = self._po(purchase_tax_treatment=NO_GST)
 
     def _integrity(self, **kwargs):
+        _posted_fields(kwargs.get("entry_type"), self.user, kwargs)
         with self.assertRaises(IntegrityError), transaction.atomic():
             PurchaseOrderPayment.objects.create(
                 purchase_order=self.po, entry_date=timezone.localdate(), recorded_by=self.user, **kwargs,
@@ -3601,3 +3614,189 @@ class SupplierPaymentLedgerAdminTests(AdminQueryCountMixin, _POBase):
             po = self._po(purchase_tax_treatment=NO_GST)
             self._line(po, variant=_variant(f"SKU-PAYQ-{i}"), quantity_ordered=1, unit_price=Decimal("100"))
         self.assertChangelistQueriesFlat(reverse("admin:purchases_purchaseorder_changelist"), make)
+
+
+# ── DEC-011: supplier payment drafts, numbering, Paid Through, proof ────────
+
+from apps.purchases.models import PaymentAccount, SupplierPaymentAttachment  # noqa: E402
+
+DRAFT = PurchaseOrderPayment.STATUS_DRAFT
+POSTED = PurchaseOrderPayment.STATUS_POSTED
+
+
+def _account(name="Petty Cash", kind=PaymentAccount.KIND_CASH, **kwargs):
+    return PaymentAccount.objects.create(name=name, kind=kind, **kwargs)
+
+
+def _draft(po, amount, user, **extra):
+    extra.setdefault("method", PurchaseOrderPayment.METHOD_CASH)
+    return PurchaseOrderPayment.objects.create(
+        purchase_order=po, entry_type=PAYMENT, amount=Decimal(amount), status=DRAFT,
+        entry_date=timezone.localdate(), recorded_by=user, **extra,
+    )
+
+
+class SupplierPaymentDraftModelTests(_POBase):
+    def setUp(self):
+        super().setUp()
+        self.po = self._po(purchase_tax_treatment=NO_GST)
+
+    def _integrity(self, **kwargs):
+        kwargs.setdefault("method", "cash")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            PurchaseOrderPayment.objects.create(
+                purchase_order=self.po, entry_date=timezone.localdate(), recorded_by=self.user,
+                amount=Decimal("10"), **kwargs,
+            )
+
+    def test_default_status_is_draft(self):
+        self.assertEqual(_draft(self.po, "10", self.user).status, DRAFT)
+        entry = PurchaseOrderPayment(purchase_order=self.po, entry_type=PAYMENT)
+        self.assertEqual(entry.status, DRAFT)
+
+    def test_only_payments_can_be_drafts(self):
+        self._integrity(entry_type=REFUND, status=DRAFT)
+
+    def test_number_exactly_on_posted_payments(self):
+        now = timezone.now()
+        posted = {"status": POSTED, "posted_by": self.user, "posted_at": now}
+        self._integrity(entry_type=PAYMENT, **posted)  # posted payment without number
+        self._integrity(entry_type=PAYMENT, status=DRAFT, payment_number="SPAY-000777")
+        self._integrity(entry_type=REFUND, payment_number="SPAY-000778", **posted)
+
+    def test_number_format(self):
+        now = timezone.now()
+        self._integrity(
+            entry_type=PAYMENT, status=POSTED, posted_by=self.user, posted_at=now, payment_number="PAY-1",
+        )
+        self._integrity(
+            entry_type=PAYMENT, status=POSTED, posted_by=self.user, posted_at=now, payment_number="SPAY-12345",
+        )
+
+    def test_posted_audit_fields(self):
+        self._integrity(entry_type=PAYMENT, status=DRAFT, posted_at=timezone.now())
+        self._integrity(entry_type=REFUND, status=POSTED, posted_by=self.user)
+
+    def test_number_unique(self):
+        number = services.next_payment_number()
+        _entry(self.po, PAYMENT, "1", self.user, payment_number=number)
+        self._integrity(
+            entry_type=PAYMENT, status=POSTED, posted_by=self.user, posted_at=timezone.now(),
+            payment_number=number,
+        )
+
+    def test_draft_is_editable_and_deletable(self):
+        draft = _draft(self.po, "10", self.user)
+        draft.notes = "edited"
+        draft.save()
+        self.assertEqual(PurchaseOrderPayment.objects.get(pk=draft.pk).notes, "edited")
+        draft.delete()
+        self.assertFalse(PurchaseOrderPayment.objects.filter(pk=draft.pk).exists())
+
+    def test_posted_payment_is_immutable_even_from_a_stale_draft_instance(self):
+        draft = _draft(self.po, "10", self.user)
+        stale = PurchaseOrderPayment.objects.get(pk=draft.pk)
+        PurchaseOrderPayment.objects.filter(pk=draft.pk).update(
+            status=POSTED, posted_by=self.user, posted_at=timezone.now(),
+            payment_number=services.next_payment_number(),
+        )
+        stale.notes = "edited after posting"
+        with self.assertRaises(ValidationError):
+            stale.save()
+        with self.assertRaises(ValidationError):
+            stale.delete()
+        self.assertTrue(PurchaseOrderPayment.objects.filter(pk=draft.pk, notes="").exists())
+
+    def test_payment_account_name_unique_case_insensitive(self):
+        _account("Petty Cash")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            _account("petty cash")
+
+    def test_payment_account_in_use_cannot_be_deleted(self):
+        from django.db.models import ProtectedError
+
+        account = _account()
+        _entry(self.po, PAYMENT, "1", self.user, paid_through=account)
+        with self.assertRaises(ProtectedError):
+            account.delete()
+
+    def test_numbers_increase(self):
+        first, second = services.next_payment_number(), services.next_payment_number()
+        self.assertRegex(first, r"^SPAY-\d{6,}$")
+        self.assertGreater(int(second[5:]), int(first[5:]))
+
+
+class SupplierPaymentBackfillMigrationTests(TransactionTestCase):
+    """0007-0009 keep every existing entry financially identical."""
+
+    migrate_from = [("purchases", "0006_po_tax_treatment_and_payments")]
+    migrate_to = [("purchases", "0009_supplier_payment_drafts_constraints")]
+
+    def setUp(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.migrate_from)
+        old = self.executor.loader.project_state(self.migrate_from).apps
+        # Only purchases is rolled back; users, vendors and warehouses use the
+        # current models. PO and ledger rows use the 0006 historical models.
+        user = User.objects.create_user(username="mig", email="mig@example.com", password="x")
+        PO_ = old.get_model("purchases", "PurchaseOrder")
+        Pay = old.get_model("purchases", "PurchaseOrderPayment")
+        po = PO_.objects.create(
+            supplier_id=Supplier.objects.create(name="Mig Vendor").pk,
+            warehouse_id=Warehouse.objects.create(name="Mig WH").pk,
+            purchase_tax_treatment="no_gst_invoice", status="issued",
+        )
+        self.po_id = po.pk
+        today = timezone.localdate()
+        day = datetime.timedelta(days=1)
+
+        def make(entry_type, amount, date, **kw):
+            if entry_type != "reversal":
+                kw.setdefault("method", "cash")
+            return Pay.objects.create(
+                purchase_order=po, entry_type=entry_type, amount=Decimal(amount), entry_date=date,
+                recorded_by_id=user.pk, **kw,
+            )
+
+        later = make("payment", "300", today)            # newer date, lower id after next
+        earlier = make("payment", "200", today - 2 * day)
+        wrong = make("payment", "50", today - day)
+        make("reversal", "50", today, reverses=wrong, reversal_reason="wrong PO")
+        make("vendor_refund", "20", today)
+        self.ids = {"earlier": earlier.pk, "wrong": wrong.pk, "later": later.pk}
+        self.user_id = user.pk
+
+    def tearDown(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        MigrationExecutor(connection).migrate(MigrationExecutor(connection).loader.graph.leaf_nodes())
+
+    def test_backfill_keeps_totals_and_numbers_in_date_order(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(self.migrate_to)
+        po = PurchaseOrder.objects.get(pk=self.po_id)
+        summary = po.payment_summary()
+        # payments 300 + 200 (+50 reversed), refund 20 -> net 480
+        self.assertEqual(
+            (summary["gross_payments"], summary["vendor_refunds"], summary["reversals"], summary["net_paid"]),
+            (Decimal("550"), Decimal("20"), Decimal("50"), Decimal("480")),
+        )
+        annotated = selectors.annotate_payment_summary(PurchaseOrder.objects.filter(pk=po.pk)).get()
+        self.assertEqual(annotated.net_paid_db, Decimal("480"))
+        entries = PurchaseOrderPayment.objects.filter(purchase_order=po)
+        self.assertEqual(set(entries.values_list("status", flat=True)), {POSTED})
+        numbers = dict(entries.filter(entry_type=PAYMENT).values_list("pk", "payment_number"))
+        self.assertEqual(
+            [numbers[self.ids[k]] for k in ("earlier", "wrong", "later")],
+            ["SPAY-000001", "SPAY-000002", "SPAY-000003"],
+        )
+        self.assertFalse(entries.exclude(entry_type=PAYMENT).filter(payment_number__isnull=False).exists())
+        self.assertFalse(entries.filter(paid_through__isnull=False).exists())
+        self.assertFalse(entries.exclude(posted_by_id=self.user_id).exists())
+        self.assertFalse(entries.filter(posted_at__isnull=True).exists())
+        self.assertEqual(services.next_payment_number(), "SPAY-000004")

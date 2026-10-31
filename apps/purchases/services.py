@@ -13,6 +13,7 @@ discrepancies never do.
 from collections import defaultdict
 
 from django.core.exceptions import ValidationError
+from django.core.files import File
 from django.db import connection, transaction
 from django.utils import timezone
 
@@ -35,6 +36,7 @@ from .models import (
     PurchaseOrderLine,
     PurchaseOrderPayment,
     ReceiptDiscrepancy,
+    SupplierPaymentAttachment,
 )
 
 
@@ -841,6 +843,7 @@ def delete_payment_draft(draft, user):
     po = _lock(draft.purchase_order)
     draft = _lock_payment(draft, po)
     _refuse_posted(draft, "deleted")
+    _delete_attachment_rows(list(draft.attachments.all()))
     draft.delete()
 
 
@@ -873,6 +876,63 @@ def post_payment(po, *, user, draft=None, amount, entry_date, method, reference,
         setattr(entry, field, value)
     entry.save()
     return entry
+
+
+def _delete_attachment_rows(attachments):
+    """Delete attachment rows now and their files only once the transaction
+    commits, so a rollback never leaves a row pointing at a missing file."""
+    for attachment in attachments:
+        storage, name = attachment.file.storage, attachment.file.name
+        attachment.delete()
+        transaction.on_commit(lambda storage=storage, name=name: storage.delete(name))
+
+
+@transaction.atomic
+def add_payment_attachments(entry, files, user):
+    """DEC-011: attach payment proof. Drafts and posted payments both accept
+    new files (posted payments are add-only); at most five per payment."""
+    from .attachments import AttachmentError, validate_upload
+
+    po = _lock(entry.purchase_order)
+    entry = _lock_payment(entry, po)
+    if entry.entry_type != PurchaseOrderPayment.TYPE_PAYMENT:
+        raise SupplierPaymentError("Proof can be attached to supplier payments only.")
+    files = list(files)
+    limit = SupplierPaymentAttachment.MAX_PER_PAYMENT
+    if entry.attachments.count() + len(files) > limit:
+        raise SupplierPaymentError(f"A payment can have at most {limit} attachments.")
+    try:
+        checked = [(upload, *validate_upload(upload)) for upload in files]
+    except AttachmentError as exc:
+        raise SupplierPaymentError(str(exc)) from exc
+    saved = []
+    try:
+        for upload, content_type, original_name, storage_name in checked:
+            attachment = SupplierPaymentAttachment(
+                payment=entry, original_name=original_name, content_type=content_type, size=upload.size,
+                uploaded_by=user,
+            )
+            attachment.file.save(storage_name, File(upload), save=False)
+            saved.append(attachment.file)
+            attachment.save()
+    except Exception:
+        for stored in saved:
+            stored.storage.delete(stored.name)
+        raise
+    return list(entry.attachments.all())
+
+
+@transaction.atomic
+def remove_payment_attachment(attachment, user):
+    """Remove proof from a draft. Posted payments are add-only."""
+    po = _lock(attachment.payment.purchase_order)
+    entry = _lock_payment(attachment.payment, po)
+    if not entry.is_draft:
+        raise SupplierPaymentError("Proof on a posted payment cannot be removed.")
+    attachment = SupplierPaymentAttachment.objects.filter(pk=attachment.pk, payment=entry).first()
+    if attachment is None:
+        raise SupplierPaymentError("This attachment no longer exists.")
+    _delete_attachment_rows([attachment])
 
 
 def record_po_payment(po, amount, entry_date, method, reference, notes, user, paid_through=None):

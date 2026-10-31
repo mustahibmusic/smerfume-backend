@@ -1,12 +1,14 @@
 from decimal import Decimal
 
 from django import forms
+from django.core.exceptions import PermissionDenied
 from django.contrib import admin, messages
 from django.db.models import Count, Q, Sum
 from django.utils.html import format_html, format_html_join
+from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
-from django.urls import reverse
+from django.urls import path, reverse
 from django.utils import timezone
 from unfold.admin import ModelAdmin, TabularInline
 from unfold.decorators import action, display
@@ -31,6 +33,7 @@ from .models import (
     PurchaseOrderLine,
     PurchaseOrderPayment,
     ReceiptDiscrepancy,
+    SupplierPaymentAttachment,
 )
 
 AUDIT_FIELDS = (
@@ -1475,4 +1478,31 @@ class PurchaseOrderPaymentAdmin(ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+    def get_urls(self):
+        return [
+            path(
+                "attachment/<uuid:public_id>/", self.admin_site.admin_view(self.download_attachment),
+                name="purchases_supplierpaymentattachment_download",
+            ),
+        ] + super().get_urls()
+
+    def download_attachment(self, request, public_id):
+        """DEC-011: payment proof is private. Served only here, to staff who
+        can view supplier payments, as a download (never inline, never via a
+        public storage URL)."""
+        if not self.has_view_permission(request):
+            raise PermissionDenied
+        attachment = get_object_or_404(SupplierPaymentAttachment, public_id=public_id)
+        try:
+            handle = attachment.file.open("rb")
+        except FileNotFoundError:
+            raise Http404("File not found.")
+        response = FileResponse(
+            handle, as_attachment=True, filename=attachment.original_name,
+            content_type=attachment.content_type,
+        )
+        response["X-Content-Type-Options"] = "nosniff"
+        response["Cache-Control"] = "private, no-store"
+        return response
 

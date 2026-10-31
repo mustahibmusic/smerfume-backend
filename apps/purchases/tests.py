@@ -4171,3 +4171,221 @@ class SupplierPaymentPostingConcurrencyTests(TransactionTestCase):
             self.assertEqual(PurchaseOrder.objects.get(pk=self.po.pk).net_paid, Decimal("0"))
         else:
             self.assertEqual((row.status, PurchaseOrder.objects.get(pk=self.po.pk).net_paid), (POSTED, Decimal("300")))
+
+
+def _image_bytes(fmt):
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 4), "red").save(buffer, format=fmt)
+    return buffer.getvalue()
+
+
+_PDF_BYTES = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
+
+
+def _upload(name="proof.pdf", content=_PDF_BYTES, content_type="application/pdf"):
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    return SimpleUploadedFile(name, content, content_type=content_type)
+
+
+class _PrivateStorageMixin:
+    """Point the private_documents storage at a throwaway directory."""
+
+    def setUp(self):
+        import tempfile
+
+        super().setUp()
+        from django.core.files.storage import FileSystemStorage
+
+        self._media_dir = tempfile.mkdtemp()
+        # The field resolves its callable storage once at import, so patch the field.
+        patcher = mock.patch.object(
+            SupplierPaymentAttachment._meta.get_field("file"), "storage", FileSystemStorage(location=self._media_dir),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self._media_dir, ignore_errors=True)
+        super().tearDown()
+
+    def _stored_files(self):
+        import os
+
+        return [name for _, _, names in os.walk(self._media_dir) for name in names]
+
+
+class SupplierPaymentAttachmentValidationTests(_PrivateStorageMixin, _PaymentServiceBase):
+    def test_accepts_pdf_jpeg_png_webp_by_content(self):
+        draft = self._create_draft()
+        uploads = [
+            _upload("a.pdf"),
+            _upload("b.jpg", _image_bytes("JPEG"), "image/jpeg"),
+            _upload("c.png", _image_bytes("PNG"), "image/png"),
+            # Browser label and extension are ignored: content decides.
+            _upload("d.bin", _image_bytes("WEBP"), "application/octet-stream"),
+        ]
+        attachments = services.add_payment_attachments(draft, uploads, self.user)
+        self.assertEqual(
+            [a.content_type for a in attachments], ["application/pdf", "image/jpeg", "image/png", "image/webp"],
+        )
+        self.assertEqual(len(self._stored_files()), 4)
+
+    def test_rejects_spoofed_type(self):
+        draft = self._create_draft()
+        for upload in (
+            _upload("invoice.pdf", b"MZ\x90\x00 not really a pdf", "application/pdf"),
+            _upload("photo.png", b"<svg xmlns='http://www.w3.org/2000/svg'/>", "image/png"),
+            _upload("anim.gif", _image_bytes("GIF"), "image/gif"),
+        ):
+            with self.subTest(upload.name), self.assertRaisesMessage(
+                services.SupplierPaymentError, "not a PDF, JPEG, PNG or WebP",
+            ):
+                services.add_payment_attachments(draft, [upload], self.user)
+        self.assertFalse(SupplierPaymentAttachment.objects.exists())
+        self.assertEqual(self._stored_files(), [])
+
+    def test_rejects_oversize_before_reading(self):
+        draft = self._create_draft()
+        upload = mock.Mock()
+        upload.name, upload.size = "huge.pdf", SupplierPaymentAttachment.MAX_SIZE + 1
+        upload.read.side_effect = AssertionError("content must not be read")
+        with self.assertRaisesMessage(services.SupplierPaymentError, "larger than 5 MB"):
+            services.add_payment_attachments(draft, [upload], self.user)
+
+    def test_rejects_empty_file(self):
+        with self.assertRaisesMessage(services.SupplierPaymentError, "empty"):
+            services.add_payment_attachments(self._create_draft(), [_upload(content=b"")], self.user)
+
+    def test_at_most_five_per_payment_in_total(self):
+        draft = self._create_draft()
+        services.add_payment_attachments(draft, [_upload() for _ in range(3)], self.user)
+        with self.assertRaisesMessage(services.SupplierPaymentError, "at most 5"):
+            services.add_payment_attachments(draft, [_upload() for _ in range(3)], self.user)
+        services.add_payment_attachments(draft, [_upload(), _upload()], self.user)
+        self.assertEqual(draft.attachments.count(), 5)
+
+    def test_one_bad_file_rejects_the_whole_batch(self):
+        draft = self._create_draft()
+        with self.assertRaises(services.SupplierPaymentError):
+            services.add_payment_attachments(draft, [_upload(), _upload("x.pdf", b"nope")], self.user)
+        self.assertFalse(SupplierPaymentAttachment.objects.exists())
+        self.assertEqual(self._stored_files(), [])
+
+    def test_stored_name_is_random_and_original_name_sanitized(self):
+        draft = self._create_draft()
+        (attachment,) = services.add_payment_attachments(
+            draft, [_upload("../../etc/évil name<script>.pdf")], self.user,
+        )
+        self.assertNotIn("..", attachment.original_name)
+        self.assertNotIn("/", attachment.original_name)
+        self.assertNotIn("<", attachment.original_name)
+        self.assertRegex(attachment.file.name, r"^supplier-payments/\d{4}/\d{2}/[0-9a-f]{32}\.pdf$")
+        self.assertEqual((attachment.size, attachment.uploaded_by), (len(_PDF_BYTES), self.user))
+
+    def test_refunds_cannot_carry_proof(self):
+        self._post()
+        refund = services.record_vendor_refund(
+            self.po, amount=Decimal("10"), entry_date=timezone.localdate(), method="cash", reference="",
+            notes="", user=self.user,
+        )
+        with self.assertRaisesMessage(services.SupplierPaymentError, "supplier payments only"):
+            services.add_payment_attachments(refund, [_upload()], self.user)
+
+
+
+class SupplierPaymentPrivateStorageTests(TestCase):
+    def test_proof_uses_private_storage_outside_public_media(self):
+        storage = SupplierPaymentAttachment._meta.get_field("file").storage
+        options = settings.STORAGES["private_documents"]["OPTIONS"]
+        self.assertEqual(storage.location, str(settings.PRIVATE_MEDIA_ROOT))
+        self.assertNotEqual(str(settings.PRIVATE_MEDIA_ROOT), str(settings.MEDIA_ROOT))
+        self.assertIsNone(options.get("base_url"))
+
+
+class SupplierPaymentAttachmentLifecycleTests(_PrivateStorageMixin, _PaymentServiceBase):
+    def test_draft_attachment_can_be_removed_and_file_deleted_on_commit(self):
+        draft = self._create_draft()
+        (attachment,) = services.add_payment_attachments(draft, [_upload()], self.user)
+        with self.captureOnCommitCallbacks(execute=True):
+            services.remove_payment_attachment(attachment, self.user)
+        self.assertFalse(SupplierPaymentAttachment.objects.exists())
+        self.assertEqual(self._stored_files(), [])
+
+    def test_posted_payment_is_add_only(self):
+        draft = self._create_draft()
+        (first,) = services.add_payment_attachments(draft, [_upload()], self.user)
+        self._post(draft=draft)
+        services.add_payment_attachments(draft, [_upload()], self.user)
+        self.assertEqual(draft.attachments.count(), 2)
+        with self.assertRaisesMessage(services.SupplierPaymentError, "cannot be removed"):
+            services.remove_payment_attachment(first, self.user)
+        with self.assertRaises(ValidationError):
+            SupplierPaymentAttachment.objects.get(pk=first.pk).delete()
+        self.assertEqual(len(self._stored_files()), 2)
+
+    def test_proof_survives_posting(self):
+        draft = self._create_draft()
+        services.add_payment_attachments(draft, [_upload(), _upload()], self.user)
+        entry = self._post(draft=draft)
+        self.assertEqual(entry.attachments.count(), 2)
+
+    def test_deleting_a_draft_deletes_its_proof(self):
+        draft = self._create_draft()
+        services.add_payment_attachments(draft, [_upload(), _upload()], self.user)
+        with self.captureOnCommitCallbacks(execute=True):
+            services.delete_payment_draft(draft, self.user)
+        self.assertFalse(SupplierPaymentAttachment.objects.exists())
+        self.assertEqual(self._stored_files(), [])
+
+    def test_rolled_back_removal_keeps_the_file(self):
+        draft = self._create_draft()
+        (attachment,) = services.add_payment_attachments(draft, [_upload()], self.user)
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            services.remove_payment_attachment(attachment, self.user)
+        self.assertEqual(len(callbacks), 1)
+        self.assertEqual(len(self._stored_files()), 1)
+
+
+class SupplierPaymentAttachmentAccessTests(_PrivateStorageMixin, _PaymentServiceBase):
+    def setUp(self):
+        super().setUp()
+        draft = self._create_draft()
+        (self.attachment,) = services.add_payment_attachments(draft, [_upload("bank slip.pdf")], self.user)
+        self.url = reverse("admin:purchases_supplierpaymentattachment_download", args=[self.attachment.public_id])
+
+    def test_viewer_downloads_as_attachment(self):
+        self.client.force_login(_purchases_staff("proofviewer", "view_purchaseorderpayment"))
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(b"".join(resp.streaming_content), _PDF_BYTES)
+        self.assertIn("attachment;", resp["Content-Disposition"])
+        self.assertIn("bank_slip.pdf", resp["Content-Disposition"])
+        self.assertEqual((resp["Content-Type"], resp["X-Content-Type-Options"]), ("application/pdf", "nosniff"))
+        self.assertIn("no-store", resp["Cache-Control"])
+
+    def test_staff_without_view_permission_refused(self):
+        self.client.force_login(_purchases_staff("noproof", "view_purchaseorder"))
+        self.assertEqual(self.client.get(self.url).status_code, 403)
+
+    def test_anonymous_redirected_to_login(self):
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("login", resp["Location"])
+
+    def test_unknown_attachment_404(self):
+        import uuid
+
+        self.client.force_login(self.user)
+        url = reverse("admin:purchases_supplierpaymentattachment_download", args=[uuid.uuid4()])
+        self.assertEqual(self.client.get(url).status_code, 404)
+
+    def test_url_uses_public_id_not_storage_path(self):
+        self.assertNotIn(self.attachment.file.name, self.url)
+        self.assertNotIn(str(self.attachment.pk) + "/", self.url.split("attachment/")[1])

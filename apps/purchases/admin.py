@@ -64,8 +64,37 @@ class PurchaseOrderLineInline(TabularInline):
         "confirmed_booked", "received_net_retail", "allocated_awaiting", "incoming_available",
     )
 
+    class Media:
+        css = {"all": ("purchases/admin/po_lines.css",)}
+
     def _is_draft(self, obj):
         return obj is None or obj.status == PurchaseOrder.STATUS_DRAFT
+
+    # Receiving and booking columns only mean something after issue. On a
+    # draft they are always empty and push the add-row link and the delete
+    # checkboxes off-screen, so drafts show only the commercial columns.
+    DRAFT_FIELDS = (
+        "variant", "quantity_ordered", "unit_price", "line_discount_amount",
+        "tax_rate", "hsn_code", "gross_line_amount", "taxable_value",
+    )
+
+    def get_fields(self, request, obj=None):
+        if self._is_draft(obj):
+            return self.DRAFT_FIELDS
+        return super().get_fields(request, obj)
+
+    def formfield_for_dbfield(self, db_field, request, **kwargs):
+        # Keep the variant search, but drop the edit / add / view / delete
+        # icons beside it: they act on the catalogue variant itself, not
+        # on this line, and widen every row.
+        field = super().formfield_for_dbfield(db_field, request, **kwargs)
+        if db_field.name == "variant" and field is not None:
+            for flag in ("can_add_related", "can_change_related", "can_delete_related", "can_view_related"):
+                setattr(field.widget, flag, False)
+            # A new (empty) row otherwise collapses the search box to the
+            # width of its arrow, leaving the dropdown unreadable.
+            field.widget.widget.attrs["data-width"] = "20rem"
+        return field
 
     def has_add_permission(self, request, obj=None):
         return self._is_draft(obj) and super().has_add_permission(request, obj)

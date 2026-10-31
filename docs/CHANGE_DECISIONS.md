@@ -372,6 +372,39 @@ Some suppliers sell with a GST invoice and some without (lower price, cash or UP
 
 ---
 
+## DEC-011 — Vendor Bill Reference, Payment Due Date and Overdue Status on Purchase Orders
+
+### Original Product Bible Requirement
+DEC-010 (point 9) deferred vendor bills and invoice tracking. Zoho Books is authoritative for vendor bills and the accounts-payable balance (DEC-001, DEC-010).
+
+### Updated Decision
+The purchase order list must show, per row: date, bill number, reference number, vendor, payment status (Paid / Unpaid / Partially Paid / Overdue), due date, amount and balance due.
+1. **One vendor bill per PO.** `PurchaseOrder` records `bill_number`, `bill_date` and `payment_due_date`. They are editable from issue onwards (issued, partially received, received, closed), never in draft or on a cancelled PO.
+2. **Due date default.** Left blank, `payment_due_date` is set to `bill_date` plus the vendor's `payment_terms_days`. Staff may enter the vendor's stated due date instead; it cannot be before the bill date, and a due date needs a bill date.
+3. **Overdue is derived, never stored.** A PO is Overdue when it is not fully paid, its payment due date is before today, and it is in a payable status. Paid wins over Overdue. Status and balance come from the DEC-010 payment ledger only.
+4. **Balance due** is `ordered_gross_total - net_paid` (the DEC-010 `remaining_against_po`); unknown while the PO is unclassified.
+5. **Visibility.** Balance due and payment status stay behind the ledger view permission, like the other DEC-010 payment columns.
+6. **Boundary unchanged.** These are operational payables figures. Zoho Books remains authoritative for vendor bills and the final accounts-payable balance.
+
+### Reason
+Staff need a day-to-day payables view (what is due, what is late) on the purchase order list without opening Zoho Books.
+
+### Impact
+- `apps/purchases`: three new nullable/blank `PurchaseOrder` fields (migration 0007), an `overdue` payment status, a `balance_due_db` annotation, new list columns, bill-number search, and a "Vendor bill" section on the PO form. The existing goods "overdue" filter (past expected date) is relabelled "delivery overdue".
+- No change to inventory, goods receipts, the payment ledger or Zoho integration.
+- Amends DEC-010 point 9 for bill number, bill date and due date only. Multiple bills per PO, bill amounts that differ from the PO and bill documents remain deferred.
+
+### Status
+**APPROVED** — Implemented.
+
+### Date
+2026-10-31
+
+### Related Documentation
+- DEC-001, DEC-010
+
+---
+
 ## Self-Consistency Check
 
 The following issues were reviewed after drafting this file:

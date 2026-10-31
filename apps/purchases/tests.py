@@ -3601,3 +3601,123 @@ class SupplierPaymentLedgerAdminTests(AdminQueryCountMixin, _POBase):
             po = self._po(purchase_tax_treatment=NO_GST)
             self._line(po, variant=_variant(f"SKU-PAYQ-{i}"), quantity_ordered=1, unit_price=Decimal("100"))
         self.assertChangelistQueriesFlat(reverse("admin:purchases_purchaseorder_changelist"), make)
+
+
+# ── DEC-011: vendor bill, due date, balance due and Overdue on the PO list ──
+
+
+class PurchaseOrderVendorBillTests(AdminQueryCountMixin, _POBase):
+    def setUp(self):
+        super().setUp()
+        self.supplier.payment_terms_days = 30
+        self.supplier.save()
+        self.po = self._po(purchase_tax_treatment=NO_GST)
+        self._line(self.po, quantity_ordered=1, unit_price=Decimal("1000"))
+        services.issue_purchase_order(self.po, self.user)
+        self.po.refresh_from_db()
+        self.today = timezone.localdate()
+
+    def _set_due(self, days_from_today):
+        PurchaseOrder.objects.filter(pk=self.po.pk).update(
+            bill_number="INV-77", bill_date=self.today - datetime.timedelta(days=60),
+            payment_due_date=self.today + datetime.timedelta(days=days_from_today),
+        )
+
+    def _pay(self, amount):
+        services.record_po_payment(
+            self.po, amount=Decimal(amount), entry_date=self.today, method="cash",
+            reference="", notes="", user=self.user,
+        )
+
+    def _annotated(self):
+        return selectors.annotate_payment_summary(PurchaseOrder.objects.filter(pk=self.po.pk)).get()
+
+    def test_due_date_defaults_to_bill_date_plus_vendor_terms(self):
+        self.po.bill_date = self.today
+        self.po.full_clean()
+        self.assertEqual(self.po.payment_due_date, self.today + datetime.timedelta(days=30))
+
+    def test_explicit_due_date_is_kept_and_validated(self):
+        self.po.bill_date = self.today
+        self.po.payment_due_date = self.today + datetime.timedelta(days=5)
+        self.po.full_clean()
+        self.assertEqual(self.po.payment_due_date, self.today + datetime.timedelta(days=5))
+        self.po.payment_due_date = self.today - datetime.timedelta(days=1)
+        with self.assertRaises(ValidationError):
+            self.po.full_clean()
+
+    def test_due_date_needs_bill_date(self):
+        self.po.payment_due_date = self.today
+        with self.assertRaises(ValidationError):
+            self.po.full_clean()
+
+    def test_bill_fields_editable_after_issue_but_not_in_draft_or_cancelled(self):
+        for field in PurchaseOrder.BILL_FIELDS:
+            self.assertIn(field, self.po.editable_fields())
+            self.assertNotIn(field, PurchaseOrder.EDITABLE_DRAFT_FIELDS)
+            self.assertNotIn(field, PurchaseOrder.EDITABLE_CANCELLED_FIELDS)
+        self.po.status = PurchaseOrder.STATUS_CANCELLED
+        self.assertEqual(self.po.editable_fields(), ("notes",))
+
+    def test_overdue_when_unpaid_or_partly_paid_past_due(self):
+        self._set_due(-1)
+        self.assertEqual(self._annotated().payment_status_db, "overdue")
+        self._pay("400")
+        po = self._annotated()
+        self.assertEqual((po.payment_status_db, po.balance_due_db), ("overdue", Decimal("600.00")))
+        self.assertEqual(PurchaseOrder.objects.get(pk=self.po.pk).payment_status, "overdue")
+
+    def test_not_overdue_on_due_date_or_when_paid(self):
+        self._set_due(0)
+        self.assertEqual(self._annotated().payment_status_db, "unpaid")
+        self._set_due(-1)
+        self._pay("1000")
+        po = self._annotated()
+        self.assertEqual((po.payment_status_db, po.balance_due_db), ("paid", Decimal("0.00")))
+
+    def test_cancelled_po_is_never_overdue(self):
+        services.cancel_purchase_order(self.po, self.user, reason="vendor out of stock")
+        self._set_due(-1)
+        self.assertEqual(self._annotated().payment_status_db, "unpaid")
+
+    def test_balance_due_unknown_while_unclassified(self):
+        legacy = self._po(purchase_tax_treatment=None)
+        self._line(legacy)
+        po = selectors.annotate_payment_summary(PurchaseOrder.objects.filter(pk=legacy.pk)).get()
+        self.assertIsNone(po.balance_due_db)
+
+    def test_sql_status_matches_property_with_due_dates(self):
+        self._set_due(-3)
+        self._pay("100")
+        po = self._annotated()
+        fresh = PurchaseOrder.objects.get(pk=self.po.pk)
+        self.assertEqual(po.payment_status_db, fresh.payment_status)
+        self.assertEqual(po.balance_due_db, fresh.remaining_against_po)
+
+    def test_changelist_columns_filter_and_search(self):
+        self._set_due(-1)
+        other = self._po(purchase_tax_treatment=NO_GST)
+        self.client.force_login(self.user)
+        url = reverse("admin:purchases_purchaseorder_changelist")
+        resp = self.client.get(url)
+        columns = list(resp.context["cl"].list_display)
+        for column in (
+            "order_date", "bill_number_display", "vendor_reference_display", "supplier",
+            "payment_status_label", "payment_due_date", "ordered_gross_total_display",
+            "balance_due_display",
+        ):
+            self.assertIn(column, columns)
+        self.assertContains(resp, "INV-77")
+        self.assertContains(resp, "Overdue")
+        overdue = set(self.client.get(url, {"payment_status": "overdue"}).context["cl"].result_list)
+        self.assertEqual(overdue, {self.po})
+        found = set(self.client.get(url, {"q": "INV-77"}).context["cl"].result_list)
+        self.assertEqual(found, {self.po})
+        self.assertNotIn(other, found)
+
+    def test_po_list_query_count_stays_flat_with_bills(self):
+        def make(i):
+            po = self._po(purchase_tax_treatment=NO_GST, bill_number=f"B-{i}")
+            self._line(po, variant=_variant(f"SKU-BILL-{i}"), quantity_ordered=1, unit_price=Decimal("100"))
+        self.client.force_login(self.user)
+        self.assertChangelistQueriesFlat(reverse("admin:purchases_purchaseorder_changelist"), make)

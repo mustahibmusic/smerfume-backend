@@ -252,13 +252,13 @@ A purchasable SKU (specific size or decant).
 | `mrp` | DecimalField(10,2) | | Maximum retail price |
 | `selling_price` | DecimalField(10,2) | | Price used at checkout |
 
-**Note:** `mrp` is exposed in the API alongside `selling_price` so the frontend can display original price and savings. `is_available` and `primary_image`/`images` are computed API fields (see `catalog_productvariantimage` below and `apps/inventory` for stock), not database columns.
+**Note:** `mrp` is exposed in the API alongside `selling_price` so the frontend can display original price and savings. `is_available` and `primary_image`/`secondary_image`/`images` are computed API fields (see `catalog_productvariantimage` below and `apps/inventory` for stock), not database columns.
 
 ---
 
 ### `catalog_productvariantimage`
 
-Gallery images for a variant. Max 10 per variant (enforced in `ProductVariantImage.clean()` and via the admin inline's `max_num=10, validate_max=True`).
+Gallery images for a variant. Max 20 per variant (`MAX_IMAGES_PER_VARIANT`, checked under the variant lock by `apps/catalog/image_services.py` and in `ProductVariantImage.clean()`). Written only through the gallery services (admin Manage Images page).
 
 | Field | Type | Constraints | Notes |
 |---|---|---|---|
@@ -268,14 +268,17 @@ Gallery images for a variant. Max 10 per variant (enforced in `ProductVariantIma
 | `created_at` | DateTimeField | | |
 | `updated_at` | DateTimeField | | |
 | `variant` | FK → catalog_productvariant | CASCADE | |
-| `image` | ImageField | required | Upload path: `catalog/variant_images/` |
+| `image` | ImageField | required | New files: `catalog/variant_images/<variant public_id>/<uuid>.<ext>` (`variant_image_upload_to`); older rows keep `catalog/variant_images/<name>` |
 | `role` | CharField(10) | | Choices: `primary` / `secondary` / `gallery`. Default: `gallery` |
 | `alt_text` | CharField(255) | blank | Accessibility/SEO alt text |
 | `sort_order` | PositiveSmallIntegerField | default 0 | Deterministic gallery order |
+| `width` | PositiveIntegerField | nullable, not editable | Pixel width of the stored file, set by the services; null for older rows until `backfill_variant_image_dimensions` runs |
+| `height` | PositiveIntegerField | nullable, not editable | Pixel height, as above |
+| `content_hash` | CharField(64) | default `""`, not editable | SHA-256 of the stored (normalised) bytes; empty for older rows |
 
-**Constraints:** `unique_primary_image_per_variant` and `unique_secondary_image_per_variant` — at most one `primary` and one `secondary` per variant (conditional `UniqueConstraint`s, hold at the DB level regardless of entry point). Gallery role has no per-role limit besides the shared 10-image cap.
+**Constraints:** `unique_primary_image_per_variant` and `unique_secondary_image_per_variant` — at most one `primary` and one `secondary` per variant (conditional `UniqueConstraint`s, hold at the DB level regardless of entry point). Gallery role has no per-role limit besides the shared 20-image cap. `unique_image_hash_per_variant` — `(variant, content_hash)` unique where `content_hash` is not empty (duplicate uploads).
 
-**Ordering:** `Meta.ordering = ["sort_order", "id"]`.
+**Ordering:** `Meta.ordering = ["sort_order", "id"]` (also the API order of `images`). The admin shows primary, secondary, then `sort_order`, `id`.
 
 **Note:** deleting the `primary` or `secondary` image never auto-promotes another image into that role — a human must choose the replacement explicitly.
 
@@ -462,6 +465,7 @@ catalog_perfumenote ─────────────────── ca
 | catalog | 0003–0005 | Variant SKU: added nullable, backfilled, enforced not-null |
 | catalog | 0006_enable_pg_trgm | Enables PostgreSQL `pg_trgm` extension (trigram search) |
 | catalog | 0007_productvariantimage_productedition_is_indexable_and_more | `ProductVariantImage` model; Edition SEO fields (`seo_title`, `meta_description`, `og_title`, `og_description`, `is_indexable`); `unique_edition_slug_per_product`; trigram GIN indexes on Brand/Product/Edition/PerfumeNote `name` |
+| catalog | 0009_variant_image_metadata | `ProductVariantImage.width`, `height`, `content_hash`; `unique_image_hash_per_variant`; per-variant upload path (no data migration; run `backfill_variant_image_dimensions` after deploy) |
 | cart | 0001_initial | Cart + CartItem |
 | orders | 0001_initial | Order + OrderItem + ShippingAddress |
 | orders | 0002_alter_shippingaddress_state | State field adjustment (untracked — present locally, not committed) |

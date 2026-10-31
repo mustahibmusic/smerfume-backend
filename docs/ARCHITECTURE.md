@@ -287,12 +287,21 @@ Recommended URL shape (not yet built by any frontend in this repo): `/perfumes/<
 
 ### Images
 
-`ProductVariantImage` (FK → `ProductVariant`, max 10 per variant, enforced in `clean()` and via `TabularInline(max_num=10, validate_max=True)`):
-- `role`: `primary` (canonical — product page, structured data, OG, Google Images, feeds), `secondary` (product-card hover only, never treated as canonical), `gallery` (unlimited within the 10-image cap).
+`ProductVariantImage` (FK → `ProductVariant`, max 20 per variant — `MAX_IMAGES_PER_VARIANT`, checked under the variant lock by the gallery services and in `clean()`). Design: `docs/superpowers/specs/2026-10-31-variant-image-gallery-design.md`.
+- `role`: `primary` (canonical — product page, structured data, OG, Google Images, feeds), `secondary` (product-card hover only, never treated as canonical), `gallery` (unlimited within the 20-image cap).
 - At most one `primary` and one `secondary` per variant — enforced by conditional `UniqueConstraint`s, so it holds even outside the admin.
 - Deleting the primary/secondary never auto-promotes another image — a human chooses the replacement.
-- `alt_text`, deterministic `sort_order`.
-- The legacy single `ProductVariant.image`/`ProductEdition.image` fields are unchanged and still served; new work should use `ProductVariantImage`.
+- `alt_text`, deterministic `sort_order`; `width`/`height` (pixel size of the stored file) and `content_hash` (SHA-256 of the stored bytes, unique per variant when set).
+- New files are stored as `catalog/variant_images/<variant public_id>/<uuid>.<ext>`, so an edited image is always a new storage object.
+- The legacy single `ProductVariant.image`/`ProductEdition.image` fields are still stored and served by the API. `ProductVariant.image` is no longer editable in the admin (shown read-only as "Legacy image (not used by the gallery)" when set); migrating legacy images into the gallery is a separate, undecided step.
+
+**Image processing** (`apps/catalog/image_processing.py`, `process_image`): the server is authoritative. Accepts JPEG (incl. multi-picture JPEG, first frame), PNG and WebP detected from content; rejects SVG, GIF, HEIC, animated and malformed images, files over 15 MB and inputs over 6000 px per side or 36 MP (checked from the header before decoding; Pillow decompression-bomb warnings are errors). Applies EXIF rotation, removes EXIF/XMP/GPS (keeps the colour profile), converts CMYK and palette images to RGB (RGBA when transparent), requires at least 600 px on the shortest side (below 1200 px saves with a warning), resizes to at most 2000 px on the longest side (never upscales) and re-encodes as WebP quality 90 (PNG for transparent / JPEG otherwise if Pillow lacks WebP). The final file must be at most 5 MB.
+
+**Gallery services** (`apps/catalog/image_services.py`) are the only write path: `add_variant_images`, `replace_variant_image`, `set_variant_image_role`, `reorder_variant_images`, `update_variant_image_alt_text`, `remove_variant_image`. Images are processed before locking; then the variant row is locked, then its images. Role changes demote the current holder to `gallery` before promoting. Reorder must list every image exactly once (sort_order becomes 0..n-1). Old files are deleted only after the transaction commits; a newly written file is deleted if the transaction fails. Each change writes an admin `LogEntry` on the variant. `display_ordered_images` orders primary, secondary, then by `sort_order`, `id` (admin only for now).
+
+**Admin:** the variant page has no image inline; it shows a read-only gallery preview with a **Manage images** link to a dedicated page (`/admin/catalog/productvariant/<id>/images/`): thumbnail grid, image count, upload of several files at once, role buttons, alt text, drag-and-drop and keyboard reordering, remove confirmation page, and an editor (Cropper.js 1.7.0 vendored under `static/vendor/cropperjs/1.7.0/` with its licence: crop, zoom, rotate, flip, free/1:1 aspect, brightness/contrast via canvas filters, preview, reset; exports at most 2000 px and saves through the replace endpoint). Permissions: view on variant + image to see the page; `add_productvariantimage` upload; `change_productvariantimage` edit, role, reorder, alt text; `delete_productvariantimage` remove. Mutations are POST-only.
+
+**API:** each variant returns `images` (each with `width`/`height`, null for older rows until `backfill_variant_image_dimensions` runs), `primary_image` and `secondary_image`. The order of `images` is still `sort_order`, `id`; returning primary, secondary, then gallery is deferred until the storefront's use of the current order is confirmed.
 
 ### Search
 

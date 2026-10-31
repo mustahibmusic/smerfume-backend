@@ -4,6 +4,11 @@
 {% block extrahead %}{{ block.super }}
 <link rel="stylesheet" href="{% static 'catalog/admin/variant_gallery.css' %}">
 <script src="{% static 'catalog/admin/variant_gallery.js' %}" defer></script>
+{% if can_change %}
+<link rel="stylesheet" href="{% static 'vendor/cropperjs/1.7.0/cropper.min.css' %}">
+<script src="{% static 'vendor/cropperjs/1.7.0/cropper.min.js' %}" defer></script>
+<script src="{% static 'catalog/admin/variant_image_editor.js' %}" defer></script>
+{% endif %}
 {% endblock %}
 
 {% block breadcrumbs %}{% endblock %}
@@ -93,6 +98,39 @@
         </ol>
     {% else %}
         <p class="vg-empty">No images yet.</p>
+    {% endif %}
+
+    {% if can_change %}
+        <dialog id="vg-editor" class="vg-editor" aria-labelledby="vg-editor-title">
+            <h2 id="vg-editor-title">Edit image</h2>
+            <div class="vg-editor-body">
+                <div class="vg-editor-stage"><img class="vg-editor-image" alt="Image being edited"></div>
+                <div class="vg-editor-side">
+                    <p class="vg-editor-label">Preview</p>
+                    <canvas class="vg-editor-preview" width="240" height="240"></canvas>
+                    <div class="vg-editor-tools" role="group" aria-label="Transform">
+                        <button type="button" class="vg-button vg-button-small" data-action="rotate-left">Rotate left</button>
+                        <button type="button" class="vg-button vg-button-small" data-action="rotate-right">Rotate right</button>
+                        <button type="button" class="vg-button vg-button-small" data-action="flip-horizontal">Flip horizontal</button>
+                        <button type="button" class="vg-button vg-button-small" data-action="flip-vertical">Flip vertical</button>
+                        <button type="button" class="vg-button vg-button-small" data-action="zoom-in">Zoom in</button>
+                        <button type="button" class="vg-button vg-button-small" data-action="zoom-out">Zoom out</button>
+                        <button type="button" class="vg-button vg-button-small" data-action="aspect-free">Free crop</button>
+                        <button type="button" class="vg-button vg-button-small" data-action="aspect-square">1:1</button>
+                    </div>
+                    <div class="vg-editor-adjust">
+                        <label>Brightness <input type="range" name="brightness" min="50" max="150" value="100"></label>
+                        <label>Contrast <input type="range" name="contrast" min="50" max="150" value="100"></label>
+                    </div>
+                    <p class="vg-editor-message" role="status" aria-live="polite"></p>
+                    <div class="vg-editor-buttons">
+                        <button type="button" class="vg-button" data-action="reset">Reset</button>
+                        <button type="button" class="vg-button" data-action="cancel">Cancel</button>
+                        <button type="button" class="vg-button vg-button-primary" data-action="save">Save edited image</button>
+                    </div>
+                </div>
+            </div>
+        </dialog>
     {% endif %}
 </div>
 {% endblock %}

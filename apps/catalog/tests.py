@@ -1790,6 +1790,17 @@ class ManageImagesAdminTests(TestCase):
         self.assertNotContains(response, 'name="images"')
         self.assertNotContains(response, "Make primary")
 
+    def test_editor_loaded_only_for_change_permission(self):
+        self.client.force_login(self.manager)
+        response = self.client.get(self._url("images"))
+        self.assertContains(response, "vendor/cropperjs/1.7.0/cropper.min.js")
+        self.assertContains(response, 'id="vg-editor"')
+        self.assertContains(response, self._url("image_replace", self.image.public_id))
+        self.client.force_login(self.viewer)
+        response = self.client.get(self._url("images"))
+        self.assertNotContains(response, "cropper.min.js")
+        self.assertNotContains(response, 'id="vg-editor"')
+
     def test_page_needs_view_permissions(self):
         self.client.force_login(_catalog_staff("variantonly", "view_productvariant"))
         self.assertEqual(self.client.get(self._url("images")).status_code, 403)

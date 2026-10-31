@@ -53,6 +53,26 @@
 .vg-confirm-image { max-width: 320px; max-height: 320px; border-radius: 8px; margin: 8px 0; display: block; }
 .vg-confirm form { display: flex; gap: 12px; }
 
+.vg-editor { width: min(1100px, calc(100vw - 32px)); max-height: calc(100vh - 32px); padding: 16px; border-radius: 10px; border: 1px solid rgba(127, 127, 127, .4); color: inherit; background: var(--color-base-50, #fff); }
+.vg-editor::backdrop { background: rgba(0, 0, 0, .55); }
+.dark .vg-editor { background: var(--color-base-900, #111827); }
+.vg-editor h2 { margin: 0 0 12px; font-size: 16px; font-weight: 700; }
+.vg-editor-body { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 16px; }
+.vg-editor-stage { height: min(70vh, 640px); background: rgba(127, 127, 127, .12); }
+.vg-editor-stage img { display: block; max-width: 100%; }
+.vg-editor-side { display: flex; flex-direction: column; gap: 10px; }
+.vg-editor-label { margin: 0; font-size: 12px; font-weight: 600; }
+.vg-editor-preview { max-width: 240px; max-height: 240px; border-radius: 6px; background: repeating-conic-gradient(rgba(127,127,127,.25) 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+.vg-editor-tools, .vg-editor-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+.vg-editor-adjust { display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.vg-editor-adjust input { width: 100%; }
+.vg-editor-message { min-height: 1.2em; margin: 0; font-size: 12px; }
+
+@media (max-width: 800px) {
+    .vg-editor-body { grid-template-columns: 1fr; }
+    .vg-editor-stage { height: 50vh; }
+}
+
 @media (max-width: 640px) {
     .vg-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
 }

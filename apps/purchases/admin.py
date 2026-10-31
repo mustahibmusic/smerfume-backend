@@ -26,6 +26,7 @@ from .models import (
     BookedQuantityChange,
     GoodsReceipt,
     GoodsReceiptLine,
+    PaymentAccount,
     PurchaseOrder,
     PurchaseOrderLine,
     PurchaseOrderPayment,
@@ -220,10 +221,16 @@ class SupplierPaymentForm(forms.Form):
         help_text="UTR, cheque or card slip number. Optional for cash.",
     )
     notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget)
+    paid_through = forms.ModelChoiceField(
+        queryset=PaymentAccount.objects.filter(is_active=True), required=False,
+        widget=UnfoldAdminSelectWidget, label="Paid through",
+    )
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, with_paid_through=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields["entry_date"].initial = timezone.localdate()
+        if not with_paid_through:
+            del self.fields["paid_through"]
 
 
 class ReversePaymentEntryForm(forms.Form):
@@ -729,15 +736,17 @@ class PurchaseOrderAdmin(ModelAdmin):
             "Cancel purchase order", "bg-red-600",
         )
 
-    def _ledger_entry_action(self, request, object_id, service, title, message, button_label, verb):
+    def _ledger_entry_action(self, request, object_id, service, title, message, button_label, verb,
+                             with_paid_through=False):
         po = get_object_or_404(PurchaseOrder, pk=object_id)
-        form = SupplierPaymentForm(request.POST or None)
+        form = SupplierPaymentForm(request.POST or None, with_paid_through=with_paid_through)
         if request.method == "POST" and form.is_valid():
             data = form.cleaned_data
+            extra = {"paid_through": data["paid_through"]} if with_paid_through else {}
             try:
                 entry = service(
                     po, amount=data["amount"], entry_date=data["entry_date"], method=data["method"],
-                    reference=data["reference"], notes=data["notes"], user=request.user,
+                    reference=data["reference"], notes=data["notes"], user=request.user, **extra,
                 )
             except po_services.SupplierPaymentError as exc:
                 self.message_user(request, str(exc), level=messages.ERROR)
@@ -760,7 +769,7 @@ class PurchaseOrderAdmin(ModelAdmin):
             request, object_id, po_services.record_po_payment, "Record supplier payment",
             "Record money paid to the supplier against this PO. Operational record only; "
             "the entry cannot be edited later (use a reversal if it is wrong).",
-            "Record payment", "Recorded payment",
+            "Record payment", "Recorded payment", with_paid_through=True,
         )
 
     @action(

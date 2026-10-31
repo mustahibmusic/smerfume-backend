@@ -30,6 +30,7 @@ from .models import (
     BookedQuantityChange,
     GoodsReceipt,
     GoodsReceiptLine,
+    PaymentAccount,
     PurchaseOrder,
     PurchaseOrderLine,
     PurchaseOrderPayment,
@@ -778,12 +779,83 @@ def _lock_payable_po(po):
     return po
 
 
+def _check_paid_through(paid_through, required):
+    if paid_through is None:
+        if required:
+            raise SupplierPaymentError("Paid through is required to post a payment.")
+        return
+    # Re-read so a deactivation committed by someone else is seen.
+    if not PaymentAccount.objects.filter(pk=paid_through.pk, is_active=True).exists():
+        raise SupplierPaymentError(f"Paid through account '{paid_through.name}' is inactive.")
+
+
+def _lock_payment(entry, po):
+    """Lock the ledger row after its PO (DEC-011 lock order: PO, then entry)."""
+    locked = PurchaseOrderPayment.objects.select_for_update().filter(pk=entry.pk).first()
+    if locked is None:
+        raise SupplierPaymentError("This draft payment no longer exists.")
+    if locked.purchase_order_id != po.pk:
+        raise SupplierPaymentError("This draft belongs to a different purchase order.")
+    return locked
+
+
+def _refuse_posted(entry, action):
+    if not entry.is_draft or entry.entry_type != PurchaseOrderPayment.TYPE_PAYMENT:
+        number = entry.payment_number or "This entry"
+        raise SupplierPaymentError(
+            f"{number} is already posted and cannot be {action}; record a reversal instead."
+        )
+
+
 @transaction.atomic
-def record_po_payment(po, amount, entry_date, method, reference, notes, user):
-    """Record money paid to the supplier. Net paid can never exceed the
-    PO's ordered_gross_total."""
+def create_payment_draft(po, *, amount, entry_date, method, reference, notes, user, paid_through=None):
+    """DEC-011: save a supplier payment as a draft. A draft has no SPAY number
+    and never counts toward net paid, payment status, caps or cancellation."""
     po = _lock_payable_po(po)
     reference, notes = _check_entry_input(amount, entry_date, method, reference, notes)
+    _check_paid_through(paid_through, required=False)
+    return PurchaseOrderPayment.objects.create(
+        purchase_order=po, entry_type=PurchaseOrderPayment.TYPE_PAYMENT,
+        status=PurchaseOrderPayment.STATUS_DRAFT, amount=amount, entry_date=entry_date, method=method,
+        reference=reference, notes=notes, paid_through=paid_through, recorded_by=user,
+    )
+
+
+@transaction.atomic
+def update_payment_draft(draft, *, user, amount, entry_date, method, reference, notes, paid_through):
+    """Edit a draft. Posted entries are immutable."""
+    po = _lock_payable_po(draft.purchase_order)
+    draft = _lock_payment(draft, po)
+    _refuse_posted(draft, "edited")
+    reference, notes = _check_entry_input(amount, entry_date, method, reference, notes)
+    _check_paid_through(paid_through, required=False)
+    draft.amount, draft.entry_date, draft.method = amount, entry_date, method
+    draft.reference, draft.notes, draft.paid_through = reference, notes, paid_through
+    draft.save()
+    return draft
+
+
+@transaction.atomic
+def delete_payment_draft(draft, user):
+    """Delete a draft (allowed on any PO status, including cancelled)."""
+    po = _lock(draft.purchase_order)
+    draft = _lock_payment(draft, po)
+    _refuse_posted(draft, "deleted")
+    draft.delete()
+
+
+@transaction.atomic
+def post_payment(po, *, user, draft=None, amount, entry_date, method, reference, notes, paid_through):
+    """DEC-011: the single posting path, used by direct Save as Paid and by
+    posting a draft. Locks the PO, then the draft; revalidates everything;
+    requires an active Paid Through; caps posted net paid at the ordered
+    gross total; assigns the SPAY number last."""
+    po = _lock_payable_po(po)
+    if draft is not None:
+        draft = _lock_payment(draft, po)
+        _refuse_posted(draft, "posted again")
+    reference, notes = _check_entry_input(amount, entry_date, method, reference, notes)
+    _check_paid_through(paid_through, required=True)
     total = po.ordered_gross_total
     new_net = po.net_paid + amount
     if total is None or new_net > total:
@@ -791,10 +863,24 @@ def record_po_payment(po, amount, entry_date, method, reference, notes, user):
             f"This payment would make net paid {new_net}, which would exceed the ordered gross "
             f"total of {total}."
         )
-    return PurchaseOrderPayment.objects.create(
-        purchase_order=po, entry_type=PurchaseOrderPayment.TYPE_PAYMENT, amount=amount,
-        entry_date=entry_date, method=method, reference=reference, notes=notes, recorded_by=user,
-        payment_number=next_payment_number(), **_posted_audit(user),
+    entry = draft or PurchaseOrderPayment(
+        purchase_order=po, entry_type=PurchaseOrderPayment.TYPE_PAYMENT, recorded_by=user,
+    )
+    entry.amount, entry.entry_date, entry.method = amount, entry_date, method
+    entry.reference, entry.notes, entry.paid_through = reference, notes, paid_through
+    entry.payment_number = next_payment_number()
+    for field, value in _posted_audit(user).items():
+        setattr(entry, field, value)
+    entry.save()
+    return entry
+
+
+def record_po_payment(po, amount, entry_date, method, reference, notes, user, paid_through=None):
+    """Record money paid to the supplier directly (Save as Paid). Net paid
+    can never exceed the PO's ordered_gross_total."""
+    return post_payment(
+        po, user=user, amount=amount, entry_date=entry_date, method=method, reference=reference,
+        notes=notes, paid_through=paid_through,
     )
 
 

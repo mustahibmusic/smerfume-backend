@@ -256,7 +256,8 @@ _MONEY_FIELD = DecimalField(max_digits=14, decimal_places=2)
 def _ledger_sum(entry_type, active_only):
     from .models import PurchaseOrderPayment
 
-    entries = PurchaseOrderPayment.objects.filter(purchase_order=OuterRef("pk"), entry_type=entry_type)
+    # DEC-011: posted entries only; drafts never count.
+    entries = PurchaseOrderPayment.objects.posted().filter(purchase_order=OuterRef("pk"), entry_type=entry_type)
     if active_only:
         entries = entries.filter(reversal__isnull=True)
     total = entries.order_by().values("purchase_order").annotate(total=Sum("amount")).values("total")
@@ -321,7 +322,7 @@ def reversible_payment_entries(po):
     """Payments and vendor refunds of a PO that have not been reversed."""
     from .models import PurchaseOrderPayment
 
-    return PurchaseOrderPayment.objects.filter(
+    return PurchaseOrderPayment.objects.posted().filter(
         purchase_order_id=po.pk,
         entry_type__in=[PurchaseOrderPayment.TYPE_PAYMENT, PurchaseOrderPayment.TYPE_VENDOR_REFUND],
         reversal__isnull=True,

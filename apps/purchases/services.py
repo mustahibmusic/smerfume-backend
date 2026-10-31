@@ -823,6 +823,8 @@ def reverse_po_payment_entry(entry, reason, user):
         raise SupplierPaymentError("A reversal reason is required.")
     po = _lock(entry.purchase_order)
     entry = PurchaseOrderPayment.objects.select_for_update().get(pk=entry.pk)
+    if entry.is_draft:
+        raise SupplierPaymentError("A draft payment cannot be reversed; edit or delete the draft instead.")
     if entry.entry_type == PurchaseOrderPayment.TYPE_REVERSAL:
         raise SupplierPaymentError("A reversal cannot be reversed.")
     if PurchaseOrderPayment.objects.filter(reverses=entry).exists():

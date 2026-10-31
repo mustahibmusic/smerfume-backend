@@ -248,7 +248,8 @@ class PurchaseOrder(BaseModel):
         R = PurchaseOrderPayment.TYPE_VENDOR_REFUND
         X = PurchaseOrderPayment.TYPE_REVERSAL
         zero = Value(Decimal("0.00"))
-        totals = self.payment_entries.aggregate(
+        # DEC-011: drafts never count. posted() is the single source of truth.
+        totals = self.payment_entries.posted().aggregate(
             gross_payments=Coalesce(Sum("amount", filter=Q(entry_type=P)), zero),
             active_payments=Coalesce(Sum("amount", filter=Q(entry_type=P, reversal__isnull=True)), zero),
             active_refunds=Coalesce(Sum("amount", filter=Q(entry_type=R, reversal__isnull=True)), zero),

@@ -3800,3 +3800,91 @@ class SupplierPaymentBackfillMigrationTests(TransactionTestCase):
         self.assertFalse(entries.exclude(posted_by_id=self.user_id).exists())
         self.assertFalse(entries.filter(posted_at__isnull=True).exists())
         self.assertEqual(services.next_payment_number(), "SPAY-000004")
+
+
+class SupplierPaymentDraftLeakTests(_POBase):
+    """Mandatory (DEC-011): a draft never reaches any total, status, filter,
+    cap or guard. The draft is larger than the PO so any leak is visible."""
+
+    def setUp(self):
+        super().setUp()
+        self.account = _account()
+        self.po = self._po(purchase_tax_treatment=NO_GST)
+        self._line(self.po, quantity_ordered=1, unit_price=Decimal("1000"))
+        services.issue_purchase_order(self.po, self.user)
+        self.draft = _draft(self.po, "5000", self.user)
+
+    def _fresh(self):
+        return PurchaseOrder.objects.get(pk=self.po.pk)
+
+    def _annotated(self):
+        return selectors.annotate_payment_summary(PurchaseOrder.objects.filter(pk=self.po.pk)).get()
+
+    def _pay(self, amount):
+        return _entry(self.po, PAYMENT, amount, self.user, paid_through=self.account)
+
+    def test_properties_ignore_drafts(self):
+        self._pay("400")
+        po = self._fresh()
+        self.assertEqual(
+            (po.gross_payments, po.vendor_refunds, po.reversals, po.net_paid, po.remaining_against_po,
+             po.payment_status),
+            (Decimal("400"), Decimal("0"), Decimal("0"), Decimal("400"), Decimal("600.00"), "partially_paid"),
+        )
+
+    def test_unpaid_po_with_only_a_draft_is_unpaid(self):
+        po = self._fresh()
+        self.assertEqual((po.net_paid, po.payment_status), (Decimal("0"), "unpaid"))
+        annotated = self._annotated()
+        self.assertEqual((annotated.net_paid_db, annotated.payment_status_db), (Decimal("0"), "unpaid"))
+
+    def test_sql_annotation_ignores_drafts(self):
+        self._pay("400")
+        annotated = self._annotated()
+        self.assertEqual(
+            (annotated.ordered_gross_total_db, annotated.net_paid_db, annotated.payment_status_db),
+            (Decimal("1000.00"), Decimal("400"), "partially_paid"),
+        )
+
+    def test_admin_payment_status_filter_ignores_drafts(self):
+        self.client.force_login(self.user)
+        url = reverse("admin:purchases_purchaseorder_changelist")
+        self.assertEqual(set(self.client.get(url, {"payment_status": "unpaid"}).context["cl"].result_list), {self.po})
+        self.assertEqual(set(self.client.get(url, {"payment_status": "paid"}).context["cl"].result_list), set())
+
+    def test_refund_cap_ignores_drafts(self):
+        self._pay("400")
+        with self.assertRaisesMessage(services.SupplierPaymentError, "cannot exceed net paid (400"):
+            services.record_vendor_refund(
+                self.po, amount=Decimal("400.01"), entry_date=timezone.localdate(), method="cash",
+                reference="", notes="", user=self.user,
+            )
+
+    def test_reversal_caps_ignore_drafts(self):
+        payment = self._pay("1000")
+        refund = services.record_vendor_refund(
+            self.po, amount=Decimal("100"), entry_date=timezone.localdate(), method="cash",
+            reference="", notes="", user=self.user,
+        )
+        # Reversing the refund brings net back to exactly the total: allowed.
+        services.reverse_po_payment_entry(refund, reason="refund never arrived", user=self.user)
+        self.assertEqual(self._fresh().net_paid, Decimal("1000"))
+        services.reverse_po_payment_entry(payment, reason="wrong PO", user=self.user)
+        self.assertEqual(self._fresh().net_paid, Decimal("0"))
+
+    def test_drafts_are_not_reversible(self):
+        self.assertNotIn(self.draft, selectors.reversible_payment_entries(self.po))
+        with self.assertRaisesMessage(services.SupplierPaymentError, "draft"):
+            services.reverse_po_payment_entry(self.draft, reason="x", user=self.user)
+
+    def test_drafts_do_not_block_cancellation(self):
+        services.cancel_purchase_order(self.po, self.user, reason="vendor out of stock")
+        self.assertEqual(self._fresh().status, PurchaseOrder.STATUS_CANCELLED)
+
+    def test_ledger_sum_subquery_ignores_drafts(self):
+        from apps.purchases.selectors import _ledger_sum
+
+        value = PurchaseOrder.objects.filter(pk=self.po.pk).annotate(
+            total=_ledger_sum(PAYMENT, False),
+        ).values_list("total", flat=True).get()
+        self.assertEqual(value, Decimal("0.00"))

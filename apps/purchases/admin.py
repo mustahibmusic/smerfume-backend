@@ -362,6 +362,11 @@ class SupplierPaymentEntryForm(SupplierPaymentForm, PaymentProofForm):
             self.fields["paid_through"].queryset = PaymentAccount.objects.filter(
                 Q(is_active=True) | Q(pk=current_account.pk)
             )
+        if not self.fields["paid_through"].queryset.exists():
+            self.fields["paid_through"].help_text = (
+                "No Paid Through accounts yet. A manager adds them under Purchases > Paid Through Accounts, "
+                "named as the ledger account in Zoho Books. Required to save as paid."
+            )
 
 
 class ReversePaymentEntryForm(forms.Form):

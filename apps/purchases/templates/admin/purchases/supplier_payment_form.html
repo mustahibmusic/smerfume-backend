@@ -52,6 +52,11 @@
         </ul>
     {% endif %}
 
+    {% if is_draft and can_draft %}
+        {# Remove/Delete live in their own form so Enter in a field never triggers them. #}
+        <form id="payment-housekeeping" method="post">{% csrf_token %}</form>
+    {% endif %}
+
     <form method="post" enctype="multipart/form-data" novalidate>
         {% csrf_token %}
 
@@ -67,21 +72,22 @@
         {% endif %}
 
         <div class="mb-4">
-            <h3 class="font-semibold mb-2 text-sm">Attachments</h3>
             {% if attachments %}
+                <h3 class="font-semibold mb-2 text-sm">Attached files</h3>
                 <ul class="mb-3 text-sm">
                     {% for attachment, url in attachments %}
                         <li class="flex gap-3 items-center mb-1">
                             <a href="{{ url }}" class="text-primary-600 underline">{{ attachment.original_name }}</a>
                             <span class="text-base-500">{{ attachment.size|filesizeformat }}</span>
                             {% if is_draft and can_draft %}
-                                <button type="submit" name="_remove_attachment" value="{{ attachment.public_id }}"
+                                <button type="submit" form="payment-housekeeping" name="_remove_attachment" value="{{ attachment.public_id }}"
                                         class="text-red-600 text-xs underline">Remove</button>
                             {% endif %}
                         </li>
                     {% endfor %}
                 </ul>
             {% elif not can_add_proof %}
+                <h3 class="font-semibold mb-2 text-sm">Attachments</h3>
                 <p class="text-base-500 text-sm">No attachments.</p>
             {% endif %}
             {% if can_add_proof %}
@@ -94,16 +100,17 @@
 
         <div class="flex flex-wrap gap-4 mt-4">
             {% if editable %}
-                {% if can_post %}
-                    <button type="submit" name="_post" value="1"
-                            class="bg-primary-600 border border-transparent font-medium px-3 py-2 rounded-default text-sm text-white">
-                        Save as Paid
-                    </button>
-                {% endif %}
+                {# Save as Draft comes first so Enter in a field saves a draft, never posts. #}
                 {% if can_draft %}
                     <button type="submit" name="_draft" value="1"
                             class="border border-base-200 font-medium px-3 py-2 rounded-default text-sm">
                         Save as Draft
+                    </button>
+                {% endif %}
+                {% if can_post %}
+                    <button type="submit" name="_post" value="1"
+                            class="bg-primary-600 border border-transparent font-medium px-3 py-2 rounded-default text-sm text-white">
+                        Save as Paid
                     </button>
                 {% endif %}
             {% elif can_add_proof %}
@@ -114,7 +121,7 @@
             {% endif %}
             <a href="{{ back_url }}" class="border border-base-200 font-medium px-3 py-2 rounded-default text-sm">Cancel</a>
             {% if is_draft and can_draft %}
-                <button type="submit" name="_delete" value="1"
+                <button type="submit" form="payment-housekeeping" name="_delete" value="1"
                         class="border border-red-200 font-medium ml-auto px-3 py-2 rounded-default text-red-600 text-sm">
                     Delete draft
                 </button>

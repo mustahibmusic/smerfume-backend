@@ -4395,8 +4395,8 @@ class SupplierPaymentAttachmentAccessTests(_PrivateStorageMixin, _PaymentService
         self.assertEqual(self.client.get(url).status_code, 404)
 
     def test_url_uses_public_id_not_storage_path(self):
+        self.assertTrue(self.url.endswith(f"/attachment/{self.attachment.public_id}/"))
         self.assertNotIn(self.attachment.file.name, self.url)
-        self.assertNotIn(str(self.attachment.pk) + "/", self.url.split("attachment/")[1])
 
 
 class SupplierPaymentFormAdminTests(_PrivateStorageMixin, _PaymentServiceBase):
@@ -4510,6 +4510,22 @@ class SupplierPaymentFormAdminTests(_PrivateStorageMixin, _PaymentServiceBase):
             self.client.post(self._entry_url(draft), {"_remove_attachment": str(target.public_id)})
         self.assertEqual(draft.attachments.count(), 1)
         self.assertEqual(len(self._stored_files()), 1)
+
+    def test_enter_key_default_is_save_as_draft_and_never_remove(self):
+        import re
+
+        draft = self._create_draft()
+        services.add_payment_attachments(draft, [_upload()], self.user)
+        self.client.force_login(self._staff("finance15", "record_po_payment", "post_po_payment"))
+        content = self.client.get(self._entry_url(draft)).content.decode()
+        main_form = content[content.index('enctype="multipart/form-data"'):]
+        main_form = main_form[:main_form.index("</form>")]
+        submit_buttons = re.findall(r'<button type="submit"([^>]*)>', main_form)
+        first_own = next(attrs for attrs in submit_buttons if "form=" not in attrs)
+        self.assertIn('name="_draft"', first_own)
+        for name in ("_remove_attachment", "_delete"):
+            attrs = next(a for a in submit_buttons if f'name="{name}"' in a)
+            self.assertIn('form="payment-housekeeping"', attrs)
 
     # Form state preservation -------------------------------------------
 

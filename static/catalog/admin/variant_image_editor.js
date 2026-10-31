@@ -80,24 +80,32 @@
             flip = { x: 1, y: 1 };
         }
 
+        // Reset rebuilds the cropper from the loaded image: Cropper's own
+        // reset() leaves a broken canvas after rotate + flip.
+        function build() {
+            if (cropper) {
+                cropper.destroy();
+            }
+            resetAdjustments();
+            cropper = new Cropper(image, {
+                viewMode: 1,
+                autoCropArea: 1,
+                checkCrossOrigin: true,
+                ready: queuePreview,
+                crop: queuePreview,
+                zoom: queuePreview,
+            });
+        }
+
         function open(src, url) {
             replaceUrl = url;
             message.textContent = "";
             saveButton.disabled = false;
-            resetAdjustments();
             if (cropper) {
                 cropper.destroy();
+                cropper = null;
             }
-            image.onload = function () {
-                cropper = new Cropper(image, {
-                    viewMode: 1,
-                    autoCropArea: 1,
-                    checkCrossOrigin: true,
-                    ready: queuePreview,
-                    crop: queuePreview,
-                    zoom: queuePreview,
-                });
-            };
+            image.onload = build;
             // Cache-busting query so the browser does not reuse a copy
             // fetched without CORS headers (canvas export would fail).
             image.src = src + (src.indexOf("?") === -1 ? "?" : "&") + "edit=" + Date.now();
@@ -202,7 +210,7 @@
             case "zoom-out": cropper.zoom(-0.1); break;
             case "aspect-free": cropper.setAspectRatio(NaN); break;
             case "aspect-square": cropper.setAspectRatio(1); break;
-            case "reset": cropper.reset(); cropper.setAspectRatio(NaN); resetAdjustments(); break;
+            case "reset": build(); break;
             case "save": save(); return;
             case "cancel": close(); return;
             }

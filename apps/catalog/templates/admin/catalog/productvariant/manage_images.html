@@ -20,7 +20,10 @@
      data-max-upload-mb="{{ max_upload_mb }}">
     {% csrf_token %}
     <div class="vg-toolbar">
-        <p class="vg-lead"><strong>{{ count }} of {{ max_images }}</strong> images · {{ subtitle }}</p>
+        <div>
+            <h1 class="vg-title">Manage images</h1>
+            <p class="vg-lead">{{ context_line }} · <strong>{{ count }} of {{ max_images }}</strong> images</p>
+        </div>
         <a href="{{ change_url }}" class="vg-button">Back to variant</a>
     </div>
 

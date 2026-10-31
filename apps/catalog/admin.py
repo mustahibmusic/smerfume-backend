@@ -309,8 +309,8 @@ class ProductVariantAdmin(ModelAdmin):
         user = request.user
         context = {
             **self.admin_site.each_context(request),
-            "title": f"Images: {variant.display_name()}",
-            "subtitle": f"SKU {variant.sku}",
+            "title": "Manage images",
+            "context_line": f"{variant.display_name()} · SKU {variant.sku}",
             "opts": self.model._meta,
             "variant": variant,
             "images": images,

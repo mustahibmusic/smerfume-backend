@@ -2,6 +2,7 @@
    Tailwind build does not include arbitrary utility classes. */
 .vg-page { max-width: 1200px; font-size: 14px; }
 .vg-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.vg-title { margin: 0 0 4px; font-size: 20px; font-weight: 700; }
 .vg-lead { margin: 0 0 8px; font-size: 15px; }
 .vg-hint { margin: 0 0 16px; font-size: 13px; opacity: .75; }
 .vg-status { min-height: 1.2em; font-size: 13px; }
@@ -53,7 +54,8 @@
 .vg-confirm-image { max-width: 320px; max-height: 320px; border-radius: 8px; margin: 8px 0; display: block; }
 .vg-confirm form { display: flex; gap: 12px; }
 
-.vg-editor { width: min(1100px, calc(100vw - 32px)); max-height: calc(100vh - 32px); padding: 16px; border-radius: 10px; border: 1px solid rgba(127, 127, 127, .4); color: inherit; background: var(--color-base-50, #fff); }
+/* margin:auto restores <dialog> centring removed by Tailwind's reset. */
+.vg-editor { margin: auto; width: min(1100px, calc(100vw - 32px)); max-height: calc(100vh - 32px); padding: 16px; border-radius: 10px; border: 1px solid rgba(127, 127, 127, .4); color: inherit; background: var(--color-base-50, #fff); }
 .vg-editor::backdrop { background: rgba(0, 0, 0, .55); }
 .dark .vg-editor { background: var(--color-base-900, #111827); }
 .vg-editor h2 { margin: 0 0 12px; font-size: 16px; font-weight: 700; }

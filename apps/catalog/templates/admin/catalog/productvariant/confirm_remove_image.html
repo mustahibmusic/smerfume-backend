@@ -9,6 +9,7 @@
 
 {% block content %}
 <div class="vg-page vg-confirm">
+    <h1 class="vg-title">Remove image</h1>
     <p class="vg-lead">Remove this {{ image.get_role_display|lower }} image from {{ variant.display_name }}?</p>
     <img class="vg-confirm-image" src="{{ image.image.url }}" alt="{{ image.alt_text }}">
     <p class="vg-hint">

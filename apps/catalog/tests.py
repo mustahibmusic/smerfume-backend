@@ -1790,6 +1790,17 @@ class ManageImagesAdminTests(TestCase):
         self.assertNotContains(response, 'name="images"')
         self.assertNotContains(response, "Make primary")
 
+    def test_page_title_and_heading(self):
+        import re
+
+        self.client.force_login(self.manager)
+        html = self.client.get(self._url("images")).content.decode()
+        title = re.search(r"<title>(.*?)</title>", html, re.S).group(1).strip()
+        self.assertTrue(title.startswith("Manage images |"), title)
+        self.assertNotIn("SKU", title)
+        self.assertIn('<h1 class="vg-title">Manage images</h1>', html)
+        self.assertIn(f"{self.variant.display_name()} · SKU {self.variant.sku}", html)
+
     def test_editor_loaded_only_for_change_permission(self):
         self.client.force_login(self.manager)
         response = self.client.get(self._url("images"))
@@ -1830,7 +1841,7 @@ class ManageImagesAdminTests(TestCase):
             self.assertEqual(self.client.get(self._url(name, self.image.public_id)).status_code, 405)
         response = self.client.get(self._url("image_remove", self.image.public_id))
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "Remove image")
+        self.assertContains(response, '<h1 class="vg-title">Remove image</h1>', html=True)
         self.assertTrue(ProductVariantImage.objects.filter(pk=self.image.pk).exists())
 
     def test_upload_json_and_form_fallback(self):

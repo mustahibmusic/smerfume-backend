@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from django import forms
+from django.forms.models import ModelChoiceIterator
 from django.core.exceptions import PermissionDenied
 from django.contrib import admin, messages
 from django.db import transaction
@@ -17,6 +18,7 @@ from unfold.enums import ActionVariant
 from unfold.widgets import (
     UnfoldAdminDateWidget,
     UnfoldAdminDecimalFieldWidget,
+    UnfoldAdminSelect2Widget,
     UnfoldAdminSelectWidget,
     UnfoldAdminTextareaWidget,
     UnfoldAdminTextInputWidget,
@@ -248,6 +250,41 @@ class OpeningReceiptForm(forms.Form):
         self.fields["received_date"].initial = timezone.localdate()
 
 
+class GroupedPaymentAccountIterator(ModelChoiceIterator):
+    """Paid Through options as <optgroup>s by kind, in the order the kinds are
+    declared on the model, accounts by name inside each group."""
+
+    def __iter__(self):
+        if self.field.empty_label is not None:
+            yield ("", self.field.empty_label)
+        labels = dict(PaymentAccount.KIND_CHOICES)
+        rank = {kind: i for i, kind in enumerate(labels)}
+        groups = {}
+        for account in self.queryset:
+            groups.setdefault(account.kind, []).append(account)
+        for kind in sorted(groups, key=lambda k: (rank.get(k, len(rank)), k)):
+            accounts = sorted(groups[kind], key=lambda a: a.name.lower())
+            yield (labels.get(kind, kind), [self.choice(a) for a in accounts])
+
+    def __len__(self):
+        return self.queryset.count() + (1 if self.field.empty_label is not None else 0)
+
+
+class PaymentAccountChoiceField(forms.ModelChoiceField):
+    """Grouped, searchable Paid Through select (Select2, Unfold theme)."""
+
+    iterator = GroupedPaymentAccountIterator
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("queryset", PaymentAccount.objects.filter(is_active=True))
+        kwargs.setdefault("widget", UnfoldAdminSelect2Widget)
+        kwargs.setdefault("empty_label", "Select an account")
+        super().__init__(**kwargs)
+
+    def label_from_instance(self, obj):
+        return obj.name if obj.is_active else f"{obj.name} (inactive)"
+
+
 class SupplierPaymentForm(forms.Form):
     amount = forms.DecimalField(
         max_digits=12, decimal_places=2, min_value=Decimal("0.01"), widget=UnfoldAdminDecimalFieldWidget,
@@ -259,10 +296,7 @@ class SupplierPaymentForm(forms.Form):
         help_text="UTR, cheque or card slip number. Optional for cash.",
     )
     notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget)
-    paid_through = forms.ModelChoiceField(
-        queryset=PaymentAccount.objects.filter(is_active=True), required=False,
-        widget=UnfoldAdminSelectWidget, label="Paid through",
-    )
+    paid_through = PaymentAccountChoiceField(required=False, label="Paid through")
 
     def __init__(self, *args, with_paid_through=True, **kwargs):
         super().__init__(*args, **kwargs)

@@ -5006,3 +5006,61 @@ class DraftLineEditingAdminTests(_POBase):
         with self.assertRaises(services.PurchaseOrderError):
             services.issue_purchase_order(po, self.user)
         self.assertEqual(PurchaseOrder.objects.get(pk=po.pk).status, PurchaseOrder.STATUS_DRAFT)
+
+
+class PaidThroughGroupedSelectTests(_PrivateStorageMixin, _PaymentServiceBase):
+    """Paid Through on Record Payment: grouped by kind, searchable, active only."""
+
+    def setUp(self):
+        super().setUp()  # self.account = "Petty Cash" (cash)
+        _account("HDFC Current", PaymentAccount.KIND_BANK)
+        _account("Axis Savings", PaymentAccount.KIND_BANK)
+        _account("GPay Business", PaymentAccount.KIND_UPI)
+        self.closed = _account("Old Bank", PaymentAccount.KIND_BANK, is_active=False)
+        self.client.force_login(_purchases_staff(
+            "pt_staff", "view_purchaseorder", "view_purchaseorderpayment", "record_po_payment", "post_po_payment",
+        ))
+
+    def _record_page(self):
+        return self.client.get(reverse("admin:purchases_purchaseorder_record_payment", args=[self.po.pk]))
+
+    def _optgroups(self, html):
+        select = re.search(r'<select name="paid_through".*?</select>', html, re.S).group(0)
+        return [
+            (label, re.findall(r"<option [^>]*>([^<]*)</option>", body))
+            for label, body in re.findall(r'<optgroup label="([^"]*)">(.*?)</optgroup>', select, re.S)
+        ]
+
+    def test_options_grouped_by_kind_in_declared_order_active_only(self):
+        resp = self._record_page()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._optgroups(resp.content.decode()), [
+            ("Cash", ["Petty Cash"]),
+            ("Bank", ["Axis Savings", "HDFC Current"]),
+            ("UPI", ["GPay Business"]),
+        ])
+
+    def test_select_is_searchable_and_loads_select2(self):
+        html = self._record_page().content.decode()
+        self.assertRegex(html, r'<select name="paid_through"[^>]*class="[^"]*unfold-admin-autocomplete')
+        self.assertIn("select2.full", html)
+        self.assertIn("unfold/js/select2.init.js", html)
+
+    def test_draft_with_inactive_account_keeps_it_visible_and_labelled(self):
+        self.closed.is_active = True
+        self.closed.save(update_fields=["is_active"])
+        draft = self._create_draft(paid_through=self.closed)
+        PaymentAccount.objects.filter(pk=self.closed.pk).update(is_active=False)
+        resp = self.client.get(reverse("admin:purchases_purchaseorder_payment_entry", args=[draft.public_id]))
+        bank = dict(self._optgroups(resp.content.decode()))["Bank"]
+        self.assertEqual(bank, ["Axis Savings", "HDFC Current", "Old Bank (inactive)"])
+
+    def test_inactive_account_still_rejected_on_post(self):
+        resp = self.client.post(
+            reverse("admin:purchases_purchaseorder_record_payment", args=[self.po.pk]),
+            {"amount": "100.00", "entry_date": timezone.localdate().isoformat(), "method": "upi",
+             "reference": "UTR-1", "notes": "", "paid_through": self.closed.pk, "_post": "1"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("paid_through", resp.context["form"].errors)
+        self.assertFalse(PurchaseOrderPayment.objects.exists())

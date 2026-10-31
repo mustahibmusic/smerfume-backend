@@ -1,4 +1,3 @@
-from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
 from django.conf import settings
@@ -6,7 +5,7 @@ from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
 from django.db import models
 from django.db.models import F, Q, Sum, Value
-from django.db.models.functions import Cast, Coalesce, Concat, Greatest, Length, LPad
+from django.db.models.functions import Cast, Coalesce, Concat, Greatest, Length, Lower, LPad
 from django.utils import timezone
 
 from apps.core.models import BaseModel
@@ -22,22 +21,15 @@ def _round(value, places):
 PAYMENT_UNPAID = "unpaid"
 PAYMENT_PARTIALLY_PAID = "partially_paid"
 PAYMENT_PAID = "paid"
-PAYMENT_OVERDUE = "overdue"
 PAYMENT_STATUS_CHOICES = (
     (PAYMENT_UNPAID, "Unpaid"),
     (PAYMENT_PARTIALLY_PAID, "Partially paid"),
     (PAYMENT_PAID, "Paid"),
-    (PAYMENT_OVERDUE, "Overdue"),
 )
 
 
-def payment_status_for(net_paid, ordered_gross_total, overdue=False):
-    """Operational PO-payment coverage (DEC-010), not settlement. Overdue
-    (DEC-011) means not fully paid after the payment due date."""
-    if net_paid and ordered_gross_total is not None and net_paid >= ordered_gross_total:
-        return PAYMENT_PAID
-    if overdue:
-        return PAYMENT_OVERDUE
+def payment_status_for(net_paid, ordered_gross_total):
+    """Operational PO-payment coverage (DEC-010), not settlement."""
     if not net_paid:
         return PAYMENT_UNPAID
     if ordered_gross_total is not None and net_paid >= ordered_gross_total:
@@ -108,12 +100,8 @@ class PurchaseOrder(BaseModel):
         "supplier", "warehouse", "order_date", "expected_date",
         "vendor_reference", "purchase_tax_treatment", "amounts_include_tax", "notes",
     )
-    # DEC-011: vendor bill reference, recorded once the bill arrives
-    # (issued onwards, never on a cancelled PO).
-    BILL_FIELDS = ("bill_number", "bill_date", "payment_due_date")
-    EDITABLE_OPEN_FIELDS = ("expected_date", "notes", *BILL_FIELDS)
-    EDITABLE_FINAL_FIELDS = ("notes", *BILL_FIELDS)
-    EDITABLE_CANCELLED_FIELDS = ("notes",)
+    EDITABLE_OPEN_FIELDS = ("expected_date", "notes")
+    EDITABLE_FINAL_FIELDS = ("notes",)
 
     # Database-generated from the primary key (same approach as
     # Supplier.vendor_code): always present, never changes, cannot collide.
@@ -150,16 +138,6 @@ class PurchaseOrder(BaseModel):
     )
     amounts_include_tax = models.BooleanField(
         default=False, help_text="Tick if the vendor's prices include GST."
-    )
-    # DEC-011: one vendor bill per PO, for day-to-day payables tracking.
-    # Zoho Books remains authoritative for the bill and the AP balance.
-    bill_number = models.CharField(
-        max_length=100, blank=True, help_text="The vendor's bill / tax invoice number."
-    )
-    bill_date = models.DateField(null=True, blank=True)
-    payment_due_date = models.DateField(
-        null=True, blank=True,
-        help_text="Left blank, it is set to the bill date plus the vendor's payment terms.",
     )
     notes = models.TextField(blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
@@ -207,20 +185,12 @@ class PurchaseOrder(BaseModel):
         super().clean()
         if self.expected_date and self.order_date and self.expected_date < self.order_date:
             raise ValidationError({"expected_date": "Expected date cannot be before the order date."})
-        if self.payment_due_date and not self.bill_date:
-            raise ValidationError({"bill_date": "Enter the bill date to set a payment due date."})
-        if self.bill_date and not self.payment_due_date and self.supplier_id:
-            self.payment_due_date = self.bill_date + timedelta(days=self.supplier.payment_terms_days)
-        if self.bill_date and self.payment_due_date and self.payment_due_date < self.bill_date:
-            raise ValidationError({"payment_due_date": "Due date cannot be before the bill date."})
 
     def editable_fields(self):
         if self.status == self.STATUS_DRAFT:
             return self.EDITABLE_DRAFT_FIELDS
         if self.status in (self.STATUS_ISSUED, self.STATUS_PARTIALLY_RECEIVED):
             return self.EDITABLE_OPEN_FIELDS
-        if self.status == self.STATUS_CANCELLED:
-            return self.EDITABLE_CANCELLED_FIELDS
         return self.EDITABLE_FINAL_FIELDS
 
     def can_transition_to(self, new_status):
@@ -278,7 +248,8 @@ class PurchaseOrder(BaseModel):
         R = PurchaseOrderPayment.TYPE_VENDOR_REFUND
         X = PurchaseOrderPayment.TYPE_REVERSAL
         zero = Value(Decimal("0.00"))
-        totals = self.payment_entries.aggregate(
+        # DEC-011: drafts never count. posted() is the single source of truth.
+        totals = self.payment_entries.posted().aggregate(
             gross_payments=Coalesce(Sum("amount", filter=Q(entry_type=P)), zero),
             active_payments=Coalesce(Sum("amount", filter=Q(entry_type=P, reversal__isnull=True)), zero),
             active_refunds=Coalesce(Sum("amount", filter=Q(entry_type=R, reversal__isnull=True)), zero),
@@ -313,19 +284,8 @@ class PurchaseOrder(BaseModel):
         return None if total is None else total - self.net_paid
 
     @property
-    def is_payment_overdue_date(self):
-        """Past the payment due date while payments are possible."""
-        return bool(
-            self.payment_due_date
-            and self.payment_due_date < timezone.localdate()
-            and self.status in self.PAYABLE_STATUSES
-        )
-
-    @property
     def payment_status(self):
-        return payment_status_for(
-            self.net_paid, self.ordered_gross_total, overdue=self.is_payment_overdue_date
-        )
+        return payment_status_for(self.net_paid, self.ordered_gross_total)
 
 
 class PurchaseOrderLine(BaseModel):
@@ -835,13 +795,68 @@ class ReceiptDiscrepancy(BaseModel):
             raise ValidationError(errors)
 
 
+class PaymentAccount(BaseModel):
+    """DEC-011 "Paid Through": the source a supplier payment was made from
+    (e.g. Petty Cash, a bank account, a UPI account). A label only: no
+    balances, account numbers, IFSC, reconciliation data or credentials.
+    Deactivated, never deleted (payments reference it)."""
+
+    KIND_CASH = "cash"
+    KIND_BANK = "bank"
+    KIND_UPI = "upi"
+    KIND_CARD = "card"
+    KIND_OTHER = "other"
+    KIND_CHOICES = (
+        (KIND_CASH, "Cash"),
+        (KIND_BANK, "Bank"),
+        (KIND_UPI, "UPI"),
+        (KIND_CARD, "Card"),
+        (KIND_OTHER, "Other"),
+    )
+
+    name = models.CharField(
+        max_length=80, help_text="A label only, e.g. \"HDFC Current ••1234\". No full account numbers.",
+    )
+    kind = models.CharField(max_length=10, choices=KIND_CHOICES)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "payment account (paid through)"
+        verbose_name_plural = "payment accounts (paid through)"
+        constraints = [
+            models.UniqueConstraint(Lower("name"), name="payment_account_name_ci_unique"),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class PurchaseOrderPaymentQuerySet(models.QuerySet):
+    def posted(self):
+        """The only rows that count financially (DEC-011)."""
+        return self.filter(status=PurchaseOrderPayment.STATUS_POSTED)
+
+    def drafts(self):
+        return self.filter(status=PurchaseOrderPayment.STATUS_DRAFT)
+
+
 class PurchaseOrderPayment(BaseModel):
-    """DEC-010 operational supplier payment ledger. Append-only: rows are
-    never updated or deleted. A mistake is corrected with a reversal entry
-    (full amount, linked, reason required, at most one per entry, never
-    itself reversed). A vendor_refund is money the supplier actually
-    returned. Not an accounting record; Zoho Books is authoritative.
+    """DEC-010 operational supplier payment ledger. Posted rows are
+    append-only: never updated or deleted. A mistake is corrected with a
+    reversal entry (full amount, linked, reason required, at most one per
+    entry, never itself reversed). A vendor_refund is money the supplier
+    actually returned. DEC-011: a payment may first be a draft, which is
+    editable and deletable and never counts in any total until posted.
+    Not an accounting record; Zoho Books is authoritative.
     Written only through apps.purchases.services."""
+
+    STATUS_DRAFT = "draft"
+    STATUS_POSTED = "posted"
+    STATUS_CHOICES = (
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_POSTED, "Posted"),
+    )
+    PAYMENT_NUMBER_PREFIX = "SPAY-"
 
     TYPE_PAYMENT = "payment"
     TYPE_VENDOR_REFUND = "vendor_refund"
@@ -887,18 +902,33 @@ class PurchaseOrderPayment(BaseModel):
     recorded_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+"
     )
+    # DEC-011. Default draft: a row created without a status can never
+    # inflate totals; refunds/reversals created as drafts fail a constraint.
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+    payment_number = models.CharField(max_length=20, null=True, blank=True, unique=True, editable=False)
+    paid_through = models.ForeignKey(
+        PaymentAccount, on_delete=models.PROTECT, null=True, blank=True, related_name="payments",
+    )
+    posted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    posted_at = models.DateTimeField(null=True, blank=True)
+
+    objects = PurchaseOrderPaymentQuerySet.as_manager()
 
     class Meta:
         ordering = ["entry_date", "id"]
         verbose_name = "supplier payment entry"
         verbose_name_plural = "supplier payment entries"
         permissions = [
-            ("record_po_payment", "Can record supplier payments and vendor refunds"),
+            ("record_po_payment", "Can record supplier payment drafts and vendor refunds"),
+            ("post_po_payment", "Can post supplier payments"),
             ("reverse_po_payment", "Can reverse supplier payment entries"),
         ]
         indexes = [
             models.Index(fields=["purchase_order", "entry_type"], name="po_payment_po_type_idx"),
             models.Index(fields=["reference"], name="po_payment_reference_idx"),
+            models.Index(fields=["purchase_order", "status"], name="po_payment_po_status_idx"),
         ]
         constraints = [
             models.CheckConstraint(condition=Q(amount__gt=0), name="po_payment_amount_gt_0"),
@@ -915,16 +945,100 @@ class PurchaseOrderPayment(BaseModel):
                 condition=Q(entry_type="reversal") | ~Q(method=""),
                 name="po_payment_method_required",
             ),
+            # DEC-011
+            models.CheckConstraint(
+                condition=Q(status="posted") | Q(entry_type="payment"),
+                name="po_payment_draft_only_payment",
+            ),
+            models.CheckConstraint(
+                condition=(Q(entry_type="payment", status="posted") & Q(payment_number__isnull=False))
+                | (~Q(entry_type="payment", status="posted") & Q(payment_number__isnull=True)),
+                name="po_payment_number_iff_posted_payment",
+            ),
+            models.CheckConstraint(
+                condition=Q(payment_number__isnull=True) | Q(payment_number__regex=r"^SPAY-[0-9]{6,}$"),
+                name="po_payment_number_format",
+            ),
+            models.CheckConstraint(
+                condition=Q(status="draft", posted_at__isnull=True, posted_by__isnull=True)
+                | Q(status="posted", posted_at__isnull=False, posted_by__isnull=False),
+                name="po_payment_posted_audit",
+            ),
         ]
 
     def __str__(self):
         return f"{self.get_entry_type_display()} {self.amount} on {self.purchase_order}"
 
+    @property
+    def is_draft(self):
+        return self.status == self.STATUS_DRAFT
+
+    def _stored_status(self):
+        return type(self).objects.filter(pk=self.pk).values_list("status", flat=True).first()
+
     def save(self, *args, **kwargs):
-        if not self._state.adding:
+        # Only a stored draft may be updated (edited, or posted once).
+        if not self._state.adding and self._stored_status() != self.STATUS_DRAFT:
             raise ValidationError("Supplier payment entries cannot be changed; record a reversal instead.")
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
-        raise ValidationError("Supplier payment entries cannot be deleted; record a reversal instead.")
+        if self._stored_status() != self.STATUS_DRAFT:
+            raise ValidationError("Supplier payment entries cannot be deleted; record a reversal instead.")
+        return super().delete(*args, **kwargs)
+
+
+def _attachment_storage():
+    from django.core.files.storage import storages
+
+    return storages["private_documents"]
+
+
+def _attachment_path(instance, filename):
+    # filename is already a random uuid4 name set by the service.
+    today = timezone.localdate()
+    return f"supplier-payments/{today:%Y/%m}/{filename}"
+
+
+class SupplierPaymentAttachment(BaseModel):
+    """DEC-011 payment proof. Private storage, served only through a
+    permission-checked admin view. Removable only while the payment is a
+    draft; posted payments are add-only."""
+
+    MAX_PER_PAYMENT = 5
+    MAX_SIZE = 5 * 1024 * 1024
+    TYPE_PDF = "application/pdf"
+    TYPE_JPEG = "image/jpeg"
+    TYPE_PNG = "image/png"
+    TYPE_WEBP = "image/webp"
+    CONTENT_TYPE_CHOICES = (
+        (TYPE_PDF, "PDF"),
+        (TYPE_JPEG, "JPEG"),
+        (TYPE_PNG, "PNG"),
+        (TYPE_WEBP, "WebP"),
+    )
+
+    payment = models.ForeignKey(PurchaseOrderPayment, on_delete=models.PROTECT, related_name="attachments")
+    file = models.FileField(storage=_attachment_storage, upload_to=_attachment_path, max_length=255)
+    original_name = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=30, choices=CONTENT_TYPE_CHOICES)
+    size = models.PositiveIntegerField()
+    uploaded_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="+")
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        verbose_name = "supplier payment attachment"
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(size__gt=0, size__lte=5 * 1024 * 1024), name="po_payment_attachment_size",
+            ),
+        ]
+
+    def __str__(self):
+        return self.original_name
+
+    def delete(self, *args, **kwargs):
+        if self.payment._stored_status() != PurchaseOrderPayment.STATUS_DRAFT:
+            raise ValidationError("Proof on a posted payment cannot be removed.")
+        return super().delete(*args, **kwargs)
 

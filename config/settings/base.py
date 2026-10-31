@@ -243,6 +243,18 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
+# DEC-011: private documents (supplier payment proof). Never served by a URL
+# route; downloads go through a permission-checked admin view.
+PRIVATE_MEDIA_ROOT = BASE_DIR / "private_media"
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+    "private_documents": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+        "OPTIONS": {"location": PRIVATE_MEDIA_ROOT, "base_url": None},
+    },
+}
+
 # ── File Storage ───────────────────────────────────────────────────────────────
 # Set USE_S3=True in your environment to switch to Amazon S3.
 # Required env vars when USE_S3 is True:
@@ -272,6 +284,24 @@ if os.getenv("USE_S3") == "True":
         },
         "staticfiles": {
             "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+        },
+        # DEC-011: same bucket, "private/" prefix, signed 5-minute URLs and no
+        # public custom domain. The bucket policy must not make "private/"
+        # publicly readable.
+        "private_documents": {
+            "BACKEND": "storages.backends.s3boto3.S3Boto3Storage",
+            "OPTIONS": {
+                "access_key": AWS_ACCESS_KEY_ID,
+                "secret_key": AWS_SECRET_ACCESS_KEY,
+                "bucket_name": AWS_STORAGE_BUCKET_NAME,
+                "region_name": AWS_S3_REGION_NAME,
+                "location": "private",
+                "custom_domain": None,
+                "querystring_auth": True,
+                "querystring_expire": 300,
+                "file_overwrite": False,
+                "default_acl": None,
+            },
         },
     }
     MEDIA_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/"

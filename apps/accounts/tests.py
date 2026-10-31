@@ -1034,3 +1034,17 @@ class SupplierPaymentGroupPermissionTests(TestCase):
         self.assertTrue(payment_perms | {"purchases.set_po_tax_treatment"} <= manager)
         for group in (ops, warehouse):
             self.assertFalse(group & (payment_perms | {"purchases.set_po_tax_treatment"}))
+
+    def test_dec011_posting_and_paid_through_permissions(self):
+        call_command("setup_staff_groups", stdout=StringIO())
+        ops, warehouse, finance, manager = (
+            _group_codes(n) for n in ("Ops", "Warehouse", "Finance", "Manager")
+        )
+        account_admin = {"purchases.add_paymentaccount", "purchases.change_paymentaccount"}
+        self.assertTrue({"purchases.post_po_payment", "purchases.view_paymentaccount"} <= finance)
+        self.assertFalse(finance & account_admin)
+        self.assertTrue({"purchases.post_po_payment", "purchases.view_paymentaccount"} | account_admin <= manager)
+        for group in (ops, warehouse, finance, manager):
+            self.assertNotIn("purchases.delete_paymentaccount", group)
+        for group in (ops, warehouse):
+            self.assertFalse(group & ({"purchases.post_po_payment", "purchases.view_paymentaccount"} | account_admin))

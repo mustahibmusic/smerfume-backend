@@ -13,7 +13,8 @@ discrepancies never do.
 from collections import defaultdict
 
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.core.files import File
+from django.db import connection, transaction
 from django.utils import timezone
 
 from apps.inventory.models import InventoryStock
@@ -30,10 +31,12 @@ from .models import (
     BookedQuantityChange,
     GoodsReceipt,
     GoodsReceiptLine,
+    PaymentAccount,
     PurchaseOrder,
     PurchaseOrderLine,
     PurchaseOrderPayment,
     ReceiptDiscrepancy,
+    SupplierPaymentAttachment,
 )
 
 
@@ -733,6 +736,21 @@ def set_po_tax_treatment(po, treatment, user):
     return po
 
 
+def _posted_audit(user):
+    return {
+        "status": PurchaseOrderPayment.STATUS_POSTED, "posted_by": user, "posted_at": timezone.now(),
+    }
+
+
+def next_payment_number():
+    """DEC-011: next SPAY number from the database sequence. Concurrency-safe;
+    a transaction that rolls back after this leaves a gap, which is accepted."""
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT nextval('purchases_spay_seq')")
+        (value,) = cursor.fetchone()
+    return f"{PurchaseOrderPayment.PAYMENT_NUMBER_PREFIX}{value:06d}"
+
+
 def _check_entry_input(amount, entry_date, method, reference, notes):
     if amount is None or amount <= 0:
         raise SupplierPaymentError("Amount must be greater than zero.")
@@ -763,12 +781,84 @@ def _lock_payable_po(po):
     return po
 
 
+def _check_paid_through(paid_through, required):
+    if paid_through is None:
+        if required:
+            raise SupplierPaymentError("Paid through is required to post a payment.")
+        return
+    # Re-read so a deactivation committed by someone else is seen.
+    if not PaymentAccount.objects.filter(pk=paid_through.pk, is_active=True).exists():
+        raise SupplierPaymentError(f"Paid through account '{paid_through.name}' is inactive.")
+
+
+def _lock_payment(entry, po):
+    """Lock the ledger row after its PO (DEC-011 lock order: PO, then entry)."""
+    locked = PurchaseOrderPayment.objects.select_for_update().filter(pk=entry.pk).first()
+    if locked is None:
+        raise SupplierPaymentError("This draft payment no longer exists.")
+    if locked.purchase_order_id != po.pk:
+        raise SupplierPaymentError("This draft belongs to a different purchase order.")
+    return locked
+
+
+def _refuse_posted(entry, action):
+    if not entry.is_draft or entry.entry_type != PurchaseOrderPayment.TYPE_PAYMENT:
+        number = entry.payment_number or "This entry"
+        raise SupplierPaymentError(
+            f"{number} is already posted and cannot be {action}; record a reversal instead."
+        )
+
+
 @transaction.atomic
-def record_po_payment(po, amount, entry_date, method, reference, notes, user):
-    """Record money paid to the supplier. Net paid can never exceed the
-    PO's ordered_gross_total."""
+def create_payment_draft(po, *, amount, entry_date, method, reference, notes, user, paid_through=None):
+    """DEC-011: save a supplier payment as a draft. A draft has no SPAY number
+    and never counts toward net paid, payment status, caps or cancellation."""
     po = _lock_payable_po(po)
     reference, notes = _check_entry_input(amount, entry_date, method, reference, notes)
+    _check_paid_through(paid_through, required=False)
+    return PurchaseOrderPayment.objects.create(
+        purchase_order=po, entry_type=PurchaseOrderPayment.TYPE_PAYMENT,
+        status=PurchaseOrderPayment.STATUS_DRAFT, amount=amount, entry_date=entry_date, method=method,
+        reference=reference, notes=notes, paid_through=paid_through, recorded_by=user,
+    )
+
+
+@transaction.atomic
+def update_payment_draft(draft, *, user, amount, entry_date, method, reference, notes, paid_through):
+    """Edit a draft. Posted entries are immutable."""
+    po = _lock_payable_po(draft.purchase_order)
+    draft = _lock_payment(draft, po)
+    _refuse_posted(draft, "edited")
+    reference, notes = _check_entry_input(amount, entry_date, method, reference, notes)
+    _check_paid_through(paid_through, required=False)
+    draft.amount, draft.entry_date, draft.method = amount, entry_date, method
+    draft.reference, draft.notes, draft.paid_through = reference, notes, paid_through
+    draft.save()
+    return draft
+
+
+@transaction.atomic
+def delete_payment_draft(draft, user):
+    """Delete a draft (allowed on any PO status, including cancelled)."""
+    po = _lock(draft.purchase_order)
+    draft = _lock_payment(draft, po)
+    _refuse_posted(draft, "deleted")
+    _delete_attachment_rows(list(draft.attachments.all()))
+    draft.delete()
+
+
+@transaction.atomic
+def post_payment(po, *, user, draft=None, amount, entry_date, method, reference, notes, paid_through):
+    """DEC-011: the single posting path, used by direct Save as Paid and by
+    posting a draft. Locks the PO, then the draft; revalidates everything;
+    requires an active Paid Through; caps posted net paid at the ordered
+    gross total; assigns the SPAY number last."""
+    po = _lock_payable_po(po)
+    if draft is not None:
+        draft = _lock_payment(draft, po)
+        _refuse_posted(draft, "posted again")
+    reference, notes = _check_entry_input(amount, entry_date, method, reference, notes)
+    _check_paid_through(paid_through, required=True)
     total = po.ordered_gross_total
     new_net = po.net_paid + amount
     if total is None or new_net > total:
@@ -776,9 +866,81 @@ def record_po_payment(po, amount, entry_date, method, reference, notes, user):
             f"This payment would make net paid {new_net}, which would exceed the ordered gross "
             f"total of {total}."
         )
-    return PurchaseOrderPayment.objects.create(
-        purchase_order=po, entry_type=PurchaseOrderPayment.TYPE_PAYMENT, amount=amount,
-        entry_date=entry_date, method=method, reference=reference, notes=notes, recorded_by=user,
+    entry = draft or PurchaseOrderPayment(
+        purchase_order=po, entry_type=PurchaseOrderPayment.TYPE_PAYMENT, recorded_by=user,
+    )
+    entry.amount, entry.entry_date, entry.method = amount, entry_date, method
+    entry.reference, entry.notes, entry.paid_through = reference, notes, paid_through
+    entry.payment_number = next_payment_number()
+    for field, value in _posted_audit(user).items():
+        setattr(entry, field, value)
+    entry.save()
+    return entry
+
+
+def _delete_attachment_rows(attachments):
+    """Delete attachment rows now and their files only once the transaction
+    commits, so a rollback never leaves a row pointing at a missing file."""
+    for attachment in attachments:
+        storage, name = attachment.file.storage, attachment.file.name
+        attachment.delete()
+        transaction.on_commit(lambda storage=storage, name=name: storage.delete(name))
+
+
+@transaction.atomic
+def add_payment_attachments(entry, files, user):
+    """DEC-011: attach payment proof. Drafts and posted payments both accept
+    new files (posted payments are add-only); at most five per payment."""
+    from .attachments import AttachmentError, validate_upload
+
+    po = _lock(entry.purchase_order)
+    entry = _lock_payment(entry, po)
+    if entry.entry_type != PurchaseOrderPayment.TYPE_PAYMENT:
+        raise SupplierPaymentError("Proof can be attached to supplier payments only.")
+    files = list(files)
+    limit = SupplierPaymentAttachment.MAX_PER_PAYMENT
+    if entry.attachments.count() + len(files) > limit:
+        raise SupplierPaymentError(f"A payment can have at most {limit} attachments.")
+    try:
+        checked = [(upload, *validate_upload(upload)) for upload in files]
+    except AttachmentError as exc:
+        raise SupplierPaymentError(str(exc)) from exc
+    saved = []
+    try:
+        for upload, content_type, original_name, storage_name in checked:
+            attachment = SupplierPaymentAttachment(
+                payment=entry, original_name=original_name, content_type=content_type, size=upload.size,
+                uploaded_by=user,
+            )
+            attachment.file.save(storage_name, File(upload), save=False)
+            saved.append(attachment.file)
+            attachment.save()
+    except Exception:
+        for stored in saved:
+            stored.storage.delete(stored.name)
+        raise
+    return list(entry.attachments.all())
+
+
+@transaction.atomic
+def remove_payment_attachment(attachment, user):
+    """Remove proof from a draft. Posted payments are add-only."""
+    po = _lock(attachment.payment.purchase_order)
+    entry = _lock_payment(attachment.payment, po)
+    if not entry.is_draft:
+        raise SupplierPaymentError("Proof on a posted payment cannot be removed.")
+    attachment = SupplierPaymentAttachment.objects.filter(pk=attachment.pk, payment=entry).first()
+    if attachment is None:
+        raise SupplierPaymentError("This attachment no longer exists.")
+    _delete_attachment_rows([attachment])
+
+
+def record_po_payment(po, amount, entry_date, method, reference, notes, user, paid_through=None):
+    """Record money paid to the supplier directly (Save as Paid). Net paid
+    can never exceed the PO's ordered_gross_total."""
+    return post_payment(
+        po, user=user, amount=amount, entry_date=entry_date, method=method, reference=reference,
+        notes=notes, paid_through=paid_through,
     )
 
 
@@ -793,6 +955,7 @@ def record_vendor_refund(po, amount, entry_date, method, reference, notes, user)
     return PurchaseOrderPayment.objects.create(
         purchase_order=po, entry_type=PurchaseOrderPayment.TYPE_VENDOR_REFUND, amount=amount,
         entry_date=entry_date, method=method, reference=reference, notes=notes, recorded_by=user,
+        **_posted_audit(user),
     )
 
 
@@ -806,6 +969,8 @@ def reverse_po_payment_entry(entry, reason, user):
         raise SupplierPaymentError("A reversal reason is required.")
     po = _lock(entry.purchase_order)
     entry = PurchaseOrderPayment.objects.select_for_update().get(pk=entry.pk)
+    if entry.is_draft:
+        raise SupplierPaymentError("A draft payment cannot be reversed; edit or delete the draft instead.")
     if entry.entry_type == PurchaseOrderPayment.TYPE_REVERSAL:
         raise SupplierPaymentError("A reversal cannot be reversed.")
     if PurchaseOrderPayment.objects.filter(reverses=entry).exists():
@@ -830,5 +995,6 @@ def reverse_po_payment_entry(entry, reason, user):
     return PurchaseOrderPayment.objects.create(
         purchase_order=po, entry_type=PurchaseOrderPayment.TYPE_REVERSAL, amount=entry.amount,
         entry_date=timezone.localdate(), reverses=entry, reversal_reason=reason, recorded_by=user,
+        **_posted_audit(user),
     )
 

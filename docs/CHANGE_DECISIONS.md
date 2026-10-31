@@ -372,36 +372,39 @@ Some suppliers sell with a GST invoice and some without (lower price, cash or UP
 
 ---
 
-## DEC-011 — Vendor Bill Reference, Payment Due Date and Overdue Status on Purchase Orders
+## DEC-011 — Supplier Payment Drafts, Numbering, Paid Through and Payment Proof
 
 ### Original Product Bible Requirement
-DEC-010 (point 9) deferred vendor bills and invoice tracking. Zoho Books is authoritative for vendor bills and the accounts-payable balance (DEC-001, DEC-010).
+DEC-010 introduced an operational, append-only supplier payment ledger per purchase order (payments, vendor refunds, reversals) with no draft state, no internal payment number, no record of the paying account and no stored proof. DEC-001 and DEC-010 keep vendor bills, accounting and the final accounts-payable balance in Zoho Books.
 
 ### Updated Decision
-The purchase order list must show, per row: date, bill number, reference number, vendor, payment status (Paid / Unpaid / Partially Paid / Overdue), due date, amount and balance due.
-1. **One vendor bill per PO.** `PurchaseOrder` records `bill_number`, `bill_date` and `payment_due_date`. They are editable from issue onwards (issued, partially received, received, closed), never in draft or on a cancelled PO.
-2. **Due date default.** Left blank, `payment_due_date` is set to `bill_date` plus the vendor's `payment_terms_days`. Staff may enter the vendor's stated due date instead; it cannot be before the bill date, and a due date needs a bill date.
-3. **Overdue is derived, never stored.** A PO is Overdue when it is not fully paid, its payment due date is before today, and it is in a payable status. Paid wins over Overdue. Status and balance come from the DEC-010 payment ledger only.
-4. **Balance due** is `ordered_gross_total - net_paid` (the DEC-010 `remaining_against_po`); unknown while the PO is unclassified.
-5. **Visibility.** Balance due and payment status stay behind the ledger view permission, like the other DEC-010 payment columns.
-6. **Boundary unchanged.** These are operational payables figures. Zoho Books remains authoritative for vendor bills and the final accounts-payable balance.
+1. **Draft payments.** A `payment` entry may be saved as a draft. Drafts can be created, edited and deleted. Drafts never count toward gross payments, net paid, remaining against PO, payment status, the vendor-refund cap, the reversal caps or the PO cancellation guard. Every financial calculation uses one shared posted-only filter. Vendor refunds and reversals are never drafts.
+2. **Posting.** A payment is posted either from a draft or directly from a new payment form; both paths use the same service and rules. Posting locks the PO, then the draft; requires the PO to be payable; re-validates date, method and reference; requires an active Paid Through account; applies the no-overpayment rule against posted net paid only; assigns the payment number; and records who posted it and when. A draft can be posted once. Posted entries are immutable and cannot be deleted; mistakes are corrected with the DEC-010 reversal.
+3. **Payment number.** Posted payments receive an internal number `SPAY-` followed by at least six digits, from a database sequence, assigned at posting and never editable. Gaps are acceptable: these are operational references, not statutory document numbers. Vendor refunds and reversals are not numbered; if they need numbers later they get their own series.
+4. **Paid Through.** A minimal `PaymentAccount` list (name, kind, active) identifies the source the payment was made from (e.g. Petty Cash, a bank account, a UPI account). It stores no balances, full account numbers, IFSC codes, reconciliation data or credentials, and is not a bank or accounting ledger.
+5. **Payment proof.** Up to five attachments per payment (PDF, JPEG, PNG, WebP; 5 MB each), validated by content. Drafts may add and remove attachments; posted payments may add attachments but never remove them. Attachments are stored privately and served only to users with permission to view supplier payments, never through a public URL.
+6. **Permissions.** New permission `post_po_payment` (Finance, Manager). `record_po_payment` covers creating, editing and deleting drafts and recording vendor refunds. `reverse_po_payment` is unchanged.
+7. **Dates.** One date only: the existing payment date (the date the money moved). Zoho's "Payment Made on" field is unresolved and is not replicated.
+8. **Existing data.** Existing payments, vendor refunds and reversals become posted and remain financially identical. Existing payments receive SPAY numbers in date order; posted-by and posted-at are taken from recorded-by and created-at. Their Paid Through stays empty ("Not recorded"); historical accounts are not inferred.
+9. **Boundary (unchanged).** Zoho Books remains the accounting source of truth, including vendor bills, GST, input tax, credit notes and the final accounts-payable balance. Django records operational supplier-payment facts only. No vendor-bill accounting and no final AP balance ownership move into Django.
 
 ### Reason
-Staff need a day-to-day payables view (what is due, what is late) on the purchase order list without opening Zoho Books.
+Staff need a payment entry flow close to Zoho Books (draft then post, an internal reference, the paying account and proof) for day-to-day procurement, and a path to maker-checker approval later, without moving accounting into Django.
 
 ### Impact
-- `apps/purchases`: three new nullable/blank `PurchaseOrder` fields (migration 0007), an `overdue` payment status, a `balance_due_db` annotation, new list columns, bill-number search, and a "Vendor bill" section on the PO form. The existing goods "overdue" filter (past expected date) is relabelled "delivery overdue".
-- No change to inventory, goods receipts, the payment ledger or Zoho integration.
-- Amends DEC-010 point 9 for bill number, bill date and due date only. Multiple bills per PO, bill amounts that differ from the PO and bill documents remain deferred.
+- `apps/purchases`: `PurchaseOrderPayment` gains status, payment number, Paid Through and posted-by/at; new `PaymentAccount` and `SupplierPaymentAttachment` models; new draft and posting services; posted-only totals everywhere; new payment form and Supplier Payments list columns.
+- New permission `post_po_payment`; Paid Through accounts maintained by Managers.
+- A private file storage for payment proof.
+- No change to inventory, goods receipts, PO goods status or the Zoho boundary.
 
 ### Status
-**APPROVED** — Implemented.
+**APPROVED** — not yet implemented.
 
 ### Date
 2026-10-31
 
 ### Related Documentation
-- DEC-001, DEC-010
+- DEC-001, DEC-010 (amended by this decision)
 
 ---
 

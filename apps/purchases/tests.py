@@ -17,6 +17,7 @@ from unittest import mock
 
 from django.conf import settings
 from django.contrib import admin as django_admin
+from django.contrib.admin.utils import label_for_field
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.core.exceptions import ValidationError
@@ -26,6 +27,8 @@ from django.test import RequestFactory, TestCase, TransactionTestCase, override_
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.text import capfirst
+from unfold.widgets import UnfoldAdminDecimalFieldWidget
 
 from apps.catalog.models import Brand, Category, Product, ProductEdition, ProductVariant
 from apps.inventory.models import (
@@ -44,6 +47,7 @@ from apps.purchases.admin import (
     GoodsReceiptLineInline,
     PurchaseOrderAdmin,
     PurchaseOrderLineInline,
+    SupplierPaymentEntryForm,
 )
 from apps.purchases.models import (
     BookedQuantityChange,
@@ -3005,12 +3009,32 @@ class OrderedGrossTotalTests(_POBase):
         self.assertIsNone(po.ordered_gross_total)
 
 
+def _test_account():
+    """DEC-011: posting a payment needs an active Paid Through account."""
+    from apps.purchases.models import PaymentAccount
+
+    account, _ = PaymentAccount.objects.get_or_create(name="Test Bank", defaults={"kind": "bank"})
+    return account
+
+
+def _posted_fields(entry_type, user, extra):
+    """DEC-011: rows written straight to the ledger in tests are posted, as
+    the services write them (payments carry an SPAY number)."""
+    extra.setdefault("status", PurchaseOrderPayment.STATUS_POSTED)
+    if extra["status"] == PurchaseOrderPayment.STATUS_POSTED:
+        extra.setdefault("posted_by", user)
+        extra.setdefault("posted_at", timezone.now())
+        if entry_type == PAYMENT:
+            extra.setdefault("payment_number", services.next_payment_number())
+    return extra
+
+
 def _entry(po, entry_type, amount, user, **extra):
     if entry_type != REVERSAL:
         extra.setdefault("method", PurchaseOrderPayment.METHOD_CASH)
     return PurchaseOrderPayment.objects.create(
         purchase_order=po, entry_type=entry_type, amount=Decimal(amount),
-        entry_date=timezone.localdate(), recorded_by=user, **extra,
+        entry_date=timezone.localdate(), recorded_by=user, **_posted_fields(entry_type, user, extra),
     )
 
 
@@ -3020,6 +3044,7 @@ class PurchaseOrderPaymentModelTests(_POBase):
         self.po = self._po(purchase_tax_treatment=NO_GST)
 
     def _integrity(self, **kwargs):
+        _posted_fields(kwargs.get("entry_type"), self.user, kwargs)
         with self.assertRaises(IntegrityError), transaction.atomic():
             PurchaseOrderPayment.objects.create(
                 purchase_order=self.po, entry_date=timezone.localdate(), recorded_by=self.user, **kwargs,
@@ -3123,6 +3148,7 @@ class SupplierPaymentServiceTests(_POBase):
         return services.record_po_payment(
             po or self.po, amount=Decimal(amount), entry_date=kwargs.pop("entry_date", timezone.localdate()),
             method=method, reference=reference, notes=kwargs.pop("notes", ""), user=self.user,
+            paid_through=_test_account(),
         )
 
     def _refund(self, amount="100", method="upi", reference="RF1"):
@@ -3326,7 +3352,7 @@ class SupplierPaymentConcurrencyTests(TransactionTestCase):
             try:
                 services.record_po_payment(
                     self.po, amount=Decimal("600"), entry_date=timezone.localdate(),
-                    method="cash", reference="", notes="", user=self.user,
+                    method="cash", reference="", notes="", user=self.user, paid_through=_test_account(),
                 )
                 results.append("ok")
             except services.SupplierPaymentError:
@@ -3358,7 +3384,9 @@ def _purchases_staff(username, *codenames):
     return staff
 
 
-FINANCE_PERMS = ("view_purchaseorder", "view_purchaseorderpayment", "record_po_payment", "reverse_po_payment")
+FINANCE_PERMS = (
+    "view_purchaseorder", "view_purchaseorderpayment", "record_po_payment", "post_po_payment", "reverse_po_payment",
+)
 
 
 class SupplierPaymentAdminTests(_POBase):
@@ -3374,7 +3402,8 @@ class SupplierPaymentAdminTests(_POBase):
     def _pay_data(self, **overrides):
         data = {
             "amount": "250.00", "entry_date": timezone.localdate().isoformat(),
-            "method": "upi", "reference": "UTR-9", "notes": "",
+            "method": "upi", "reference": "UTR-9", "notes": "", "paid_through": _test_account().pk,
+            "_post": "1",  # DEC-011 Save as Paid
         }
         data.update(overrides)
         return data
@@ -3397,7 +3426,7 @@ class SupplierPaymentAdminTests(_POBase):
     def test_payment_panel_uses_operational_labels(self):
         services.record_po_payment(
             self.po, amount=Decimal("250"), entry_date=timezone.localdate(), method="cash",
-            reference="", notes="", user=self.user,
+            reference="", notes="", user=self.user, paid_through=_test_account(),
         )
         self.client.force_login(self.user)
         resp = self.client.get(reverse("admin:purchases_purchaseorder_change", args=[self.po.pk]))
@@ -3432,7 +3461,7 @@ class SupplierPaymentAdminTests(_POBase):
     def test_record_vendor_refund(self):
         services.record_po_payment(
             self.po, amount=Decimal("500"), entry_date=timezone.localdate(), method="cash",
-            reference="", notes="", user=self.user,
+            reference="", notes="", user=self.user, paid_through=_test_account(),
         )
         self.client.force_login(_purchases_staff("finance3", *FINANCE_PERMS))
         self.client.post(self._url("record_vendor_refund"), self._pay_data(amount="100", reference="RF-1"))
@@ -3441,7 +3470,7 @@ class SupplierPaymentAdminTests(_POBase):
     def test_reverse_entry(self):
         payment = services.record_po_payment(
             self.po, amount=Decimal("500"), entry_date=timezone.localdate(), method="cash",
-            reference="", notes="", user=self.user,
+            reference="", notes="", user=self.user, paid_through=_test_account(),
         )
         self.client.force_login(_purchases_staff("finance4", *FINANCE_PERMS))
         resp = self.client.get(self._url("reverse_payment_entry"))
@@ -3452,7 +3481,7 @@ class SupplierPaymentAdminTests(_POBase):
     def test_reverse_requires_reverse_permission(self):
         payment = services.record_po_payment(
             self.po, amount=Decimal("500"), entry_date=timezone.localdate(), method="cash",
-            reference="", notes="", user=self.user,
+            reference="", notes="", user=self.user, paid_through=_test_account(),
         )
         self.client.force_login(_purchases_staff("recorderonly", "view_purchaseorder", "record_po_payment"))
         resp = self.client.post(self._url("reverse_payment_entry"), {"entry": payment.pk, "reason": "x"})
@@ -3488,7 +3517,7 @@ class SupplierPaymentAdminTests(_POBase):
     def test_list_payment_status_and_treatment_filters(self):
         services.record_po_payment(
             self.po, amount=Decimal("1000"), entry_date=timezone.localdate(), method="cash",
-            reference="", notes="", user=self.user,
+            reference="", notes="", user=self.user, paid_through=_test_account(),
         )
         unpaid = self._po(purchase_tax_treatment=GST)
         self.client.force_login(self.user)
@@ -3509,7 +3538,7 @@ class SupplierPaymentVisibilityTests(_POBase):
         services.issue_purchase_order(self.po, self.user)
         services.record_po_payment(
             self.po, amount=Decimal("250"), entry_date=timezone.localdate(), method="upi",
-            reference="UTR-SECRET-1", notes="", user=self.user,
+            reference="UTR-SECRET-1", notes="", user=self.user, paid_through=_test_account(),
         )
 
     def _group_staff(self, username, group_name):
@@ -3591,7 +3620,7 @@ class SupplierPaymentLedgerAdminTests(AdminQueryCountMixin, _POBase):
         services.issue_purchase_order(po, self.user)
         entry = services.record_po_payment(
             po, amount=Decimal("10"), entry_date=timezone.localdate(), method="upi",
-            reference="UTR-FIND-ME", notes="", user=self.user,
+            reference="UTR-FIND-ME", notes="", user=self.user, paid_through=_test_account(),
         )
         resp = self.client.get(reverse("admin:purchases_purchaseorderpayment_changelist"), {"q": "FIND-ME"})
         self.assertEqual(list(resp.context["cl"].result_list), [entry])
@@ -3601,6 +3630,1027 @@ class SupplierPaymentLedgerAdminTests(AdminQueryCountMixin, _POBase):
             po = self._po(purchase_tax_treatment=NO_GST)
             self._line(po, variant=_variant(f"SKU-PAYQ-{i}"), quantity_ordered=1, unit_price=Decimal("100"))
         self.assertChangelistQueriesFlat(reverse("admin:purchases_purchaseorder_changelist"), make)
+
+
+# ── DEC-011: supplier payment drafts, numbering, Paid Through, proof ────────
+
+from apps.purchases.models import PaymentAccount, SupplierPaymentAttachment  # noqa: E402
+
+DRAFT = PurchaseOrderPayment.STATUS_DRAFT
+POSTED = PurchaseOrderPayment.STATUS_POSTED
+
+
+def _account(name="Petty Cash", kind=PaymentAccount.KIND_CASH, **kwargs):
+    return PaymentAccount.objects.create(name=name, kind=kind, **kwargs)
+
+
+def _draft(po, amount, user, **extra):
+    extra.setdefault("method", PurchaseOrderPayment.METHOD_CASH)
+    return PurchaseOrderPayment.objects.create(
+        purchase_order=po, entry_type=PAYMENT, amount=Decimal(amount), status=DRAFT,
+        entry_date=timezone.localdate(), recorded_by=user, **extra,
+    )
+
+
+class SupplierPaymentDraftModelTests(_POBase):
+    def setUp(self):
+        super().setUp()
+        self.po = self._po(purchase_tax_treatment=NO_GST)
+
+    def _integrity(self, **kwargs):
+        kwargs.setdefault("method", "cash")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            PurchaseOrderPayment.objects.create(
+                purchase_order=self.po, entry_date=timezone.localdate(), recorded_by=self.user,
+                amount=Decimal("10"), **kwargs,
+            )
+
+    def test_default_status_is_draft(self):
+        self.assertEqual(_draft(self.po, "10", self.user).status, DRAFT)
+        entry = PurchaseOrderPayment(purchase_order=self.po, entry_type=PAYMENT)
+        self.assertEqual(entry.status, DRAFT)
+
+    def test_only_payments_can_be_drafts(self):
+        self._integrity(entry_type=REFUND, status=DRAFT)
+
+    def test_number_exactly_on_posted_payments(self):
+        now = timezone.now()
+        posted = {"status": POSTED, "posted_by": self.user, "posted_at": now}
+        self._integrity(entry_type=PAYMENT, **posted)  # posted payment without number
+        self._integrity(entry_type=PAYMENT, status=DRAFT, payment_number="SPAY-000777")
+        self._integrity(entry_type=REFUND, payment_number="SPAY-000778", **posted)
+
+    def test_number_format(self):
+        now = timezone.now()
+        self._integrity(
+            entry_type=PAYMENT, status=POSTED, posted_by=self.user, posted_at=now, payment_number="PAY-1",
+        )
+        self._integrity(
+            entry_type=PAYMENT, status=POSTED, posted_by=self.user, posted_at=now, payment_number="SPAY-12345",
+        )
+
+    def test_posted_audit_fields(self):
+        self._integrity(entry_type=PAYMENT, status=DRAFT, posted_at=timezone.now())
+        self._integrity(entry_type=REFUND, status=POSTED, posted_by=self.user)
+
+    def test_number_unique(self):
+        number = services.next_payment_number()
+        _entry(self.po, PAYMENT, "1", self.user, payment_number=number)
+        self._integrity(
+            entry_type=PAYMENT, status=POSTED, posted_by=self.user, posted_at=timezone.now(),
+            payment_number=number,
+        )
+
+    def test_draft_is_editable_and_deletable(self):
+        draft = _draft(self.po, "10", self.user)
+        draft.notes = "edited"
+        draft.save()
+        self.assertEqual(PurchaseOrderPayment.objects.get(pk=draft.pk).notes, "edited")
+        draft.delete()
+        self.assertFalse(PurchaseOrderPayment.objects.filter(pk=draft.pk).exists())
+
+    def test_posted_payment_is_immutable_even_from_a_stale_draft_instance(self):
+        draft = _draft(self.po, "10", self.user)
+        stale = PurchaseOrderPayment.objects.get(pk=draft.pk)
+        PurchaseOrderPayment.objects.filter(pk=draft.pk).update(
+            status=POSTED, posted_by=self.user, posted_at=timezone.now(),
+            payment_number=services.next_payment_number(),
+        )
+        stale.notes = "edited after posting"
+        with self.assertRaises(ValidationError):
+            stale.save()
+        with self.assertRaises(ValidationError):
+            stale.delete()
+        self.assertTrue(PurchaseOrderPayment.objects.filter(pk=draft.pk, notes="").exists())
+
+    def test_payment_account_name_unique_case_insensitive(self):
+        _account("Petty Cash")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            _account("petty cash")
+
+    def test_payment_account_in_use_cannot_be_deleted(self):
+        from django.db.models import ProtectedError
+
+        account = _account()
+        _entry(self.po, PAYMENT, "1", self.user, paid_through=account)
+        with self.assertRaises(ProtectedError):
+            account.delete()
+
+    def test_numbers_increase(self):
+        first, second = services.next_payment_number(), services.next_payment_number()
+        self.assertRegex(first, r"^SPAY-\d{6,}$")
+        self.assertGreater(int(second[5:]), int(first[5:]))
+
+
+class SupplierPaymentBackfillMigrationTests(TransactionTestCase):
+    """0007-0009 keep every existing entry financially identical."""
+
+    migrate_from = [("purchases", "0006_po_tax_treatment_and_payments")]
+    migrate_to = [("purchases", "0009_supplier_payment_drafts_constraints")]
+
+    def setUp(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.migrate_from)
+        old = self.executor.loader.project_state(self.migrate_from).apps
+        # Only purchases is rolled back; users, vendors and warehouses use the
+        # current models. PO and ledger rows use the 0006 historical models.
+        user = User.objects.create_user(username="mig", email="mig@example.com", password="x")
+        PO_ = old.get_model("purchases", "PurchaseOrder")
+        Pay = old.get_model("purchases", "PurchaseOrderPayment")
+        po = PO_.objects.create(
+            supplier_id=Supplier.objects.create(name="Mig Vendor").pk,
+            warehouse_id=Warehouse.objects.create(name="Mig WH").pk,
+            purchase_tax_treatment="no_gst_invoice", status="issued",
+        )
+        self.po_id = po.pk
+        today = timezone.localdate()
+        day = datetime.timedelta(days=1)
+
+        def make(entry_type, amount, date, **kw):
+            if entry_type != "reversal":
+                kw.setdefault("method", "cash")
+            return Pay.objects.create(
+                purchase_order=po, entry_type=entry_type, amount=Decimal(amount), entry_date=date,
+                recorded_by_id=user.pk, **kw,
+            )
+
+        later = make("payment", "300", today)            # newer date, lower id after next
+        earlier = make("payment", "200", today - 2 * day)
+        wrong = make("payment", "50", today - day)
+        make("reversal", "50", today, reverses=wrong, reversal_reason="wrong PO")
+        make("vendor_refund", "20", today)
+        self.ids = {"earlier": earlier.pk, "wrong": wrong.pk, "later": later.pk}
+        self.user_id = user.pk
+
+    def tearDown(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        MigrationExecutor(connection).migrate(MigrationExecutor(connection).loader.graph.leaf_nodes())
+
+    def test_backfill_keeps_totals_and_numbers_in_date_order(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(self.migrate_to)
+        po = PurchaseOrder.objects.get(pk=self.po_id)
+        summary = po.payment_summary()
+        # payments 300 + 200 (+50 reversed), refund 20 -> net 480
+        self.assertEqual(
+            (summary["gross_payments"], summary["vendor_refunds"], summary["reversals"], summary["net_paid"]),
+            (Decimal("550"), Decimal("20"), Decimal("50"), Decimal("480")),
+        )
+        annotated = selectors.annotate_payment_summary(PurchaseOrder.objects.filter(pk=po.pk)).get()
+        self.assertEqual(annotated.net_paid_db, Decimal("480"))
+        entries = PurchaseOrderPayment.objects.filter(purchase_order=po)
+        self.assertEqual(set(entries.values_list("status", flat=True)), {POSTED})
+        numbers = dict(entries.filter(entry_type=PAYMENT).values_list("pk", "payment_number"))
+        self.assertEqual(
+            [numbers[self.ids[k]] for k in ("earlier", "wrong", "later")],
+            ["SPAY-000001", "SPAY-000002", "SPAY-000003"],
+        )
+        self.assertFalse(entries.exclude(entry_type=PAYMENT).filter(payment_number__isnull=False).exists())
+        self.assertFalse(entries.filter(paid_through__isnull=False).exists())
+        self.assertFalse(entries.exclude(posted_by_id=self.user_id).exists())
+        self.assertFalse(entries.filter(posted_at__isnull=True).exists())
+        self.assertEqual(services.next_payment_number(), "SPAY-000004")
+
+
+class SupplierPaymentDraftLeakTests(_POBase):
+    """Mandatory (DEC-011): a draft never reaches any total, status, filter,
+    cap or guard. The draft is larger than the PO so any leak is visible."""
+
+    def setUp(self):
+        super().setUp()
+        self.account = _account()
+        self.po = self._po(purchase_tax_treatment=NO_GST)
+        self._line(self.po, quantity_ordered=1, unit_price=Decimal("1000"))
+        services.issue_purchase_order(self.po, self.user)
+        self.draft = _draft(self.po, "5000", self.user)
+
+    def _fresh(self):
+        return PurchaseOrder.objects.get(pk=self.po.pk)
+
+    def _annotated(self):
+        return selectors.annotate_payment_summary(PurchaseOrder.objects.filter(pk=self.po.pk)).get()
+
+    def _pay(self, amount):
+        return _entry(self.po, PAYMENT, amount, self.user, paid_through=self.account)
+
+    def test_properties_ignore_drafts(self):
+        self._pay("400")
+        po = self._fresh()
+        self.assertEqual(
+            (po.gross_payments, po.vendor_refunds, po.reversals, po.net_paid, po.remaining_against_po,
+             po.payment_status),
+            (Decimal("400"), Decimal("0"), Decimal("0"), Decimal("400"), Decimal("600.00"), "partially_paid"),
+        )
+
+    def test_unpaid_po_with_only_a_draft_is_unpaid(self):
+        po = self._fresh()
+        self.assertEqual((po.net_paid, po.payment_status), (Decimal("0"), "unpaid"))
+        annotated = self._annotated()
+        self.assertEqual((annotated.net_paid_db, annotated.payment_status_db), (Decimal("0"), "unpaid"))
+
+    def test_sql_annotation_ignores_drafts(self):
+        self._pay("400")
+        annotated = self._annotated()
+        self.assertEqual(
+            (annotated.ordered_gross_total_db, annotated.net_paid_db, annotated.payment_status_db),
+            (Decimal("1000.00"), Decimal("400"), "partially_paid"),
+        )
+
+    def test_admin_payment_status_filter_ignores_drafts(self):
+        self.client.force_login(self.user)
+        url = reverse("admin:purchases_purchaseorder_changelist")
+        self.assertEqual(set(self.client.get(url, {"payment_status": "unpaid"}).context["cl"].result_list), {self.po})
+        self.assertEqual(set(self.client.get(url, {"payment_status": "paid"}).context["cl"].result_list), set())
+
+    def test_refund_cap_ignores_drafts(self):
+        self._pay("400")
+        with self.assertRaisesMessage(services.SupplierPaymentError, "cannot exceed net paid (400"):
+            services.record_vendor_refund(
+                self.po, amount=Decimal("400.01"), entry_date=timezone.localdate(), method="cash",
+                reference="", notes="", user=self.user,
+            )
+
+    def test_reversal_caps_ignore_drafts(self):
+        payment = self._pay("1000")
+        refund = services.record_vendor_refund(
+            self.po, amount=Decimal("100"), entry_date=timezone.localdate(), method="cash",
+            reference="", notes="", user=self.user,
+        )
+        # Reversing the refund brings net back to exactly the total: allowed.
+        services.reverse_po_payment_entry(refund, reason="refund never arrived", user=self.user)
+        self.assertEqual(self._fresh().net_paid, Decimal("1000"))
+        services.reverse_po_payment_entry(payment, reason="wrong PO", user=self.user)
+        self.assertEqual(self._fresh().net_paid, Decimal("0"))
+
+    def test_drafts_are_not_reversible(self):
+        self.assertNotIn(self.draft, selectors.reversible_payment_entries(self.po))
+        with self.assertRaisesMessage(services.SupplierPaymentError, "draft"):
+            services.reverse_po_payment_entry(self.draft, reason="x", user=self.user)
+
+    def test_drafts_do_not_block_cancellation(self):
+        services.cancel_purchase_order(self.po, self.user, reason="vendor out of stock")
+        self.assertEqual(self._fresh().status, PurchaseOrder.STATUS_CANCELLED)
+
+    def test_ledger_sum_subquery_ignores_drafts(self):
+        from apps.purchases.selectors import _ledger_sum
+
+        value = PurchaseOrder.objects.filter(pk=self.po.pk).annotate(
+            total=_ledger_sum(PAYMENT, False),
+        ).values_list("total", flat=True).get()
+        self.assertEqual(value, Decimal("0.00"))
+
+
+class _PaymentServiceBase(_POBase):
+    def setUp(self):
+        super().setUp()
+        self.account = _account()
+        self.po = self._po(purchase_tax_treatment=NO_GST)
+        self._line(self.po, quantity_ordered=1, unit_price=Decimal("1000"))
+        services.issue_purchase_order(self.po, self.user)
+
+    def _fields(self, **overrides):
+        data = {
+            "amount": Decimal("400"), "entry_date": timezone.localdate(), "method": "upi",
+            "reference": "UTR-77", "notes": "", "paid_through": self.account,
+        }
+        data.update(overrides)
+        return data
+
+    def _create_draft(self, po=None, **overrides):
+        return services.create_payment_draft(po or self.po, user=self.user, **self._fields(**overrides))
+
+    def _post(self, draft=None, po=None, **overrides):
+        return services.post_payment(po or self.po, user=self.user, draft=draft, **self._fields(**overrides))
+
+    def _fresh(self):
+        return PurchaseOrder.objects.get(pk=self.po.pk)
+
+
+class SupplierPaymentDraftServiceTests(_PaymentServiceBase):
+    def test_create_draft(self):
+        draft = self._create_draft()
+        self.assertEqual(
+            (draft.status, draft.entry_type, draft.amount, draft.payment_number, draft.posted_by, draft.posted_at,
+             draft.paid_through, draft.recorded_by),
+            (DRAFT, PAYMENT, Decimal("400"), None, None, None, self.account, self.user),
+        )
+        self.assertEqual(self._fresh().net_paid, Decimal("0"))
+
+    def test_draft_allowed_on_payable_statuses_only(self):
+        for status in (PurchaseOrder.STATUS_DRAFT, PurchaseOrder.STATUS_CANCELLED):
+            PurchaseOrder.objects.filter(pk=self.po.pk).update(status=status)
+            with self.assertRaises(services.SupplierPaymentError, msg=status):
+                self._create_draft()
+        for status in PurchaseOrder.PAYABLE_STATUSES:
+            PurchaseOrder.objects.filter(pk=self.po.pk).update(status=status)
+            self._create_draft()
+        PurchaseOrder.objects.filter(pk=self.po.pk).update(purchase_tax_treatment=None)
+        with self.assertRaisesMessage(services.SupplierPaymentError, "tax treatment"):
+            self._create_draft()
+
+    def test_draft_validates_fields(self):
+        cases = (
+            ({"amount": Decimal("0")}, "greater than zero"),
+            ({"entry_date": timezone.localdate() + datetime.timedelta(days=1)}, "future"),
+            ({"reference": ""}, "reference"),
+            ({"paid_through": _account("Old Bank", "bank", is_active=False)}, "inactive"),
+        )
+        for overrides, message in cases:
+            with self.subTest(message=message), self.assertRaisesMessage(services.SupplierPaymentError, message):
+                self._create_draft(**overrides)
+
+    def test_draft_paid_through_optional_and_overpay_not_checked(self):
+        draft = self._create_draft(paid_through=None, amount=Decimal("5000"))
+        self.assertIsNone(draft.paid_through)
+
+    def test_update_draft(self):
+        draft = self._create_draft()
+        services.update_payment_draft(
+            draft, user=self.user, **self._fields(amount=Decimal("450"), method="cash", reference="", notes="n"),
+        )
+        draft.refresh_from_db()
+        self.assertEqual((draft.amount, draft.method, draft.notes, draft.status), (Decimal("450"), "cash", "n", DRAFT))
+
+    def test_update_and_delete_refused_once_posted(self):
+        draft = self._create_draft()
+        self._post(draft=draft)
+        with self.assertRaisesMessage(services.SupplierPaymentError, "posted"):
+            services.update_payment_draft(draft, user=self.user, **self._fields(amount=Decimal("1")))
+        with self.assertRaisesMessage(services.SupplierPaymentError, "posted"):
+            services.delete_payment_draft(draft, self.user)
+        self.assertEqual(PurchaseOrderPayment.objects.get(pk=draft.pk).amount, Decimal("400"))
+
+    def test_delete_draft(self):
+        draft = self._create_draft()
+        services.delete_payment_draft(draft, self.user)
+        self.assertFalse(PurchaseOrderPayment.objects.filter(pk=draft.pk).exists())
+
+    def test_drafts_on_cancelled_po_can_be_deleted_not_posted(self):
+        draft = self._create_draft()
+        services.cancel_purchase_order(self.po, self.user, reason="vendor out of stock")
+        with self.assertRaises(services.SupplierPaymentError):
+            self._post(draft=draft)
+        services.delete_payment_draft(draft, self.user)
+        self.assertFalse(PurchaseOrderPayment.objects.filter(pk=draft.pk).exists())
+
+
+class SupplierPaymentPostingTests(_PaymentServiceBase):
+    def _shape(self, entry):
+        return (entry.status, entry.entry_type, entry.amount, entry.method, entry.reference, entry.paid_through,
+                entry.posted_by, entry.recorded_by)
+
+    def test_direct_posting(self):
+        before = timezone.now()
+        entry = self._post()
+        self.assertEqual(self._shape(entry), (POSTED, PAYMENT, Decimal("400"), "upi", "UTR-77", self.account,
+                                              self.user, self.user))
+        self.assertRegex(entry.payment_number, r"^SPAY-\d{6,}$")
+        self.assertGreaterEqual(entry.posted_at, before)
+        self.assertEqual(self._fresh().net_paid, Decimal("400"))
+
+    def test_posting_a_draft_applies_edits_and_keeps_the_row(self):
+        draft = self._create_draft(paid_through=None)
+        entry = self._post(draft=draft, amount=Decimal("300"), notes="checked")
+        self.assertEqual(entry.pk, draft.pk)
+        self.assertEqual((entry.status, entry.amount, entry.notes, entry.paid_through), (POSTED, Decimal("300"),
+                                                                                        "checked", self.account))
+        self.assertIsNotNone(entry.payment_number)
+        self.assertEqual(self._fresh().net_paid, Decimal("300"))
+
+    def test_both_paths_give_the_same_shape(self):
+        direct = self._post(amount=Decimal("100"))
+        via_draft = self._post(draft=self._create_draft(amount=Decimal("100")), amount=Decimal("100"))
+        self.assertEqual(self._shape(direct), self._shape(via_draft))
+
+    def test_record_po_payment_is_the_direct_path(self):
+        entry = services.record_po_payment(
+            self.po, amount=Decimal("10"), entry_date=timezone.localdate(), method="cash", reference="",
+            notes="", user=self.user, paid_through=self.account,
+        )
+        self.assertEqual((entry.status, entry.paid_through), (POSTED, self.account))
+        self.assertIsNotNone(entry.payment_number)
+
+    def test_posting_requires_active_paid_through(self):
+        with self.assertRaisesMessage(services.SupplierPaymentError, "Paid through"):
+            self._post(paid_through=None)
+        with self.assertRaisesMessage(services.SupplierPaymentError, "inactive"):
+            self._post(paid_through=_account("Closed Bank", "bank", is_active=False))
+        draft = self._create_draft()
+        PaymentAccount.objects.filter(pk=self.account.pk).update(is_active=False)
+        self.account.refresh_from_db()
+        with self.assertRaisesMessage(services.SupplierPaymentError, "inactive"):
+            self._post(draft=draft)
+
+    def test_posting_revalidates_date_and_reference(self):
+        draft = self._create_draft()
+        with self.assertRaisesMessage(services.SupplierPaymentError, "future"):
+            self._post(draft=draft, entry_date=timezone.localdate() + datetime.timedelta(days=1))
+        with self.assertRaisesMessage(services.SupplierPaymentError, "reference"):
+            self._post(draft=draft, reference="")
+
+    def test_failed_post_leaves_the_draft_untouched(self):
+        draft = self._create_draft()
+        with self.assertRaises(services.SupplierPaymentError):
+            self._post(draft=draft, amount=Decimal("1000.01"))
+        draft.refresh_from_db()
+        self.assertEqual((draft.status, draft.amount, draft.payment_number), (DRAFT, Decimal("400"), None))
+
+    def test_overpayment_uses_posted_net_and_ignores_other_drafts(self):
+        self._create_draft(amount=Decimal("5000"), paid_through=None)
+        self._post(amount=Decimal("900"))
+        with self.assertRaisesMessage(services.SupplierPaymentError, "exceed"):
+            self._post(amount=Decimal("100.01"))
+        self._post(amount=Decimal("100"))
+        self.assertEqual(self._fresh().payment_status, "paid")
+
+    def test_double_post_of_the_same_draft_is_refused(self):
+        draft = self._create_draft()
+        first = self._post(draft=draft)
+        with self.assertRaisesMessage(services.SupplierPaymentError, "already posted"):
+            self._post(draft=PurchaseOrderPayment.objects.get(pk=draft.pk))
+        self.assertEqual(PurchaseOrderPayment.objects.get(pk=draft.pk).payment_number, first.payment_number)
+        self.assertEqual(self._fresh().net_paid, Decimal("400"))
+
+    def test_draft_of_another_po_is_refused(self):
+        other = self._po(purchase_tax_treatment=NO_GST)
+        self._line(other, quantity_ordered=1, unit_price=Decimal("1000"))
+        services.issue_purchase_order(other, self.user)
+        draft = self._create_draft(po=other)
+        with self.assertRaises(services.SupplierPaymentError):
+            self._post(draft=draft)
+
+    def test_refunds_and_reversals_are_posted_and_unnumbered(self):
+        self._post()
+        refund = services.record_vendor_refund(
+            self.po, amount=Decimal("50"), entry_date=timezone.localdate(), method="cash",
+            reference="", notes="", user=self.user,
+        )
+        reversal = services.reverse_po_payment_entry(refund, reason="refund not received", user=self.user)
+        for entry in (refund, reversal):
+            self.assertEqual((entry.status, entry.payment_number, entry.posted_by), (POSTED, None, self.user))
+
+    def test_numbers_unique_and_increasing_and_drafts_consume_none(self):
+        first = self._post(amount=Decimal("10"))
+        draft = self._create_draft(amount=Decimal("10"))
+        services.delete_payment_draft(draft, self.user)
+        second = self._post(amount=Decimal("10"))
+        self.assertEqual(int(second.payment_number[5:]), int(first.payment_number[5:]) + 1)
+
+
+class SupplierPaymentPostingConcurrencyTests(TransactionTestCase):
+    def setUp(self):
+        Warehouse.objects.filter(is_default=True).delete()
+        warehouse = Warehouse.objects.create(name="Smerfume Default", is_default=True)
+        self.user = User.objects.create_superuser(
+            username="postconc", email="postconc@example.com", password="testpass123",
+        )
+        self.account = _account()
+        self.po = PurchaseOrder.objects.create(
+            supplier=Supplier.objects.create(name="Post Vendor"), warehouse=warehouse,
+            purchase_tax_treatment=NO_GST,
+        )
+        PurchaseOrderLine.objects.create(
+            purchase_order=self.po, variant=_variant("SKU-POST-CONC"), quantity_ordered=1,
+            unit_price=Decimal("1000"),
+        )
+        services.issue_purchase_order(self.po, self.user)
+
+    def _draft(self, amount):
+        return services.create_payment_draft(
+            self.po, amount=Decimal(amount), entry_date=timezone.localdate(), method="cash", reference="",
+            notes="", paid_through=self.account, user=self.user,
+        )
+
+    def _race(self, *callables):
+        results = []
+        barrier = threading.Barrier(len(callables))
+
+        def run(fn):
+            barrier.wait()
+            try:
+                fn()
+                results.append("ok")
+            except services.SupplierPaymentError:
+                results.append("refused")
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=run, args=(fn,)) for fn in callables]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return sorted(results)
+
+    def _post(self, draft):
+        return lambda: services.post_payment(
+            self.po, draft=draft, amount=draft.amount,
+            entry_date=draft.entry_date, method=draft.method, reference="", notes="",
+            paid_through=self.account, user=self.user,
+        )
+
+    def test_two_drafts_that_overpay_together_post_once(self):
+        a, b = self._draft("600"), self._draft("600")
+        self.assertEqual(self._race(self._post(a), self._post(b)), ["ok", "refused"])
+        self.assertEqual(PurchaseOrder.objects.get(pk=self.po.pk).net_paid, Decimal("600"))
+        self.assertEqual(PurchaseOrderPayment.objects.posted().filter(purchase_order=self.po).count(), 1)
+
+    def test_same_draft_posted_twice_at_once_posts_once(self):
+        draft = self._draft("300")
+        self.assertEqual(self._race(self._post(draft), self._post(draft)), ["ok", "refused"])
+        self.assertEqual(PurchaseOrder.objects.get(pk=self.po.pk).net_paid, Decimal("300"))
+        self.assertIsNotNone(PurchaseOrderPayment.objects.get(pk=draft.pk).payment_number)
+
+    def test_delete_and_post_racing_leave_one_outcome(self):
+        draft = self._draft("300")
+        results = self._race(
+            self._post(draft),
+            lambda: services.delete_payment_draft(draft, self.user),
+        )
+        self.assertEqual(results, ["ok", "refused"])
+        row = PurchaseOrderPayment.objects.filter(pk=draft.pk).first()
+        if row is None:
+            self.assertEqual(PurchaseOrder.objects.get(pk=self.po.pk).net_paid, Decimal("0"))
+        else:
+            self.assertEqual((row.status, PurchaseOrder.objects.get(pk=self.po.pk).net_paid), (POSTED, Decimal("300")))
+
+
+def _image_bytes(fmt):
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 4), "red").save(buffer, format=fmt)
+    return buffer.getvalue()
+
+
+_PDF_BYTES = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
+
+
+def _upload(name="proof.pdf", content=_PDF_BYTES, content_type="application/pdf"):
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    return SimpleUploadedFile(name, content, content_type=content_type)
+
+
+class _PrivateStorageMixin:
+    """Point the private_documents storage at a throwaway directory."""
+
+    def setUp(self):
+        import tempfile
+
+        super().setUp()
+        from django.core.files.storage import FileSystemStorage
+
+        self._media_dir = tempfile.mkdtemp()
+        # The field resolves its callable storage once at import, so patch the field.
+        patcher = mock.patch.object(
+            SupplierPaymentAttachment._meta.get_field("file"), "storage", FileSystemStorage(location=self._media_dir),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self._media_dir, ignore_errors=True)
+        super().tearDown()
+
+    def _stored_files(self):
+        import os
+
+        return [name for _, _, names in os.walk(self._media_dir) for name in names]
+
+
+class SupplierPaymentAttachmentValidationTests(_PrivateStorageMixin, _PaymentServiceBase):
+    def test_accepts_pdf_jpeg_png_webp_by_content(self):
+        draft = self._create_draft()
+        uploads = [
+            _upload("a.pdf"),
+            _upload("b.jpg", _image_bytes("JPEG"), "image/jpeg"),
+            _upload("c.png", _image_bytes("PNG"), "image/png"),
+            # Browser label and extension are ignored: content decides.
+            _upload("d.bin", _image_bytes("WEBP"), "application/octet-stream"),
+        ]
+        attachments = services.add_payment_attachments(draft, uploads, self.user)
+        self.assertEqual(
+            [a.content_type for a in attachments], ["application/pdf", "image/jpeg", "image/png", "image/webp"],
+        )
+        self.assertEqual(len(self._stored_files()), 4)
+
+    def test_rejects_spoofed_type(self):
+        draft = self._create_draft()
+        for upload in (
+            _upload("invoice.pdf", b"MZ\x90\x00 not really a pdf", "application/pdf"),
+            _upload("photo.png", b"<svg xmlns='http://www.w3.org/2000/svg'/>", "image/png"),
+            _upload("anim.gif", _image_bytes("GIF"), "image/gif"),
+        ):
+            with self.subTest(upload.name), self.assertRaisesMessage(
+                services.SupplierPaymentError, "not a PDF, JPEG, PNG or WebP",
+            ):
+                services.add_payment_attachments(draft, [upload], self.user)
+        self.assertFalse(SupplierPaymentAttachment.objects.exists())
+        self.assertEqual(self._stored_files(), [])
+
+    def test_rejects_oversize_before_reading(self):
+        draft = self._create_draft()
+        upload = mock.Mock()
+        upload.name, upload.size = "huge.pdf", SupplierPaymentAttachment.MAX_SIZE + 1
+        upload.read.side_effect = AssertionError("content must not be read")
+        with self.assertRaisesMessage(services.SupplierPaymentError, "larger than 5 MB"):
+            services.add_payment_attachments(draft, [upload], self.user)
+
+    def test_rejects_empty_file(self):
+        with self.assertRaisesMessage(services.SupplierPaymentError, "empty"):
+            services.add_payment_attachments(self._create_draft(), [_upload(content=b"")], self.user)
+
+    def test_at_most_five_per_payment_in_total(self):
+        draft = self._create_draft()
+        services.add_payment_attachments(draft, [_upload() for _ in range(3)], self.user)
+        with self.assertRaisesMessage(services.SupplierPaymentError, "at most 5"):
+            services.add_payment_attachments(draft, [_upload() for _ in range(3)], self.user)
+        services.add_payment_attachments(draft, [_upload(), _upload()], self.user)
+        self.assertEqual(draft.attachments.count(), 5)
+
+    def test_one_bad_file_rejects_the_whole_batch(self):
+        draft = self._create_draft()
+        with self.assertRaises(services.SupplierPaymentError):
+            services.add_payment_attachments(draft, [_upload(), _upload("x.pdf", b"nope")], self.user)
+        self.assertFalse(SupplierPaymentAttachment.objects.exists())
+        self.assertEqual(self._stored_files(), [])
+
+    def test_stored_name_is_random_and_original_name_sanitized(self):
+        draft = self._create_draft()
+        (attachment,) = services.add_payment_attachments(
+            draft, [_upload("../../etc/évil name<script>.pdf")], self.user,
+        )
+        self.assertNotIn("..", attachment.original_name)
+        self.assertNotIn("/", attachment.original_name)
+        self.assertNotIn("<", attachment.original_name)
+        self.assertRegex(attachment.file.name, r"^supplier-payments/\d{4}/\d{2}/[0-9a-f]{32}\.pdf$")
+        self.assertEqual((attachment.size, attachment.uploaded_by), (len(_PDF_BYTES), self.user))
+
+    def test_refunds_cannot_carry_proof(self):
+        self._post()
+        refund = services.record_vendor_refund(
+            self.po, amount=Decimal("10"), entry_date=timezone.localdate(), method="cash", reference="",
+            notes="", user=self.user,
+        )
+        with self.assertRaisesMessage(services.SupplierPaymentError, "supplier payments only"):
+            services.add_payment_attachments(refund, [_upload()], self.user)
+
+
+
+class SupplierPaymentPrivateStorageTests(TestCase):
+    def test_proof_uses_private_storage_outside_public_media(self):
+        storage = SupplierPaymentAttachment._meta.get_field("file").storage
+        options = settings.STORAGES["private_documents"]["OPTIONS"]
+        self.assertEqual(storage.location, str(settings.PRIVATE_MEDIA_ROOT))
+        self.assertNotEqual(str(settings.PRIVATE_MEDIA_ROOT), str(settings.MEDIA_ROOT))
+        self.assertIsNone(options.get("base_url"))
+
+
+class SupplierPaymentAttachmentLifecycleTests(_PrivateStorageMixin, _PaymentServiceBase):
+    def test_draft_attachment_can_be_removed_and_file_deleted_on_commit(self):
+        draft = self._create_draft()
+        (attachment,) = services.add_payment_attachments(draft, [_upload()], self.user)
+        with self.captureOnCommitCallbacks(execute=True):
+            services.remove_payment_attachment(attachment, self.user)
+        self.assertFalse(SupplierPaymentAttachment.objects.exists())
+        self.assertEqual(self._stored_files(), [])
+
+    def test_posted_payment_is_add_only(self):
+        draft = self._create_draft()
+        (first,) = services.add_payment_attachments(draft, [_upload()], self.user)
+        self._post(draft=draft)
+        services.add_payment_attachments(draft, [_upload()], self.user)
+        self.assertEqual(draft.attachments.count(), 2)
+        with self.assertRaisesMessage(services.SupplierPaymentError, "cannot be removed"):
+            services.remove_payment_attachment(first, self.user)
+        with self.assertRaises(ValidationError):
+            SupplierPaymentAttachment.objects.get(pk=first.pk).delete()
+        self.assertEqual(len(self._stored_files()), 2)
+
+    def test_proof_survives_posting(self):
+        draft = self._create_draft()
+        services.add_payment_attachments(draft, [_upload(), _upload()], self.user)
+        entry = self._post(draft=draft)
+        self.assertEqual(entry.attachments.count(), 2)
+
+    def test_deleting_a_draft_deletes_its_proof(self):
+        draft = self._create_draft()
+        services.add_payment_attachments(draft, [_upload(), _upload()], self.user)
+        with self.captureOnCommitCallbacks(execute=True):
+            services.delete_payment_draft(draft, self.user)
+        self.assertFalse(SupplierPaymentAttachment.objects.exists())
+        self.assertEqual(self._stored_files(), [])
+
+    def test_rolled_back_removal_keeps_the_file(self):
+        draft = self._create_draft()
+        (attachment,) = services.add_payment_attachments(draft, [_upload()], self.user)
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            services.remove_payment_attachment(attachment, self.user)
+        self.assertEqual(len(callbacks), 1)
+        self.assertEqual(len(self._stored_files()), 1)
+
+
+class SupplierPaymentAttachmentAccessTests(_PrivateStorageMixin, _PaymentServiceBase):
+    def setUp(self):
+        super().setUp()
+        draft = self._create_draft()
+        (self.attachment,) = services.add_payment_attachments(draft, [_upload("bank slip.pdf")], self.user)
+        self.url = reverse("admin:purchases_supplierpaymentattachment_download", args=[self.attachment.public_id])
+
+    def test_viewer_downloads_as_attachment(self):
+        self.client.force_login(_purchases_staff("proofviewer", "view_purchaseorderpayment"))
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(b"".join(resp.streaming_content), _PDF_BYTES)
+        self.assertIn("attachment;", resp["Content-Disposition"])
+        self.assertIn("bank_slip.pdf", resp["Content-Disposition"])
+        self.assertEqual((resp["Content-Type"], resp["X-Content-Type-Options"]), ("application/pdf", "nosniff"))
+        self.assertIn("no-store", resp["Cache-Control"])
+
+    def test_staff_without_view_permission_refused(self):
+        self.client.force_login(_purchases_staff("noproof", "view_purchaseorder"))
+        self.assertEqual(self.client.get(self.url).status_code, 403)
+
+    def test_anonymous_redirected_to_login(self):
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("login", resp["Location"])
+
+    def test_unknown_attachment_404(self):
+        import uuid
+
+        self.client.force_login(self.user)
+        url = reverse("admin:purchases_supplierpaymentattachment_download", args=[uuid.uuid4()])
+        self.assertEqual(self.client.get(url).status_code, 404)
+
+    def test_url_uses_public_id_not_storage_path(self):
+        self.assertTrue(self.url.endswith(f"/attachment/{self.attachment.public_id}/"))
+        self.assertNotIn(self.attachment.file.name, self.url)
+
+
+class SupplierPaymentFormAdminTests(_PrivateStorageMixin, _PaymentServiceBase):
+    """DEC-011 Record Payment page, entry page and permission matrix."""
+
+    VIEW = ("view_purchaseorder", "view_purchaseorderpayment")
+
+    def _staff(self, username, *codenames):
+        return _purchases_staff(username, *self.VIEW, *codenames)
+
+    def _record_url(self):
+        return reverse("admin:purchases_purchaseorder_record_payment", args=[self.po.pk])
+
+    def _entry_url(self, entry):
+        return reverse("admin:purchases_purchaseorder_payment_entry", args=[entry.public_id])
+
+    def _data(self, button, **overrides):
+        data = {
+            "amount": "400.00", "entry_date": timezone.localdate().isoformat(), "method": "upi",
+            "reference": "UTR-55", "notes": "", "paid_through": self.account.pk, button: "1",
+        }
+        data.update(overrides)
+        return data
+
+    # Permission matrix -------------------------------------------------
+
+    def test_permission_matrix_on_record_page(self):
+        cases = (
+            ((), 403, False, False),
+            (("record_po_payment",), 200, True, False),
+            (("post_po_payment",), 200, False, True),
+            (("record_po_payment", "post_po_payment"), 200, True, True),
+        )
+        for index, (perms, status, sees_draft, sees_paid) in enumerate(cases):
+            with self.subTest(perms=perms):
+                self.client.force_login(self._staff(f"matrix{index}", *perms))
+                resp = self.client.get(self._record_url())
+                self.assertEqual(resp.status_code, status)
+                if status == 200:
+                    self.assertEqual('name="_draft"' in resp.content.decode(), sees_draft)
+                    self.assertEqual('name="_post"' in resp.content.decode(), sees_paid)
+
+    def test_server_side_checks_ignore_hidden_buttons(self):
+        self.client.force_login(self._staff("drafter", "record_po_payment"))
+        self.assertEqual(self.client.post(self._record_url(), self._data("_post")).status_code, 403)
+        self.client.force_login(self._staff("poster", "post_po_payment"))
+        self.assertEqual(self.client.post(self._record_url(), self._data("_draft")).status_code, 403)
+        self.assertFalse(PurchaseOrderPayment.objects.exists())
+
+    def test_drafter_saves_draft_and_poster_posts_it(self):
+        self.client.force_login(self._staff("drafter2", "record_po_payment"))
+        resp = self.client.post(self._record_url(), self._data("_draft", paid_through=""))
+        self.assertRedirects(resp, reverse("admin:purchases_purchaseorder_change", args=[self.po.pk]),
+                             fetch_redirect_response=False)
+        draft = PurchaseOrderPayment.objects.get()
+        self.assertEqual((draft.status, draft.payment_number, draft.paid_through), (DRAFT, None, None))
+        self.assertEqual(self.client.post(self._entry_url(draft), self._data("_post")).status_code, 403)
+
+        poster = self._staff("poster2", "post_po_payment")
+        self.client.force_login(poster)
+        self.client.post(self._entry_url(draft), self._data("_post", amount="350.00"))
+        draft.refresh_from_db()
+        self.assertEqual((draft.status, draft.amount, draft.posted_by), (POSTED, Decimal("350.00"), poster))
+        self.assertIsNotNone(draft.payment_number)
+        self.assertEqual(self._fresh().net_paid, Decimal("350.00"))
+
+    def test_edit_and_delete_draft_need_record_permission(self):
+        draft = self._create_draft()
+        self.client.force_login(self._staff("poster3", "post_po_payment"))
+        self.assertEqual(self.client.post(self._entry_url(draft), {"_delete": "1"}).status_code, 403)
+        self.assertEqual(self.client.post(self._entry_url(draft), self._data("_draft")).status_code, 403)
+        self.client.force_login(self._staff("drafter3", "record_po_payment"))
+        self.client.post(self._entry_url(draft), self._data("_draft", amount="420.00", reference="UTR-56"))
+        draft.refresh_from_db()
+        self.assertEqual((draft.amount, draft.reference, draft.status), (Decimal("420.00"), "UTR-56", DRAFT))
+        self.client.post(self._entry_url(draft), {"_delete": "1"})
+        self.assertFalse(PurchaseOrderPayment.objects.exists())
+
+    def test_viewer_without_payment_view_permission_cannot_open_entry(self):
+        draft = self._create_draft()
+        self.client.force_login(_purchases_staff("poonly", "view_purchaseorder", "record_po_payment"))
+        self.assertEqual(self.client.get(self._entry_url(draft)).status_code, 403)
+
+    def test_posted_entry_is_read_only_and_add_only(self):
+        entry = self._post()
+        services.add_payment_attachments(entry, [_upload("first.pdf")], self.user)
+        self.client.force_login(self._staff("finance9", "record_po_payment", "post_po_payment"))
+        resp = self.client.get(self._entry_url(entry))
+        self.assertContains(resp, entry.payment_number)
+        self.assertNotContains(resp, 'name="amount"')
+        self.assertNotContains(resp, 'name="_remove_attachment"')
+        self.assertNotContains(resp, 'name="_delete"')
+        self.assertContains(resp, 'name="_add_proof"')
+        self.client.post(self._entry_url(entry), {"_add_proof": "1", "attachments": [_upload("second.pdf")]})
+        self.assertEqual(entry.attachments.count(), 2)
+        removed = entry.attachments.first()
+        self.assertEqual(
+            self.client.post(self._entry_url(entry), {"_remove_attachment": str(removed.public_id)}).status_code, 403,
+        )
+        self.assertEqual(self.client.post(self._entry_url(entry), {"_delete": "1"}).status_code, 403)
+        self.assertEqual(entry.attachments.count(), 2)
+        self.assertEqual(PurchaseOrderPayment.objects.get(pk=entry.pk).amount, Decimal("400"))
+
+    def test_draft_attachments_can_be_added_and_removed_from_the_page(self):
+        self.client.force_login(self._staff("drafter4", "record_po_payment"))
+        self.client.post(self._record_url(), {**self._data("_draft"), "attachments": [_upload(), _upload("b.pdf")]})
+        draft = PurchaseOrderPayment.objects.get()
+        self.assertEqual(draft.attachments.count(), 2)
+        target = draft.attachments.first()
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(self._entry_url(draft), {"_remove_attachment": str(target.public_id)})
+        self.assertEqual(draft.attachments.count(), 1)
+        self.assertEqual(len(self._stored_files()), 1)
+
+    def test_enter_key_default_is_save_as_draft_and_never_remove(self):
+        import re
+
+        draft = self._create_draft()
+        services.add_payment_attachments(draft, [_upload()], self.user)
+        self.client.force_login(self._staff("finance15", "record_po_payment", "post_po_payment"))
+        content = self.client.get(self._entry_url(draft)).content.decode()
+        main_form = content[content.index('enctype="multipart/form-data"'):]
+        main_form = main_form[:main_form.index("</form>")]
+        submit_buttons = re.findall(r'<button type="submit"([^>]*)>', main_form)
+        first_own = next(attrs for attrs in submit_buttons if "form=" not in attrs)
+        self.assertIn('name="_draft"', first_own)
+        for name in ("_remove_attachment", "_delete"):
+            attrs = next(a for a in submit_buttons if f'name="{name}"' in a)
+            self.assertIn('form="payment-housekeeping"', attrs)
+
+    # Form state preservation -------------------------------------------
+
+    def test_service_refusal_keeps_values_and_asks_for_files_again(self):
+        self.client.force_login(self._staff("finance10", "record_po_payment", "post_po_payment"))
+        resp = self.client.post(self._record_url(), {
+            **self._data("_post", amount="5000.00", reference="UTR-KEEP-ME", notes="keep these notes"),
+            "attachments": [_upload("slip.pdf")],
+        })
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "exceed")
+        self.assertContains(resp, 'value="5000.00"')
+        self.assertContains(resp, 'value="UTR-KEEP-ME"')
+        self.assertContains(resp, "keep these notes")
+        self.assertContains(resp, f'<option value="{self.account.pk}" selected>')
+        self.assertContains(resp, "select the attachment files again")
+        self.assertFalse(PurchaseOrderPayment.objects.exists())
+        self.assertFalse(SupplierPaymentAttachment.objects.exists())
+        self.assertEqual(self._stored_files(), [])
+
+    def test_bad_attachment_rolls_back_the_payment(self):
+        self.client.force_login(self._staff("finance11", "record_po_payment", "post_po_payment"))
+        resp = self.client.post(self._record_url(), {
+            **self._data("_post"), "attachments": [_upload("fake.pdf", b"not a pdf")],
+        })
+        self.assertContains(resp, "not a PDF, JPEG, PNG or WebP")
+        self.assertContains(resp, 'value="UTR-55"')
+        self.assertFalse(PurchaseOrderPayment.objects.exists())
+        self.assertEqual(self._fresh().net_paid, Decimal("0"))
+
+    def test_form_errors_keep_values_without_file_message_when_no_files(self):
+        self.client.force_login(self._staff("finance12", "record_po_payment", "post_po_payment"))
+        resp = self.client.post(self._record_url(), self._data("_post", amount="", reference="UTR-STAY"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, 'value="UTR-STAY"')
+        self.assertNotContains(resp, "select the attachment files again")
+
+    def test_more_than_five_files_refused_by_the_form(self):
+        self.client.force_login(self._staff("finance13", "record_po_payment"))
+        files = [_upload() for _ in range(6)]
+        resp = self.client.post(self._record_url(), {**self._data("_draft"), "attachments": files})
+        self.assertContains(resp, "at most 5 attachments")
+        self.assertFalse(PurchaseOrderPayment.objects.exists())
+
+    # Form rendering ----------------------------------------------------
+
+    def test_form_fields_widgets_and_active_accounts_only(self):
+        _account("Closed Account", "bank", is_active=False)
+        self.client.force_login(self._staff("finance14", "record_po_payment", "post_po_payment"))
+        resp = self.client.get(self._record_url())
+        content = resp.content.decode()
+        for label in ("Payment date", "Payment mode", "Paid through", "Reference", "Notes", "Attachments",
+                      "Save as Draft", "Save as Paid", "Cancel", "Remaining against PO (operational)",
+                      "Drafts (not counted)"):
+            self.assertIn(label, content)
+        self.assertNotIn("Payment Made on", content)
+        self.assertNotIn("Closed Account", content)
+        self.assertIn('enctype="multipart/form-data"', content)
+        self.assertIn('name="attachments"', content)
+        self.assertIn("multiple", content)
+        # The amount input uses the Unfold widget (styled, visible), not a bare number input.
+        amount = SupplierPaymentEntryForm(existing_count=0).fields["amount"].widget
+        self.assertIsInstance(amount, UnfoldAdminDecimalFieldWidget)
+        self.assertIn("border", amount.attrs.get("class", ""))
+
+    # Lists and panels --------------------------------------------------
+
+    def test_po_panel_separates_drafts_and_shows_numbers(self):
+        posted = self._post(amount=Decimal("100"))
+        self._create_draft(amount=Decimal("700"), paid_through=None)
+        self.client.force_login(self.user)
+        resp = self.client.get(reverse("admin:purchases_purchaseorder_change", args=[self.po.pk]))
+        self.assertContains(resp, posted.payment_number)
+        self.assertContains(resp, "Draft payments (not counted in net paid or payment status)")
+        self.assertContains(resp, "Edit draft")
+        self.assertContains(resp, "900.00")  # remaining against PO ignores the 700 draft
+
+    def test_ledger_list_columns_and_status_labels(self):
+        paid = self._post(amount=Decimal("100"))
+        reversed_entry = self._post(amount=Decimal("50"))
+        services.reverse_po_payment_entry(reversed_entry, reason="duplicate", user=self.user)
+        self._create_draft(amount=Decimal("10"), paid_through=None)
+        PurchaseOrderPayment.objects.filter(pk=paid.pk).update(paid_through=None)  # legacy row
+        self.client.force_login(self.user)
+        resp = self.client.get(reverse("admin:purchases_purchaseorderpayment_changelist"))
+        content = resp.content.decode()
+        cl = resp.context["cl"]
+        labels = [capfirst(label_for_field(name, PurchaseOrderPayment, cl.model_admin)) for name in cl.list_display]
+        self.assertEqual(labels, ["Payment #", "Date", "Vendor", "PO", "Type", "Status", "Mode", "Paid through",
+                                  "Reference", "Amount"])
+        for text in ("Draft (edit)", "Reversed", "Paid", "Posted", "Not recorded", paid.payment_number):
+            self.assertIn(text, content)
+        resp = self.client.get(
+            reverse("admin:purchases_purchaseorderpayment_changelist"), {"q": paid.payment_number},
+        )
+        self.assertEqual(resp.context["cl"].result_count, 1)
+
+    def test_payment_account_admin_has_no_delete(self):
+        self.client.force_login(self.user)
+        url = reverse("admin:purchases_paymentaccount_delete", args=[self.account.pk])
+        self.assertEqual(self.client.post(url, {"post": "yes"}).status_code, 403)
+        self.assertTrue(PaymentAccount.objects.filter(pk=self.account.pk).exists())
+
+    # Query-count stability ---------------------------------------------
+
+    def _count_queries(self, url):
+        with CaptureQueriesContext(connection) as ctx:
+            self.assertEqual(self.client.get(url).status_code, 200)
+        return len(ctx)
+
+    def test_query_counts_do_not_grow_with_entries(self):
+        self.client.force_login(self.user)
+        po_url = reverse("admin:purchases_purchaseorder_change", args=[self.po.pk])
+        list_url = reverse("admin:purchases_purchaseorderpayment_changelist")
+        self._post(amount=Decimal("10"))
+        self._create_draft(amount=Decimal("10"))
+        self.client.get(po_url)  # warm caches (content types, sessions)
+        baseline = (self._count_queries(po_url), self._count_queries(list_url), self._count_queries(self._record_url()))
+        for _ in range(4):
+            entry = self._post(amount=Decimal("10"))
+            services.add_payment_attachments(entry, [_upload()], self.user)
+            self._create_draft(amount=Decimal("10"))
+        services.reverse_po_payment_entry(entry, reason="dup", user=self.user)
+        after = (self._count_queries(po_url), self._count_queries(list_url), self._count_queries(self._record_url()))
+        self.assertEqual(baseline, after)
 
 
 # ── Draft PO line editing through the admin change form ─────────────────────
@@ -3768,123 +4818,3 @@ class DraftLineEditingAdminTests(_POBase):
         with self.assertRaises(services.PurchaseOrderError):
             services.issue_purchase_order(po, self.user)
         self.assertEqual(PurchaseOrder.objects.get(pk=po.pk).status, PurchaseOrder.STATUS_DRAFT)
-
-
-# ── DEC-011: vendor bill, due date, balance due and Overdue on the PO list ──
-
-
-class PurchaseOrderVendorBillTests(AdminQueryCountMixin, _POBase):
-    def setUp(self):
-        super().setUp()
-        self.supplier.payment_terms_days = 30
-        self.supplier.save()
-        self.po = self._po(purchase_tax_treatment=NO_GST)
-        self._line(self.po, quantity_ordered=1, unit_price=Decimal("1000"))
-        services.issue_purchase_order(self.po, self.user)
-        self.po.refresh_from_db()
-        self.today = timezone.localdate()
-
-    def _set_due(self, days_from_today):
-        PurchaseOrder.objects.filter(pk=self.po.pk).update(
-            bill_number="INV-77", bill_date=self.today - datetime.timedelta(days=60),
-            payment_due_date=self.today + datetime.timedelta(days=days_from_today),
-        )
-
-    def _pay(self, amount):
-        services.record_po_payment(
-            self.po, amount=Decimal(amount), entry_date=self.today, method="cash",
-            reference="", notes="", user=self.user,
-        )
-
-    def _annotated(self):
-        return selectors.annotate_payment_summary(PurchaseOrder.objects.filter(pk=self.po.pk)).get()
-
-    def test_due_date_defaults_to_bill_date_plus_vendor_terms(self):
-        self.po.bill_date = self.today
-        self.po.full_clean()
-        self.assertEqual(self.po.payment_due_date, self.today + datetime.timedelta(days=30))
-
-    def test_explicit_due_date_is_kept_and_validated(self):
-        self.po.bill_date = self.today
-        self.po.payment_due_date = self.today + datetime.timedelta(days=5)
-        self.po.full_clean()
-        self.assertEqual(self.po.payment_due_date, self.today + datetime.timedelta(days=5))
-        self.po.payment_due_date = self.today - datetime.timedelta(days=1)
-        with self.assertRaises(ValidationError):
-            self.po.full_clean()
-
-    def test_due_date_needs_bill_date(self):
-        self.po.payment_due_date = self.today
-        with self.assertRaises(ValidationError):
-            self.po.full_clean()
-
-    def test_bill_fields_editable_after_issue_but_not_in_draft_or_cancelled(self):
-        for field in PurchaseOrder.BILL_FIELDS:
-            self.assertIn(field, self.po.editable_fields())
-            self.assertNotIn(field, PurchaseOrder.EDITABLE_DRAFT_FIELDS)
-            self.assertNotIn(field, PurchaseOrder.EDITABLE_CANCELLED_FIELDS)
-        self.po.status = PurchaseOrder.STATUS_CANCELLED
-        self.assertEqual(self.po.editable_fields(), ("notes",))
-
-    def test_overdue_when_unpaid_or_partly_paid_past_due(self):
-        self._set_due(-1)
-        self.assertEqual(self._annotated().payment_status_db, "overdue")
-        self._pay("400")
-        po = self._annotated()
-        self.assertEqual((po.payment_status_db, po.balance_due_db), ("overdue", Decimal("600.00")))
-        self.assertEqual(PurchaseOrder.objects.get(pk=self.po.pk).payment_status, "overdue")
-
-    def test_not_overdue_on_due_date_or_when_paid(self):
-        self._set_due(0)
-        self.assertEqual(self._annotated().payment_status_db, "unpaid")
-        self._set_due(-1)
-        self._pay("1000")
-        po = self._annotated()
-        self.assertEqual((po.payment_status_db, po.balance_due_db), ("paid", Decimal("0.00")))
-
-    def test_cancelled_po_is_never_overdue(self):
-        services.cancel_purchase_order(self.po, self.user, reason="vendor out of stock")
-        self._set_due(-1)
-        self.assertEqual(self._annotated().payment_status_db, "unpaid")
-
-    def test_balance_due_unknown_while_unclassified(self):
-        legacy = self._po(purchase_tax_treatment=None)
-        self._line(legacy)
-        po = selectors.annotate_payment_summary(PurchaseOrder.objects.filter(pk=legacy.pk)).get()
-        self.assertIsNone(po.balance_due_db)
-
-    def test_sql_status_matches_property_with_due_dates(self):
-        self._set_due(-3)
-        self._pay("100")
-        po = self._annotated()
-        fresh = PurchaseOrder.objects.get(pk=self.po.pk)
-        self.assertEqual(po.payment_status_db, fresh.payment_status)
-        self.assertEqual(po.balance_due_db, fresh.remaining_against_po)
-
-    def test_changelist_columns_filter_and_search(self):
-        self._set_due(-1)
-        other = self._po(purchase_tax_treatment=NO_GST)
-        self.client.force_login(self.user)
-        url = reverse("admin:purchases_purchaseorder_changelist")
-        resp = self.client.get(url)
-        columns = list(resp.context["cl"].list_display)
-        for column in (
-            "order_date", "bill_number_display", "vendor_reference_display", "supplier",
-            "payment_status_label", "payment_due_date", "ordered_gross_total_display",
-            "balance_due_display",
-        ):
-            self.assertIn(column, columns)
-        self.assertContains(resp, "INV-77")
-        self.assertContains(resp, "Overdue")
-        overdue = set(self.client.get(url, {"payment_status": "overdue"}).context["cl"].result_list)
-        self.assertEqual(overdue, {self.po})
-        found = set(self.client.get(url, {"q": "INV-77"}).context["cl"].result_list)
-        self.assertEqual(found, {self.po})
-        self.assertNotIn(other, found)
-
-    def test_po_list_query_count_stays_flat_with_bills(self):
-        def make(i):
-            po = self._po(purchase_tax_treatment=NO_GST, bill_number=f"B-{i}")
-            self._line(po, variant=_variant(f"SKU-BILL-{i}"), quantity_ordered=1, unit_price=Decimal("100"))
-        self.client.force_login(self.user)
-        self.assertChangelistQueriesFlat(reverse("admin:purchases_purchaseorder_changelist"), make)

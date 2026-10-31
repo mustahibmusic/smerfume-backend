@@ -3601,3 +3601,170 @@ class SupplierPaymentLedgerAdminTests(AdminQueryCountMixin, _POBase):
             po = self._po(purchase_tax_treatment=NO_GST)
             self._line(po, variant=_variant(f"SKU-PAYQ-{i}"), quantity_ordered=1, unit_price=Decimal("100"))
         self.assertChangelistQueriesFlat(reverse("admin:purchases_purchaseorder_changelist"), make)
+
+
+# ── Draft PO line editing through the admin change form ─────────────────────
+
+
+class DraftLineEditingAdminTests(_POBase):
+    """Draft lines are fully editable on the PO screen; any other status
+    keeps them read-only (no amend workflow)."""
+
+    PREFIX = "lines"
+
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.user)
+
+    def _url(self, po):
+        return reverse("admin:purchases_purchaseorder_change", args=[po.pk])
+
+    def _header(self, po):
+        return {
+            "supplier": po.supplier_id, "warehouse": po.warehouse_id,
+            "order_date": po.order_date.isoformat(), "expected_date": "",
+            "vendor_reference": po.vendor_reference, "notes": po.notes,
+            "purchase_tax_treatment": po.purchase_tax_treatment or "",
+            **({"amounts_include_tax": "on"} if po.amounts_include_tax else {}),
+            "_save": "Save",
+        }
+
+    def _line_data(self, i, po, line=None, **values):
+        p = f"{self.PREFIX}-{i}"
+        data = {f"{p}-purchase_order": po.pk, f"{p}-line_discount_amount": "0"}
+        if line is not None:
+            data.update({
+                f"{p}-id": line.pk, f"{p}-variant": line.variant_id,
+                f"{p}-quantity_ordered": line.quantity_ordered, f"{p}-unit_price": line.unit_price,
+                f"{p}-line_discount_amount": line.line_discount_amount,
+                f"{p}-tax_rate": "" if line.tax_rate is None else line.tax_rate,
+                f"{p}-hsn_code": line.hsn_code,
+            })
+        data.update({f"{p}-{k}": v for k, v in values.items()})
+        return data
+
+    def _post(self, po, lines, total, initial):
+        data = self._header(po)
+        data.update({
+            f"{self.PREFIX}-TOTAL_FORMS": str(total), f"{self.PREFIX}-INITIAL_FORMS": str(initial),
+            f"{self.PREFIX}-MIN_NUM_FORMS": "0", f"{self.PREFIX}-MAX_NUM_FORMS": "1000",
+        })
+        for d in lines:
+            data.update(d)
+        return self.client.post(self._url(po), data)
+
+    def _lines(self, po):
+        return list(
+            po.lines.order_by("pk").values_list(
+                "variant__sku", "quantity_ordered", "unit_price", "line_discount_amount", "tax_rate", "hsn_code",
+            )
+        )
+
+    def test_draft_line_can_be_added(self):
+        po = self._po()
+        first = self._line(po, quantity_ordered=1, unit_price=Decimal("100"))
+        extra = _variant("SKU-DRAFT-ADD")
+        resp = self._post(po, [
+            self._line_data(0, po, first),
+            self._line_data(1, po, variant=extra.pk, quantity_ordered="2", unit_price="50.00"),
+        ], total=2, initial=1)
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(
+            self._lines(po)[1], ("SKU-DRAFT-ADD", 2, Decimal("50.00"), Decimal("0.00"), None, ""),
+        )
+
+    def test_draft_line_can_be_edited_and_totals_follow(self):
+        po = self._po(purchase_tax_treatment=GST)
+        line = self._line(po, quantity_ordered=1, unit_price=Decimal("100"), tax_rate=Decimal("18"))
+        other = _variant("SKU-DRAFT-EDIT")
+        resp = self._post(po, [self._line_data(
+            0, po, line, variant=other.pk, quantity_ordered="3", unit_price="200.00",
+            line_discount_amount="60.00", tax_rate="12", hsn_code="33030010",
+        )], total=1, initial=1)
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(
+            self._lines(po),
+            [("SKU-DRAFT-EDIT", 3, Decimal("200.00"), Decimal("60.00"), Decimal("12.00"), "33030010")],
+        )
+        po = PurchaseOrder.objects.get(pk=po.pk)
+        self.assertEqual(po.total_gross_amount, Decimal("600.00"))
+        self.assertEqual(po.total_discounted_amount, Decimal("540.00"))
+        self.assertEqual(po.ordered_gross_total, Decimal("604.80"))
+        annotated = selectors.annotate_payment_summary(PurchaseOrder.objects.filter(pk=po.pk)).get()
+        self.assertEqual(annotated.ordered_gross_total_db, Decimal("604.80"))
+
+    def test_draft_line_can_be_deleted(self):
+        po = self._po()
+        keep = self._line(po, quantity_ordered=1)
+        drop = self._line(po, variant=_variant("SKU-DRAFT-DEL"), quantity_ordered=1)
+        resp = self._post(po, [
+            self._line_data(0, po, keep),
+            self._line_data(1, po, drop, DELETE="on"),
+        ], total=2, initial=2)
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(list(po.lines.values_list("pk", flat=True)), [keep.pk])
+
+    def test_draft_inline_shows_commercial_columns_and_variant_search(self):
+        po = self._po()
+        self._line(po)
+        resp = self.client.get(self._url(po))
+        formset = resp.context["inline_admin_formsets"][0]
+        self.assertTrue(formset.has_add_permission)
+        self.assertTrue(formset.has_change_permission)
+        self.assertTrue(formset.has_delete_permission)
+        self.assertEqual(
+            [f for f in formset.formset.forms[0].fields if f not in ("id", "DELETE", "purchase_order")],
+            ["variant", "quantity_ordered", "unit_price", "line_discount_amount", "tax_rate", "hsn_code"],
+        )
+        widget = formset.formset.forms[0].fields["variant"].widget
+        self.assertIn("admin-autocomplete", widget.widget.attrs.get("class", "") + str(widget.widget.build_attrs({})))
+        self.assertFalse(widget.can_delete_related)
+        self.assertNotContains(resp, "Vendor-confirmed total (cumulative)")
+
+    def test_issued_po_lines_stay_read_only(self):
+        po = self._po()
+        line = self._line(po, quantity_ordered=1, unit_price=Decimal("100"))
+        services.issue_purchase_order(po, self.user)
+        po.refresh_from_db()
+        before = self._lines(po)
+        self._post(po, [
+            self._line_data(0, po, line, quantity_ordered="99", DELETE="on"),
+            self._line_data(1, po, variant=_variant("SKU-ISSUED-ADD").pk, quantity_ordered="1", unit_price="1"),
+        ], total=2, initial=1)
+        self.assertEqual(self._lines(po), before)
+        resp = self.client.get(self._url(po))
+        formset = resp.context["inline_admin_formsets"][0]
+        self.assertFalse(formset.has_add_permission)
+        self.assertFalse(formset.has_change_permission)
+        self.assertFalse(formset.has_delete_permission)
+        self.assertContains(resp, "Vendor-confirmed total (cumulative)")
+
+    def test_received_closed_cancelled_po_lines_stay_read_only(self):
+        inline = PurchaseOrderLineInline(PurchaseOrder, django_admin.site)
+        request = RequestFactory().get("/admin/")
+        request.user = self.user
+        po = self._po()
+        line = self._line(po, quantity_ordered=1, unit_price=Decimal("100"))
+        for status in (
+            PurchaseOrder.STATUS_PARTIALLY_RECEIVED, PurchaseOrder.STATUS_RECEIVED,
+            PurchaseOrder.STATUS_CLOSED, PurchaseOrder.STATUS_CANCELLED,
+        ):
+            PurchaseOrder.objects.filter(pk=po.pk).update(status=status)
+            po.refresh_from_db()
+            with self.subTest(status=status):
+                self.assertFalse(inline.has_add_permission(request, po))
+                self.assertFalse(inline.has_change_permission(request, po))
+                self.assertFalse(inline.has_delete_permission(request, po))
+                self._post(po, [self._line_data(0, po, line, quantity_ordered="42", DELETE="on")], total=1, initial=1)
+                self.assertEqual(self._lines(po), [("SKU-PO-100ML", 1, Decimal("100.00"), Decimal("0.00"), None, "")])
+
+    def test_tax_treatment_validation_still_runs_on_issue_after_draft_edit(self):
+        po = self._po(purchase_tax_treatment=GST)
+        line = self._line(po, quantity_ordered=1, unit_price=Decimal("100"), tax_rate=Decimal("18"))
+        # Clearing the tax rate is allowed on a draft...
+        resp = self._post(po, [self._line_data(0, po, line, tax_rate="")], total=1, initial=1)
+        self.assertEqual(resp.status_code, 302)
+        # ...but a gst_invoice PO with a line missing its tax rate cannot be issued.
+        with self.assertRaises(services.PurchaseOrderError):
+            services.issue_purchase_order(po, self.user)
+        self.assertEqual(PurchaseOrder.objects.get(pk=po.pk).status, PurchaseOrder.STATUS_DRAFT)

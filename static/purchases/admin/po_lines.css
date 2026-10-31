@@ -1,0 +1,5 @@
+/* Purchase order lines inline: keep the variant search readable on new
+   rows, where the table would otherwise shrink the cell to its arrow. */
+.field-variant {
+    min-width: 20rem;
+}

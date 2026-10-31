@@ -5,7 +5,7 @@
 {% block content %}
 <div class="max-w-4xl">
     <div class="border border-base-200 mb-6 p-4 rounded-default">
-        <dl class="gap-x-6 gap-y-3 grid grid-cols-1 md:grid-cols-3 text-sm">
+        <dl class="gap-4 grid grid-cols-1 md:grid-cols-3 text-sm">
             {% for label, value in summary_rows %}
                 <div>
                     <dt class="text-base-500">{{ label }}</dt>
@@ -21,7 +21,7 @@
 
     {% if entry and not editable %}
         <div class="border border-base-200 mb-6 p-4 rounded-default">
-            <dl class="gap-x-6 gap-y-3 grid grid-cols-1 md:grid-cols-3 text-sm">
+            <dl class="gap-4 grid grid-cols-1 md:grid-cols-3 text-sm">
                 <div><dt class="text-base-500">Payment #</dt><dd class="font-medium">{{ entry.payment_number|default:"-" }}</dd></div>
                 <div><dt class="text-base-500">Type</dt><dd>{{ entry.get_entry_type_display }}</dd></div>
                 <div><dt class="text-base-500">Amount</dt><dd>{{ entry.amount }}</dd></div>
@@ -61,7 +61,7 @@
         {% csrf_token %}
 
         {% if editable %}
-            <div class="gap-x-6 grid grid-cols-1 md:grid-cols-2">
+            <div class="grid grid-cols-1 md:gap-4 md:grid-cols-2">
                 <div>{% include "unfold/helpers/field.html" with field=form.amount %}</div>
                 <div>{% include "unfold/helpers/field.html" with field=form.entry_date %}</div>
                 <div>{% include "unfold/helpers/field.html" with field=form.method %}</div>

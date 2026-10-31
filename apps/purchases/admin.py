@@ -13,6 +13,7 @@ from django.urls import path, reverse
 from django.utils import timezone
 from unfold.admin import ModelAdmin, TabularInline
 from unfold.decorators import action, display
+from unfold.enums import ActionVariant
 from unfold.widgets import (
     UnfoldAdminDateWidget,
     UnfoldAdminDecimalFieldWidget,
@@ -36,6 +37,7 @@ from .models import (
     PurchaseOrderPayment,
     ReceiptDiscrepancy,
     SupplierPaymentAttachment,
+    payment_status_for,
 )
 
 AUDIT_FIELDS = (
@@ -689,7 +691,19 @@ class PurchaseOrderAdmin(ModelAdmin):
         # DEC-011: drafting needs record_po_payment, Save as Paid needs post_po_payment.
         user = request.user
         can_use = user.has_perm("purchases.record_po_payment") or user.has_perm("purchases.post_po_payment")
-        return can_use and self._payable(object_id)
+        return can_use and self._payable(object_id) and not self._fully_paid(object_id)
+
+    @staticmethod
+    def _fully_paid(object_id):
+        """Nothing left to pay against the PO (posted entries only, DEC-011),
+        so a new payment could never be posted. Existing drafts stay reachable
+        from the payments panel. Unknown totals keep the action available;
+        post_payment still refuses them."""
+        if object_id is None:
+            return False
+        po = PurchaseOrder.objects.filter(pk=object_id).first()
+        remaining = po.remaining_against_po if po is not None else None
+        return remaining is not None and remaining <= 0
 
     def has_record_vendor_refund_permission(self, request, object_id=None):
         return request.user.has_perm("purchases.record_po_payment") and self._payable(object_id)
@@ -896,7 +910,13 @@ class PurchaseOrderAdmin(ModelAdmin):
         ]
         return self._action_page(request, po, title, form, message, button_label, "bg-primary-600", rows=rows)
 
-    @action(description="Record payment", url_path="record-payment", permissions=["record_payment"], icon="payments")
+    # Detail-action hierarchy (see .claude/DECISIONS.md): the normal positive
+    # step is PRIMARY, a less common money step is WARNING, a corrective step
+    # is DANGER; everything else keeps Unfold's neutral DEFAULT.
+    @action(
+        description="Record payment", url_path="record-payment", permissions=["record_payment"], icon="payments",
+        variant=ActionVariant.PRIMARY,
+    )
     def record_payment(self, request, object_id):
         """DEC-011 Record Payment: GET shows the form; POST saves a draft or
         posts (Save as Paid) through the services."""
@@ -941,13 +961,24 @@ class PurchaseOrderAdmin(ModelAdmin):
                     raise PermissionDenied
                 return self._draft_housekeeping(request, po, entry, existing, here)
 
+        # One posted-only summary (DEC-011) feeds both the card above the form
+        # and the default amount, so the two can never disagree.
+        net_paid = po.payment_summary()["net_paid"]
+        ordered_total = po.ordered_gross_total
+        remaining = None if ordered_total is None else ordered_total - net_paid
+
         if editable:
-            initial = None
             if entry is not None:
+                # Editing a draft keeps its own amount, never today's remaining.
                 initial = {
                     "amount": entry.amount, "entry_date": entry.entry_date, "method": entry.method,
                     "reference": entry.reference, "notes": entry.notes, "paid_through": entry.paid_through,
                 }
+            else:
+                # A new payment defaults to the full remaining amount; staff
+                # lower it for a partial payment. A bound (POST) form ignores
+                # initial, so a re-rendered error keeps what was submitted.
+                initial = {"amount": remaining} if remaining is not None and remaining > 0 else None
             form = SupplierPaymentEntryForm(
                 request.POST or None, request.FILES or None, initial=initial, existing_count=len(existing),
                 current_account=entry.paid_through if entry else None,
@@ -967,7 +998,6 @@ class PurchaseOrderAdmin(ModelAdmin):
                 if saved is not None:
                     return saved
 
-        summary = po.payment_summary()
         drafts = po.payment_entries.drafts().aggregate(count=Count("pk"), total=Sum("amount"))
         context = {
             **self.admin_site.each_context(request),
@@ -989,10 +1019,10 @@ class PurchaseOrderAdmin(ModelAdmin):
             "summary_rows": [
                 ("Purchase order", po.po_number),
                 ("Vendor", po.supplier),
-                ("Ordered gross total", "-" if po.ordered_gross_total is None else po.ordered_gross_total),
-                ("Net paid (posted)", summary["net_paid"]),
-                ("Remaining against PO (operational)",
-                 "-" if po.remaining_against_po is None else po.remaining_against_po),
+                ("Payment status", dict(PAYMENT_STATUS_CHOICES)[payment_status_for(net_paid, ordered_total)]),
+                ("Ordered gross total", "-" if ordered_total is None else ordered_total),
+                ("Net paid (posted)", net_paid),
+                ("Remaining against PO (operational)", "-" if remaining is None else remaining),
                 ("Drafts (not counted)", f"{drafts['count']} totalling {drafts['total'] or Decimal('0')}"),
             ],
             "back_url": self._change_url(po),
@@ -1062,7 +1092,7 @@ class PurchaseOrderAdmin(ModelAdmin):
 
     @action(
         description="Record vendor refund", url_path="record-vendor-refund",
-        permissions=["record_vendor_refund"], icon="currency_exchange",
+        permissions=["record_vendor_refund"], icon="currency_exchange", variant=ActionVariant.WARNING,
     )
     def record_vendor_refund(self, request, object_id):
         return self._ledger_entry_action(
@@ -1074,7 +1104,7 @@ class PurchaseOrderAdmin(ModelAdmin):
 
     @action(
         description="Reverse entry", url_path="reverse-payment-entry",
-        permissions=["reverse_payment_entry"], icon="undo",
+        permissions=["reverse_payment_entry"], icon="undo", variant=ActionVariant.DANGER,
     )
     def reverse_payment_entry(self, request, object_id):
         po = get_object_or_404(PurchaseOrder, pk=object_id)

@@ -14,7 +14,6 @@ from django.db.models import (
     Value, When,
 )
 from django.db.models.functions import Coalesce, Round
-from django.utils import timezone
 
 from apps.inventory.models import InventoryStock, StockReservationAllocation
 
@@ -265,10 +264,9 @@ def _ledger_sum(entry_type, active_only):
 
 
 def annotate_payment_summary(queryset):
-    """Annotate POs with ordered_gross_total_db, net_paid_db,
-    balance_due_db and payment_status_db, matching the PurchaseOrder
-    properties exactly (per-line GST rounding for tax-exclusive
-    gst_invoice POs). All in one SQL query: no per-row lookups."""
+    """Annotate POs with ordered_gross_total_db, net_paid_db and
+    payment_status_db, matching the PurchaseOrder properties exactly
+    (per-line GST rounding for tax-exclusive gst_invoice POs)."""
     from .models import PurchaseOrder, PurchaseOrderLine, PurchaseOrderPayment
 
     discounted = F("unit_price") * F("quantity_ordered") - F("line_discount_amount")
@@ -309,24 +307,10 @@ def annotate_payment_summary(queryset):
         output_field=_MONEY_FIELD,
     )
     queryset = queryset.annotate(ordered_gross_total_db=ordered, net_paid_db=net)
-    # NULL while unclassified (ordered total unknown), like remaining_against_po.
-    queryset = queryset.annotate(
-        balance_due_db=ExpressionWrapper(
-            F("ordered_gross_total_db") - F("net_paid_db"), output_field=_MONEY_FIELD,
-        )
-    )
-    is_paid = Q(
-        net_paid_db__gt=0, ordered_gross_total_db__isnull=False,
-        net_paid_db__gte=F("ordered_gross_total_db"),
-    )
-    is_overdue = Q(
-        payment_due_date__lt=timezone.localdate(), status__in=PurchaseOrder.PAYABLE_STATUSES,
-    )
     return queryset.annotate(
         payment_status_db=Case(
-            When(is_paid, then=Value("paid")),
-            When(is_overdue, then=Value("overdue")),
             When(net_paid_db=0, then=Value("unpaid")),
+            When(ordered_gross_total_db__isnull=False, net_paid_db__gte=F("ordered_gross_total_db"), then=Value("paid")),
             default=Value("partially_paid"),
             output_field=CharField(),
         )

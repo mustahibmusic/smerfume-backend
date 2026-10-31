@@ -1,0 +1,98 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block extrahead %}{{ block.super }}
+<link rel="stylesheet" href="{% static 'catalog/admin/variant_gallery.css' %}">
+<script src="{% static 'catalog/admin/variant_gallery.js' %}" defer></script>
+{% endblock %}
+
+{% block breadcrumbs %}{% endblock %}
+
+{% block content %}
+<div class="vg-page" id="variant-gallery"
+     data-reorder-url="{{ reorder_url }}"
+     data-free-slots="{{ free_slots }}"
+     data-max-upload-mb="{{ max_upload_mb }}">
+    {% csrf_token %}
+    <div class="vg-toolbar">
+        <p class="vg-lead"><strong>{{ count }} of {{ max_images }}</strong> images · {{ subtitle }}</p>
+        <a href="{{ change_url }}" class="vg-button">Back to variant</a>
+    </div>
+
+    <p class="vg-hint">
+        The customer-facing order is the primary image, then the secondary (hover) image, then the remaining
+        images in the order shown here. JPEG, PNG or WebP, at least 600 px on the shortest side
+        (1200 px recommended), up to {{ max_upload_mb }} MB each. Images are stored as WebP, at most 2000 px.
+    </p>
+
+    {% if can_add %}
+        <form class="vg-upload" method="post" action="{{ upload_url }}" enctype="multipart/form-data">
+            {% csrf_token %}
+            <label class="vg-dropzone">
+                <span>Drop images here or choose files ({{ free_slots }} free)</span>
+                <input type="file" name="images" multiple accept="image/jpeg,image/png,image/webp"
+                       {% if not free_slots %}disabled{% endif %}>
+            </label>
+            <button type="submit" class="vg-button vg-button-primary" {% if not free_slots %}disabled{% endif %}>Upload</button>
+            <p class="vg-upload-errors" role="alert"></p>
+        </form>
+    {% endif %}
+
+    <p class="vg-status" role="status" aria-live="polite"></p>
+
+    {% if images %}
+        <ol class="vg-grid" aria-label="Gallery images">
+            {% for image in images %}
+                <li class="vg-card" data-public-id="{{ image.public_id }}" data-role="{{ image.role }}"
+                    {% if can_change and image.role == "gallery" %}draggable="true"{% endif %}>
+                    <div class="vg-thumb">
+                        <img src="{{ image.image.url }}" alt="{{ image.alt_text }}" loading="lazy">
+                        <span class="vg-badge vg-badge-{{ image.role }}">{{ image.get_role_display }}</span>
+                    </div>
+                    <p class="vg-meta">{% if image.width %}{{ image.width }}×{{ image.height }} px{% else %}size unknown{% endif %}</p>
+
+                    {% if can_change %}
+                        <div class="vg-actions">
+                            {% for value, label in role_choices %}
+                                {% if value != image.role %}
+                                    <form method="post" action="{% url 'admin:catalog_productvariant_image_role' variant.pk image.public_id %}">
+                                        {% csrf_token %}
+                                        <input type="hidden" name="role" value="{{ value }}">
+                                        <button type="submit" class="vg-button vg-button-small">
+                                            {% if value == "primary" %}Make primary{% elif value == "secondary" %}Make secondary{% else %}Gallery{% endif %}
+                                        </button>
+                                    </form>
+                                {% endif %}
+                            {% endfor %}
+                            <button type="button" class="vg-button vg-button-small" data-edit
+                                    data-src="{{ image.image.url }}"
+                                    data-replace-url="{% url 'admin:catalog_productvariant_image_replace' variant.pk image.public_id %}">Edit</button>
+                        </div>
+                        {% if image.role == "gallery" %}
+                            <div class="vg-move">
+                                <button type="button" class="vg-button vg-button-small" data-move="-1" aria-label="Move earlier">←</button>
+                                <button type="button" class="vg-button vg-button-small" data-move="1" aria-label="Move later">→</button>
+                            </div>
+                        {% endif %}
+                        <form class="vg-alt" method="post" action="{% url 'admin:catalog_productvariant_image_alt_text' variant.pk image.public_id %}">
+                            {% csrf_token %}
+                            <label>Alt text
+                                <input type="text" name="alt_text" maxlength="255" value="{{ image.alt_text }}">
+                            </label>
+                            <button type="submit" class="vg-button vg-button-small">Save</button>
+                        </form>
+                    {% elif image.alt_text %}
+                        <p class="vg-meta">Alt: {{ image.alt_text }}</p>
+                    {% endif %}
+
+                    {% if can_delete %}
+                        <a class="vg-remove" href="{% url 'admin:catalog_productvariant_image_remove' variant.pk image.public_id %}">Remove</a>
+                    {% endif %}
+                </li>
+            {% endfor %}
+        </ol>
+    {% else %}
+        <p class="vg-empty">No images yet.</p>
+    {% endif %}
+</div>
+{% endblock %}

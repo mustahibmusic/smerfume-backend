@@ -1,0 +1,25 @@
+<div class="vg-preview">
+    {% if images %}
+        <div class="vg-preview-strip">
+            {% for image in images %}
+                <figure class="vg-preview-item">
+                    <img src="{{ image.image.url }}" alt="{{ image.alt_text }}" loading="lazy">
+                    {% if image.role != "gallery" %}<figcaption>{{ image.get_role_display }}</figcaption>{% endif %}
+                </figure>
+            {% endfor %}
+        </div>
+    {% else %}
+        <p>No gallery images yet.</p>
+    {% endif %}
+    <p class="vg-preview-meta">
+        {{ count }} of {{ max_images }} images ·
+        <a href="{{ manage_url }}" class="vg-button">Manage images</a>
+    </p>
+</div>
+<style>
+    .vg-preview-strip { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+    .vg-preview-item { margin: 0; text-align: center; font-size: 11px; }
+    .vg-preview-item img { width: 72px; height: 72px; object-fit: cover; border-radius: 6px; border: 1px solid rgba(127, 127, 127, .3); }
+    .vg-preview-meta { font-size: 13px; }
+    .vg-preview .vg-button { display: inline-block; padding: 4px 10px; border-radius: 6px; border: 1px solid rgba(127, 127, 127, .45); font-weight: 600; }
+</style>

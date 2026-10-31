@@ -86,13 +86,15 @@ FINANCE = (
     *_view("inventory", "inventorystock", "stockmovement", "stocktransaction", "supplier"),
     *_view(
         "purchases", "purchaseorder", "purchaseorderline", "goodsreceipt", "goodsreceiptline",
-        "receiptdiscrepancy", "purchaseorderpayment",
+        "receiptdiscrepancy", "purchaseorderpayment", "paymentaccount",
     ),
     "orders.change_return",
     "orders.change_refund",
     # DEC-010: operational supplier payment ledger (not classification).
     "purchases.record_po_payment",
     "purchases.reverse_po_payment",
+    # DEC-011: posting (Save as Paid) is a separate permission.
+    "purchases.post_po_payment",
     "orders.process_refund",
     "orders.complete_refund",
     "orders.add_refundadjustment",
@@ -102,6 +104,9 @@ MANAGER_EXTRA = (
     *_view("orders", "refundadjustment"),
     # DEC-010: one-time classification of pre-existing POs is Manager only.
     "purchases.set_po_tax_treatment",
+    # DEC-011: managers maintain the Paid Through list (no delete; deactivate instead).
+    "purchases.add_paymentaccount",
+    "purchases.change_paymentaccount",
     *_view(
         "inventory", "partialbottlelot", "stockmovement", "stocktransaction", "stockreservation",
         "stockreservationallocation", "supplier", "warehouse", "decantsource",

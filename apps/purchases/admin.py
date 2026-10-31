@@ -3,7 +3,8 @@ from decimal import Decimal
 from django import forms
 from django.core.exceptions import PermissionDenied
 from django.contrib import admin, messages
-from django.db.models import Count, Q, Sum
+from django.db import transaction
+from django.db.models import Count, Exists, OuterRef, Q, Sum
 from django.utils.html import format_html, format_html_join
 from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404, redirect
@@ -14,6 +15,7 @@ from unfold.admin import ModelAdmin, TabularInline
 from unfold.decorators import action, display
 from unfold.widgets import (
     UnfoldAdminDateWidget,
+    UnfoldAdminDecimalFieldWidget,
     UnfoldAdminSelectWidget,
     UnfoldAdminTextareaWidget,
     UnfoldAdminTextInputWidget,
@@ -216,7 +218,9 @@ class OpeningReceiptForm(forms.Form):
 
 
 class SupplierPaymentForm(forms.Form):
-    amount = forms.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal("0.01"))
+    amount = forms.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal("0.01"), widget=UnfoldAdminDecimalFieldWidget,
+    )
     entry_date = forms.DateField(widget=UnfoldAdminDateWidget, label="Date")
     method = forms.ChoiceField(choices=PurchaseOrderPayment.METHOD_CHOICES, widget=UnfoldAdminSelectWidget)
     reference = forms.CharField(
@@ -234,6 +238,65 @@ class SupplierPaymentForm(forms.Form):
         self.fields["entry_date"].initial = timezone.localdate()
         if not with_paid_through:
             del self.fields["paid_through"]
+
+
+class MultipleFileInput(forms.ClearableFileInput):
+    allow_multiple_selected = True
+
+
+class MultipleFileField(forms.FileField):
+    """Several proof files in one input; the service validates their content."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("widget", MultipleFileInput(attrs={
+            "accept": "application/pdf,image/jpeg,image/png,image/webp",
+            "class": "block text-sm file:mr-3 file:rounded-default file:border file:border-base-200 "
+                     "file:bg-white file:px-3 file:py-2 file:text-sm",
+        }))
+        kwargs.setdefault("required", False)
+        super().__init__(*args, **kwargs)
+
+    def clean(self, data, initial=None):
+        single = super().clean
+        if isinstance(data, (list, tuple)):
+            return [single(item, initial) for item in data if item]
+        return [single(data, initial)] if data else []
+
+
+class PaymentProofForm(forms.Form):
+    attachments = MultipleFileField(
+        label="Attachments", help_text="PDF, JPEG, PNG or WebP. Up to 5 files per payment, 5 MB each.",
+    )
+
+    def __init__(self, *args, existing_count=0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.existing_count = existing_count
+
+    def clean_attachments(self):
+        files = self.cleaned_data["attachments"]
+        limit = SupplierPaymentAttachment.MAX_PER_PAYMENT
+        if self.existing_count + len(files) > limit:
+            raise forms.ValidationError(
+                f"A payment can have at most {limit} attachments ({self.existing_count} already attached)."
+            )
+        return files
+
+
+class SupplierPaymentEntryForm(SupplierPaymentForm, PaymentProofForm):
+    """DEC-011 Record Payment form: Save as Draft or Save as Paid."""
+
+    field_order = ("amount", "entry_date", "method", "paid_through", "reference", "notes", "attachments")
+
+    def __init__(self, *args, current_account=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["entry_date"].label = "Payment date"
+        self.fields["method"].label = "Payment mode"
+        self.fields["paid_through"].help_text = "Required to save as paid. Optional on a draft."
+        if current_account is not None:
+            # Keep a draft's now-inactive account visible; posting will refuse it.
+            self.fields["paid_through"].queryset = PaymentAccount.objects.filter(
+                Q(is_active=True) | Q(pk=current_account.pk)
+            )
 
 
 class ReversePaymentEntryForm(forms.Form):
@@ -455,27 +518,65 @@ class PurchaseOrderAdmin(ModelAdmin):
             ("Remaining against PO (operational)", "-" if remaining is None else remaining),
             ("Payment status", dict(PAYMENT_STATUS_CHOICES)[obj.payment_status]),
         ]
-        entries = obj.payment_entries.select_related("recorded_by", "reverses", "reversal").order_by("entry_date", "pk")
+        entries = list(
+            obj.payment_entries.select_related("recorded_by", "reverses", "reversal", "paid_through")
+            .annotate(proof_count=Count("attachments"))
+            .order_by("entry_date", "pk")
+        )
+        posted = [e for e in entries if not e.is_draft]
+        drafts = [e for e in entries if e.is_draft]
+
+        def entry_link(e, text):
+            url = reverse("admin:purchases_purchaseorder_payment_entry", args=[e.public_id])
+            return format_html('<a href="{}" class="underline">{}</a>', url, text)
+
+        def paid_through(e):
+            if e.entry_type != PurchaseOrderPayment.TYPE_PAYMENT:
+                return "-"
+            return e.paid_through or "Not recorded"
+
         rows = format_html_join(
-            "", "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>"
+            "<td>{}</td><td>{}</td><td>{}</td></tr>",
             (
                 (
-                    e.entry_date, e.get_entry_type_display(), e.amount, e.get_method_display() or "-",
-                    e.reference or "-", e.notes or e.reversal_reason or "-", e.recorded_by,
-                    f"reverses #{e.reverses_id}" if e.reverses_id else (
+                    entry_link(e, e.payment_number or "View"), e.entry_date, e.get_entry_type_display(), e.amount,
+                    e.get_method_display() or "-", paid_through(e), e.reference or "-",
+                    e.notes or e.reversal_reason or "-", e.recorded_by, e.proof_count or "-",
+                    (f"reverses {e.reverses.payment_number or '#' + str(e.reverses_id)}" if e.reverses_id else (
                         "reversed" if hasattr(e, "reversal") else "-"
-                    ),
+                    )),
                 )
-                for e in entries
+                for e in posted
             ),
         )
+        draft_rows = format_html_join(
+            "", "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            (
+                (
+                    entry_link(e, "Edit draft"), e.entry_date, e.amount, e.get_method_display() or "-",
+                    paid_through(e), e.reference or "-", e.proof_count or "-",
+                )
+                for e in drafts
+            ),
+        )
+        drafts_html = ""
+        if drafts:
+            drafts_html = format_html(
+                "<p><strong>Draft payments (not counted in net paid or payment status)</strong></p>"
+                "<table><thead><tr><th></th><th>Date</th><th>Amount</th><th>Mode</th><th>Paid through</th>"
+                "<th>Reference</th><th>Proof</th></tr></thead><tbody>{}</tbody></table>",
+                draft_rows,
+            )
         return format_html(
             "<table><tbody>{}</tbody></table>"
-            "<table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Method</th>"
-            "<th>Reference</th><th>Notes / reason</th><th>Recorded by</th><th>Link</th></tr></thead>"
-            "<tbody>{}</tbody></table>",
+            "<table><thead><tr><th>Payment #</th><th>Date</th><th>Type</th><th>Amount</th><th>Mode</th>"
+            "<th>Paid through</th><th>Reference</th><th>Notes / reason</th><th>Recorded by</th><th>Proof</th>"
+            "<th>Link</th></tr></thead><tbody>{}</tbody></table>{}",
             format_html_join("", "<tr><th>{}</th><td>{}</td></tr>", figures),
-            rows or format_html('<tr><td colspan="8">{}</td></tr>', "No entries"),
+            rows or format_html('<tr><td colspan="11">{}</td></tr>', "No posted entries"),
+            drafts_html,
         )
 
     @admin.display(description="Open receipt discrepancies")
@@ -556,7 +657,10 @@ class PurchaseOrderAdmin(ModelAdmin):
         ).exists()
 
     def has_record_payment_permission(self, request, object_id=None):
-        return request.user.has_perm("purchases.record_po_payment") and self._payable(object_id)
+        # DEC-011: drafting needs record_po_payment, Save as Paid needs post_po_payment.
+        user = request.user
+        can_use = user.has_perm("purchases.record_po_payment") or user.has_perm("purchases.post_po_payment")
+        return can_use and self._payable(object_id)
 
     def has_record_vendor_refund_permission(self, request, object_id=None):
         return request.user.has_perm("purchases.record_po_payment") and self._payable(object_id)
@@ -739,17 +843,15 @@ class PurchaseOrderAdmin(ModelAdmin):
             "Cancel purchase order", "bg-red-600",
         )
 
-    def _ledger_entry_action(self, request, object_id, service, title, message, button_label, verb,
-                             with_paid_through=False):
+    def _ledger_entry_action(self, request, object_id, service, title, message, button_label, verb):
         po = get_object_or_404(PurchaseOrder, pk=object_id)
-        form = SupplierPaymentForm(request.POST or None, with_paid_through=with_paid_through)
+        form = SupplierPaymentForm(request.POST or None, with_paid_through=False)
         if request.method == "POST" and form.is_valid():
             data = form.cleaned_data
-            extra = {"paid_through": data["paid_through"]} if with_paid_through else {}
             try:
                 entry = service(
                     po, amount=data["amount"], entry_date=data["entry_date"], method=data["method"],
-                    reference=data["reference"], notes=data["notes"], user=request.user, **extra,
+                    reference=data["reference"], notes=data["notes"], user=request.user,
                 )
             except po_services.SupplierPaymentError as exc:
                 self.message_user(request, str(exc), level=messages.ERROR)
@@ -767,13 +869,167 @@ class PurchaseOrderAdmin(ModelAdmin):
 
     @action(description="Record payment", url_path="record-payment", permissions=["record_payment"], icon="payments")
     def record_payment(self, request, object_id):
-        """GET shows the form; only POST records, through the service."""
-        return self._ledger_entry_action(
-            request, object_id, po_services.record_po_payment, "Record supplier payment",
-            "Record money paid to the supplier against this PO. Operational record only; "
-            "the entry cannot be edited later (use a reversal if it is wrong).",
-            "Record payment", "Recorded payment", with_paid_through=True,
+        """DEC-011 Record Payment: GET shows the form; POST saves a draft or
+        posts (Save as Paid) through the services."""
+        po = get_object_or_404(PurchaseOrder, pk=object_id)
+        return self._payment_entry_page(request, po)
+
+    def get_urls(self):
+        return [
+            path(
+                "payment/<uuid:public_id>/", self.admin_site.admin_view(self.payment_entry_view),
+                name="purchases_purchaseorder_payment_entry",
+            ),
+        ] + super().get_urls()
+
+    def payment_entry_view(self, request, public_id):
+        """One supplier payment entry: drafts are edited, posted or deleted
+        here; posted payments are read-only and add-only for proof."""
+        if not request.user.has_perm("purchases.view_purchaseorderpayment"):
+            raise PermissionDenied
+        entry = get_object_or_404(
+            PurchaseOrderPayment.objects.select_related("purchase_order__supplier", "paid_through"),
+            public_id=public_id,
         )
+        return self._payment_entry_page(request, entry.purchase_order, entry)
+
+    def _payment_entry_page(self, request, po, entry=None):
+        user = request.user
+        can_draft = user.has_perm("purchases.record_po_payment")
+        can_post = user.has_perm("purchases.post_po_payment")
+        is_draft = entry is not None and entry.is_draft
+        editable = entry is None or is_draft
+        existing = list(entry.attachments.all()) if entry else []
+        is_payment = entry is None or entry.entry_type == PurchaseOrderPayment.TYPE_PAYMENT
+        can_add_proof = is_payment and (can_draft if editable else (can_draft or can_post))
+        here = request.get_full_path()
+
+        if request.method == "POST":
+            if not (can_draft or can_post):
+                raise PermissionDenied
+            if "_delete" in request.POST or "_remove_attachment" in request.POST:
+                if not (is_draft and can_draft):
+                    raise PermissionDenied
+                return self._draft_housekeeping(request, po, entry, existing, here)
+
+        if editable:
+            initial = None
+            if entry is not None:
+                initial = {
+                    "amount": entry.amount, "entry_date": entry.entry_date, "method": entry.method,
+                    "reference": entry.reference, "notes": entry.notes, "paid_through": entry.paid_through,
+                }
+            form = SupplierPaymentEntryForm(
+                request.POST or None, request.FILES or None, initial=initial, existing_count=len(existing),
+                current_account=entry.paid_through if entry else None,
+            )
+        else:
+            form = PaymentProofForm(request.POST or None, request.FILES or None, existing_count=len(existing))
+
+        if request.method == "POST":
+            if editable:
+                posting = "_post" in request.POST
+                if not (can_post if posting else can_draft):
+                    raise PermissionDenied
+            elif not can_add_proof:
+                raise PermissionDenied
+            if form.is_valid():
+                saved = self._save_payment_entry(request, po, entry, form, editable, "_post" in request.POST)
+                if saved is not None:
+                    return saved
+
+        summary = po.payment_summary()
+        drafts = po.payment_entries.drafts().aggregate(count=Count("pk"), total=Sum("amount"))
+        context = {
+            **self.admin_site.each_context(request),
+            "title": self._payment_page_title(po, entry),
+            "opts": self.model._meta,
+            "po": po,
+            "entry": entry,
+            "form": form,
+            "editable": editable,
+            "is_draft": is_draft,
+            "can_draft": can_draft,
+            "can_post": can_post,
+            "can_add_proof": can_add_proof,
+            "attachments": [
+                (a, reverse("admin:purchases_supplierpaymentattachment_download", args=[a.public_id]))
+                for a in existing
+            ],
+            "files_lost": request.method == "POST" and bool(request.FILES),
+            "summary_rows": [
+                ("Purchase order", po.po_number),
+                ("Vendor", po.supplier),
+                ("Ordered gross total", "-" if po.ordered_gross_total is None else po.ordered_gross_total),
+                ("Net paid (posted)", summary["net_paid"]),
+                ("Remaining against PO (operational)",
+                 "-" if po.remaining_against_po is None else po.remaining_against_po),
+                ("Drafts (not counted)", f"{drafts['count']} totalling {drafts['total'] or Decimal('0')}"),
+            ],
+            "back_url": self._change_url(po),
+        }
+        return TemplateResponse(request, "admin/purchases/supplier_payment_form.html", context)
+
+    @staticmethod
+    def _payment_page_title(po, entry):
+        if entry is None:
+            return f"Record payment for {po.po_number}"
+        if entry.is_draft:
+            return f"Draft payment for {po.po_number}"
+        label = entry.payment_number or entry.get_entry_type_display()
+        return f"{label} on {po.po_number}"
+
+    def _draft_housekeeping(self, request, po, entry, existing, here):
+        try:
+            if "_delete" in request.POST:
+                po_services.delete_payment_draft(entry, request.user)
+            else:
+                wanted = request.POST["_remove_attachment"]
+                attachment = next((a for a in existing if str(a.public_id) == wanted), None)
+                if attachment is None:
+                    raise po_services.SupplierPaymentError("This attachment no longer exists.")
+                po_services.remove_payment_attachment(attachment, request.user)
+        except po_services.SupplierPaymentError as exc:
+            self.message_user(request, str(exc), level=messages.ERROR)
+            return redirect(here)
+        if "_delete" in request.POST:
+            self.log_change(request, po, f"Deleted draft payment {entry.amount}.")
+            self.message_user(request, f"Draft payment deleted from {po.po_number}.", level=messages.SUCCESS)
+            return redirect(self._change_url(po))
+        self.message_user(request, "Attachment removed.", level=messages.SUCCESS)
+        return redirect(here)
+
+    def _save_payment_entry(self, request, po, entry, form, editable, posting):
+        """Run the service; on a refusal add the message to the form and
+        return None so the page re-renders with the entered values."""
+        data = dict(form.cleaned_data)
+        files = data.pop("attachments", [])
+        try:
+            with transaction.atomic():
+                if not editable:
+                    po_services.add_payment_attachments(entry, files, request.user)
+                    saved, verb = entry, "Added proof to"
+                else:
+                    fields = {k: data[k] for k in ("amount", "entry_date", "method", "reference", "notes",
+                                                   "paid_through")}
+                    if posting:
+                        saved = po_services.post_payment(po, user=request.user, draft=entry, **fields)
+                        verb = "Recorded payment"
+                    elif entry is not None:
+                        saved = po_services.update_payment_draft(entry, user=request.user, **fields)
+                        verb = "Updated draft payment"
+                    else:
+                        saved = po_services.create_payment_draft(po, user=request.user, **fields)
+                        verb = "Saved draft payment"
+                    if files:
+                        po_services.add_payment_attachments(saved, files, request.user)
+        except po_services.SupplierPaymentError as exc:
+            form.add_error(None, str(exc))
+            return None
+        label = saved.payment_number or "draft"
+        self.log_change(request, po, f"{verb} {label} {saved.amount} ({saved.get_method_display()}).")
+        self.message_user(request, f"{verb} {label} ({saved.amount}) on {po.po_number}.", level=messages.SUCCESS)
+        return redirect(self._change_url(po))
 
     @action(
         description="Record vendor refund", url_path="record-vendor-refund",
@@ -1451,20 +1707,67 @@ class BookedQuantityChangeAdmin(ModelAdmin):
 
 @admin.register(PurchaseOrderPayment)
 class PurchaseOrderPaymentAdmin(ModelAdmin):
-    """DEC-010 supplier payment ledger. Read-only for everyone: entries are
-    recorded and reversed only from the purchase order page."""
+    """DEC-010/DEC-011 supplier payment ledger. Read-only here: payments are
+    drafted, posted and reversed from the purchase order. Each row links to
+    the entry page (edit a draft, or view a posted entry and add proof)."""
 
     list_display = (
-        "entry_date", "purchase_order", "vendor", "entry_type", "amount", "method",
-        "reference", "recorded_by", "reverses",
+        "payment_link", "date_display", "vendor", "po_display", "type_display", "status_label", "mode_display",
+        "paid_through_display", "reference", "amount",
     )
-    list_filter = ("entry_type", "method")
+    list_display_links = None
+    list_filter = ("status", "entry_type", "method", "paid_through")
     search_fields = (
-        "purchase_order__po_number", "purchase_order__supplier__name",
+        "payment_number", "purchase_order__po_number", "purchase_order__supplier__name",
         "purchase_order__supplier__vendor_code", "reference",
     )
     date_hierarchy = "entry_date"
-    list_select_related = ("purchase_order__supplier", "recorded_by", "reverses")
+    list_select_related = ("purchase_order__supplier", "paid_through")
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).annotate(
+            is_reversed=Exists(PurchaseOrderPayment.objects.filter(reverses=OuterRef("pk"))),
+        )
+
+    @admin.display(description="Payment #", ordering="payment_number")
+    def payment_link(self, obj):
+        url = reverse("admin:purchases_purchaseorder_payment_entry", args=[obj.public_id])
+        if obj.is_draft:
+            return format_html('<a href="{}" class="italic underline">Draft (edit)</a>', url)
+        return format_html('<a href="{}" class="underline">{}</a>', url, obj.payment_number or "View")
+
+    @display(
+        description="Status",
+        label={"Draft": "warning", "Paid": "success", "Posted": "info"},  # Reversed: default grey
+    )
+    def status_label(self, obj):
+        if obj.is_draft:
+            return "Draft"
+        if getattr(obj, "is_reversed", False):
+            return "Reversed"
+        return "Paid" if obj.entry_type == PurchaseOrderPayment.TYPE_PAYMENT else "Posted"
+
+    @admin.display(description="Date", ordering="entry_date")
+    def date_display(self, obj):
+        return obj.entry_date
+
+    @admin.display(description="PO", ordering="purchase_order__po_number")
+    def po_display(self, obj):
+        return obj.purchase_order.po_number
+
+    @admin.display(description="Type", ordering="entry_type")
+    def type_display(self, obj):
+        return obj.get_entry_type_display()
+
+    @admin.display(description="Mode", ordering="method")
+    def mode_display(self, obj):
+        return obj.get_method_display() or "-"
+
+    @admin.display(description="Paid through", ordering="paid_through__name")
+    def paid_through_display(self, obj):
+        if obj.entry_type != PurchaseOrderPayment.TYPE_PAYMENT:
+            return "-"
+        return obj.paid_through or "Not recorded"
 
     @admin.display(description="Vendor", ordering="purchase_order__supplier__name")
     def vendor(self, obj):
@@ -1506,3 +1809,16 @@ class PurchaseOrderPaymentAdmin(ModelAdmin):
         response["Cache-Control"] = "private, no-store"
         return response
 
+
+@admin.register(PaymentAccount)
+class PaymentAccountAdmin(ModelAdmin):
+    """DEC-011 Paid Through list: a label and kind only. No balances, full
+    account numbers, IFSC or credentials. Deactivate instead of deleting."""
+
+    list_display = ("name", "kind", "is_active")
+    list_filter = ("kind", "is_active")
+    search_fields = ("name",)
+    fields = ("name", "kind", "is_active")
+
+    def has_delete_permission(self, request, obj=None):
+        return False

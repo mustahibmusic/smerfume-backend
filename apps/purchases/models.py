@@ -814,7 +814,9 @@ class PaymentAccount(BaseModel):
         (KIND_OTHER, "Other"),
     )
 
-    name = models.CharField(max_length=80, help_text="A label only, e.g. \"HDFC Current ••1234\". No full account numbers.")
+    name = models.CharField(
+        max_length=80, help_text="A label only, e.g. \"HDFC Current ••1234\". No full account numbers.",
+    )
     kind = models.CharField(max_length=10, choices=KIND_CHOICES)
 
     class Meta:

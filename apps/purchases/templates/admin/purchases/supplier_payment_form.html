@@ -1,0 +1,125 @@
+{% extends "admin/base_site.html" %}
+
+{% block breadcrumbs %}{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl">
+    <div class="border border-base-200 mb-6 p-4 rounded-default">
+        <dl class="gap-x-6 gap-y-3 grid grid-cols-1 md:grid-cols-3 text-sm">
+            {% for label, value in summary_rows %}
+                <div>
+                    <dt class="text-base-500">{{ label }}</dt>
+                    <dd class="font-medium">{{ value }}</dd>
+                </div>
+            {% endfor %}
+        </dl>
+        <p class="mt-3 text-base-500 text-xs">
+            Operational record only. Zoho Books remains authoritative for vendor bills and accounts payable.
+            Drafts never count toward net paid or payment status.
+        </p>
+    </div>
+
+    {% if entry and not editable %}
+        <div class="border border-base-200 mb-6 p-4 rounded-default">
+            <dl class="gap-x-6 gap-y-3 grid grid-cols-1 md:grid-cols-3 text-sm">
+                <div><dt class="text-base-500">Payment #</dt><dd class="font-medium">{{ entry.payment_number|default:"-" }}</dd></div>
+                <div><dt class="text-base-500">Type</dt><dd>{{ entry.get_entry_type_display }}</dd></div>
+                <div><dt class="text-base-500">Amount</dt><dd>{{ entry.amount }}</dd></div>
+                <div><dt class="text-base-500">Payment date</dt><dd>{{ entry.entry_date }}</dd></div>
+                <div><dt class="text-base-500">Payment mode</dt><dd>{{ entry.get_method_display|default:"-" }}</dd></div>
+                <div><dt class="text-base-500">Paid through</dt><dd>{{ entry.paid_through|default:"Not recorded" }}</dd></div>
+                <div><dt class="text-base-500">Reference</dt><dd>{{ entry.reference|default:"-" }}</dd></div>
+                <div><dt class="text-base-500">Posted by</dt><dd>{{ entry.posted_by|default:"-" }}</dd></div>
+                <div><dt class="text-base-500">Posted at</dt><dd>{{ entry.posted_at|default:"-" }}</dd></div>
+            </dl>
+            {% if entry.notes or entry.reversal_reason %}
+                <p class="mt-3 text-sm">{{ entry.notes|default:entry.reversal_reason }}</p>
+            {% endif %}
+            <p class="mt-3 text-base-500 text-xs">Posted entries cannot be edited. Use Reverse entry on the purchase order if it is wrong.</p>
+        </div>
+    {% endif %}
+
+    {% if files_lost %}
+        <div class="bg-red-50 border border-red-200 mb-4 p-3 rounded-default text-red-700 text-sm" role="alert">
+            Nothing was saved, including your attachments. Your other entries are kept below;
+            select the attachment files again before saving.
+        </div>
+    {% endif %}
+
+    {% if form.non_field_errors %}
+        <ul class="mb-4 text-red-600 text-sm" role="alert">
+            {% for error in form.non_field_errors %}<li>{{ error }}</li>{% endfor %}
+        </ul>
+    {% endif %}
+
+    <form method="post" enctype="multipart/form-data" novalidate>
+        {% csrf_token %}
+
+        {% if editable %}
+            <div class="gap-x-6 grid grid-cols-1 md:grid-cols-2">
+                <div>{% include "unfold/helpers/field.html" with field=form.amount %}</div>
+                <div>{% include "unfold/helpers/field.html" with field=form.entry_date %}</div>
+                <div>{% include "unfold/helpers/field.html" with field=form.method %}</div>
+                <div>{% include "unfold/helpers/field.html" with field=form.paid_through %}</div>
+                <div>{% include "unfold/helpers/field.html" with field=form.reference %}</div>
+            </div>
+            {% include "unfold/helpers/field.html" with field=form.notes %}
+        {% endif %}
+
+        <div class="mb-4">
+            <h3 class="font-semibold mb-2 text-sm">Attachments</h3>
+            {% if attachments %}
+                <ul class="mb-3 text-sm">
+                    {% for attachment, url in attachments %}
+                        <li class="flex gap-3 items-center mb-1">
+                            <a href="{{ url }}" class="text-primary-600 underline">{{ attachment.original_name }}</a>
+                            <span class="text-base-500">{{ attachment.size|filesizeformat }}</span>
+                            {% if is_draft and can_draft %}
+                                <button type="submit" name="_remove_attachment" value="{{ attachment.public_id }}"
+                                        class="text-red-600 text-xs underline">Remove</button>
+                            {% endif %}
+                        </li>
+                    {% endfor %}
+                </ul>
+            {% elif not can_add_proof %}
+                <p class="text-base-500 text-sm">No attachments.</p>
+            {% endif %}
+            {% if can_add_proof %}
+                {% include "unfold/helpers/field.html" with field=form.attachments %}
+                {% if entry and not editable %}
+                    <p class="text-base-500 text-xs">Proof on a posted payment can be added but not removed.</p>
+                {% endif %}
+            {% endif %}
+        </div>
+
+        <div class="flex flex-wrap gap-4 mt-4">
+            {% if editable %}
+                {% if can_post %}
+                    <button type="submit" name="_post" value="1"
+                            class="bg-primary-600 border border-transparent font-medium px-3 py-2 rounded-default text-sm text-white">
+                        Save as Paid
+                    </button>
+                {% endif %}
+                {% if can_draft %}
+                    <button type="submit" name="_draft" value="1"
+                            class="border border-base-200 font-medium px-3 py-2 rounded-default text-sm">
+                        Save as Draft
+                    </button>
+                {% endif %}
+            {% elif can_add_proof %}
+                <button type="submit" name="_add_proof" value="1"
+                        class="bg-primary-600 border border-transparent font-medium px-3 py-2 rounded-default text-sm text-white">
+                    Add attachments
+                </button>
+            {% endif %}
+            <a href="{{ back_url }}" class="border border-base-200 font-medium px-3 py-2 rounded-default text-sm">Cancel</a>
+            {% if is_draft and can_draft %}
+                <button type="submit" name="_delete" value="1"
+                        class="border border-red-200 font-medium ml-auto px-3 py-2 rounded-default text-red-600 text-sm">
+                    Delete draft
+                </button>
+            {% endif %}
+        </div>
+    </form>
+</div>
+{% endblock %}

@@ -293,7 +293,7 @@ class OverduePurchaseOrderFilter(admin.SimpleListFilter):
     """Still expecting goods (issued or partially received) after the
     expected date."""
 
-    title = "overdue"
+    title = "delivery overdue"
     parameter_name = "overdue"
 
     def lookups(self, request, model_admin):
@@ -315,9 +315,10 @@ class PurchaseOrderAdmin(ModelAdmin):
 
     inlines = [PurchaseOrderLineInline]
     list_display = (
-        "po_number", "supplier", "warehouse", "order_date", "expected_date",
-        "status_label", "line_count", "ordered_gross_total_display", "net_paid_display",
-        "payment_status_label", "created_by",
+        "po_number", "order_date", "bill_number_display", "vendor_reference_display",
+        "supplier", "status_label", "payment_status_label", "payment_due_date",
+        "ordered_gross_total_display", "net_paid_display", "balance_due_display",
+        "warehouse", "expected_date", "line_count", "created_by",
     )
     list_filter = (
         "status", PaymentStatusFilter, "purchase_tax_treatment", OverduePurchaseOrderFilter,
@@ -325,7 +326,7 @@ class PurchaseOrderAdmin(ModelAdmin):
     )
     search_fields = (
         "po_number", "supplier__name", "supplier__vendor_code",
-        "vendor_reference", "lines__variant__sku",
+        "vendor_reference", "bill_number", "lines__variant__sku",
     )
     list_select_related = ("supplier", "warehouse", "created_by")
     actions_detail = [
@@ -337,6 +338,13 @@ class PurchaseOrderAdmin(ModelAdmin):
             "number", "status", "supplier", "warehouse", "order_date", "expected_date",
         )}),
         ("Vendor terms", {"fields": ("vendor_reference", "purchase_tax_treatment", "amounts_include_tax")}),
+        ("Vendor bill", {
+            "fields": PurchaseOrder.BILL_FIELDS,
+            "description": (
+                "Record the vendor's bill once it arrives. Leave the due date blank to use "
+                "the vendor's payment terms. Zoho Books stays authoritative for bills."
+            ),
+        }),
         ("Notes", {"fields": ("notes",)}),
         ("Receiving", {"fields": ("open_discrepancies", "awaiting_orders")}),
         ("Totals", {"fields": (
@@ -358,7 +366,7 @@ class PurchaseOrderAdmin(ModelAdmin):
     )
     # DEC-010: supplier payment data is shown only to users who may view the
     # payment ledger. Ordered gross total stays visible (order value).
-    PAYMENT_LIST_COLUMNS = ("net_paid_display", "payment_status_label")
+    PAYMENT_LIST_COLUMNS = ("net_paid_display", "balance_due_display", "payment_status_label")
 
     @staticmethod
     def _can_view_payments(request):
@@ -399,11 +407,13 @@ class PurchaseOrderAdmin(ModelAdmin):
             *self.TOTAL_FIELDS, "supplier_payments", *AUDIT_FIELDS,
         )
         if obj is None:
-            return always
+            # A new PO is a draft: the bill is recorded after issue.
+            return always + PurchaseOrder.BILL_FIELDS
         editable = set(obj.editable_fields())
         header = (
             "supplier", "warehouse", "order_date", "expected_date",
             "vendor_reference", "purchase_tax_treatment", "amounts_include_tax", "notes",
+            *PurchaseOrder.BILL_FIELDS,
         )
         return always + tuple(f for f in header if f not in editable)
 
@@ -430,7 +440,7 @@ class PurchaseOrderAdmin(ModelAdmin):
 
     # --- list/detail display ---
 
-    @display(description="Status", label={
+    @display(description="PO status", label={
         "Draft": "info", "Issued": "warning", "Partially received": "warning",
         "Received": "success", "Closed": "success", "Cancelled": "danger",
     })
@@ -448,11 +458,26 @@ class PurchaseOrderAdmin(ModelAdmin):
             return "Unclassified"
         return "-" if value is None else value
 
+    @admin.display(description="Bill no.", ordering="bill_number")
+    def bill_number_display(self, obj):
+        return obj.bill_number or "-"
+
+    @admin.display(description="Reference no.", ordering="vendor_reference")
+    def vendor_reference_display(self, obj):
+        return obj.vendor_reference or "-"
+
     @admin.display(description="Net paid", ordering="net_paid_db")
     def net_paid_display(self, obj):
         return getattr(obj, "net_paid_db", None)
 
-    @display(description="Payment", label={"Unpaid": "danger", "Partially paid": "warning", "Paid": "success"})
+    @admin.display(description="Balance due", ordering="balance_due_db")
+    def balance_due_display(self, obj):
+        value = getattr(obj, "balance_due_db", None)
+        return "-" if value is None else value
+
+    @display(description="Payment status", label={
+        "Unpaid": "warning", "Partially paid": "info", "Paid": "success", "Overdue": "danger",
+    })
     def payment_status_label(self, obj):
         return dict(PAYMENT_STATUS_CHOICES).get(getattr(obj, "payment_status_db", None), "-")
 

@@ -421,3 +421,80 @@ class StdoutLoggingTests(SimpleTestCase):
         config = logging_config("INFO")
         self.assertNotIn("mail_admins", config["handlers"])
         self.assertEqual(config["loggers"]["django"]["handlers"], ["stdout", "stderr"])
+
+
+
+@override_settings(ALLOWED_HOSTS=["api.example.com"], SECURE_SSL_REDIRECT=True)
+class LivenessTests(TestCase):
+    """/healthz/ answers before host and HTTPS handling so a provider's
+    internal probe (IP Host header, plain HTTP) works. Only that exact
+    path and GET/HEAD get the bypass, and it touches nothing."""
+
+    def test_ok_for_internal_probe_without_db_or_cache(self):
+        broken = MagicMock(side_effect=AssertionError("cache touched"))
+        with self.assertNumQueries(0), patch.object(cache, "get", broken), patch.object(cache, "set", broken):
+            resp = self.client.get("/healthz/", HTTP_HOST="10.0.0.7:8000")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.content, b"ok")
+        self.assertEqual(resp["Content-Type"], "text/plain")
+        self.assertEqual(resp["Cache-Control"], "no-store")
+
+    def test_head_allowed(self):
+        self.assertEqual(self.client.head("/healthz/", HTTP_HOST="10.0.0.7").status_code, 200)
+
+    def test_no_build_or_environment_details(self):
+        resp = self.client.get("/healthz/?verbose=1", HTTP_HOST="10.0.0.7")
+        self.assertEqual(resp.content, b"ok")
+        for header in ("Server", "X-Version", "X-Environment"):
+            self.assertNotIn(header, resp)
+
+    def test_only_the_exact_path_bypasses(self):
+        for path in ("/healthz", "/healthz/x", "/HEALTHZ/", "/healthz//", "/api/healthz/", "/admin/"):
+            with self.subTest(path):
+                self.assertEqual(self.client.get(path, HTTP_HOST="10.0.0.7").status_code, 400)
+
+    def test_other_methods_do_not_bypass(self):
+        for method in ("post", "put", "delete", "options"):
+            with self.subTest(method):
+                resp = getattr(self.client, method)("/healthz/", HTTP_HOST="10.0.0.7")
+                self.assertEqual(resp.status_code, 400)
+
+    def test_middleware_runs_first(self):
+        self.assertEqual(settings.MIDDLEWARE[0], "apps.core.health.LivenessMiddleware")
+
+
+@override_settings(ALLOWED_HOSTS=["api.example.com"])
+class ReadinessTests(TestCase):
+    """/readyz/ goes through normal request handling and checks only the
+    primary database (SELECT 1); Redis is not a readiness dependency."""
+
+    def _get(self, **extra):
+        return self.client.get("/readyz/", HTTP_HOST="api.example.com", **extra)
+
+    def test_ready_when_database_answers(self):
+        broken = MagicMock(side_effect=AssertionError("cache touched"))
+        with self.assertNumQueries(1), patch.object(cache, "get", broken):
+            resp = self._get()
+        self.assertEqual((resp.status_code, resp.content), (200, b"ok"))
+        self.assertEqual(resp["Cache-Control"], "no-store")
+
+    def test_unavailable_without_detail_when_database_fails(self):
+        from django.db import OperationalError
+
+        with patch("apps.core.views.connection.cursor", side_effect=OperationalError("password authentication failed for db-host")), \
+                self.assertLogs("apps.core.views", "ERROR"):
+            resp = self._get()
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.content, b"unavailable")
+        self.assertNotIn(b"password", resp.content)
+
+    def test_normal_host_validation_applies(self):
+        self.assertEqual(self.client.get("/readyz/", HTTP_HOST="10.0.0.7").status_code, 400)
+
+    @override_settings(SECURE_SSL_REDIRECT=True)
+    def test_normal_https_handling_applies(self):
+        self.assertEqual(self._get().status_code, 301)
+
+    def test_no_login_needed_and_get_only(self):
+        self.assertEqual(self._get().status_code, 200)
+        self.assertEqual(self.client.post("/readyz/", HTTP_HOST="api.example.com").status_code, 405)

@@ -18,6 +18,7 @@ from unfold.decorators import action
 from unfold.widgets import (
     UnfoldAdminDecimalFieldWidget,
     UnfoldAdminIntegerFieldWidget,
+    UnfoldAdminSelect2Widget,
     UnfoldAdminSelectWidget,
     UnfoldAdminTextareaWidget,
     UnfoldAdminTextInputWidget,
@@ -105,7 +106,7 @@ class InStoreSaleForm(forms.Form):
         queryset=Warehouse.objects.order_by("name"), widget=UnfoldAdminSelectWidget,
         help_text="Stock location the items leave from.",
     )
-    notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget)
+    notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget(attrs={"rows": 2}))
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -119,7 +120,11 @@ class InStoreSaleForm(forms.Form):
 
 
 class InStoreSaleLineForm(forms.Form):
-    sku = forms.CharField(max_length=64, widget=UnfoldAdminTextInputWidget)
+    # A searchable select on the page (in-store-sale/items/); it submits the
+    # SKU. Its only option is the chosen item (see attach_item_labels).
+    sku = forms.CharField(
+        max_length=64, widget=forms.Select(attrs={"class": "counter-item", "data-theme": "admin-autocomplete"}),
+    )
     # No initial value: blank extra rows must stay "unchanged" so the
     # formset skips them instead of reporting required-field errors.
     quantity = forms.IntegerField(
@@ -136,16 +141,56 @@ class InStoreSaleLineForm(forms.Form):
 
 
 class _BaseLineFormSet(forms.BaseFormSet):
+    """Sale lines. The page adds rows from empty_form and removes them by
+    ticking DELETE, so indices and TOTAL_FORMS stay valid; deleted rows are
+    skipped, whatever they contain."""
+
+    def live_forms(self):
+        return [
+            form for form in self.forms
+            if not self._should_delete_form(form) and form.cleaned_data.get("variant")
+        ]
+
     def clean(self):
         super().clean()
         if any(self.errors):
             return
-        if not any(form.cleaned_data.get("variant") for form in self.forms):
+        if not self.live_forms():
             raise forms.ValidationError("Add at least one item.")
+
+    def attach_item_labels(self):
+        """Give each row's item select one option: its chosen SKU, labelled
+        with the product name, so a re-rendered form shows what was picked."""
+        skus = {(form["sku"].value() or "").strip() for form in self.forms} - {""}
+        names = {
+            variant.sku: str(variant)
+            for variant in ProductVariant.objects.filter(sku__in=skus).select_related("edition__product__brand")
+        }
+        for form in self.forms:
+            sku = (form["sku"].value() or "").strip()
+            form.fields["sku"].widget.choices = [("", "")] + ([(sku, names.get(sku, sku))] if sku else [])
+
+    def lines(self):
+        return [(form.cleaned_data["variant"], form.cleaned_data["quantity"]) for form in self.live_forms()]
+
+    def check_stock(self, warehouse):
+        """Add an error under each line asking for more than the warehouse
+        holds physically (rows of one SKU count together). Display check
+        only: the locked reservation at sale time stays authoritative."""
+        forms_by_variant = {}
+        for form in self.live_forms():
+            forms_by_variant.setdefault(form.cleaned_data["variant"], []).append(form)
+        available = in_store_available([v.pk for v in forms_by_variant], warehouse)
+        for variant, line_forms in forms_by_variant.items():
+            units = available.get(variant.pk, 0)
+            if sum(f.cleaned_data["quantity"] for f in line_forms) > units:
+                noun = "unit is" if units == 1 else "units are"
+                line_forms[-1].add_error("quantity", f"Only {units} {noun} available in {warehouse}.")
+        return not any(form.errors for form in self.live_forms())
 
 
 InStoreSaleLineFormSet = forms.formset_factory(
-    InStoreSaleLineForm, formset=_BaseLineFormSet, extra=5, max_num=50
+    InStoreSaleLineForm, formset=_BaseLineFormSet, extra=1, max_num=50, can_delete=True,
 )
 
 
@@ -560,13 +605,9 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
         if request.method == "POST":
             form = InStoreSaleForm(request.POST)
             formset = InStoreSaleLineFormSet(request.POST, prefix="lines")
-            if form.is_valid() and formset.is_valid():
+            if form.is_valid() and formset.is_valid() and formset.check_stock(form.cleaned_data["warehouse"]):
                 data = form.cleaned_data
-                lines = [
-                    (line["variant"], line["quantity"])
-                    for line in formset.cleaned_data
-                    if line.get("variant")
-                ]
+                lines = formset.lines()
                 try:
                     order = order_services.create_in_store_order(
                         customer_mobile=data["customer_mobile"],
@@ -592,12 +633,15 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
             form = InStoreSaleForm()
             formset = InStoreSaleLineFormSet(prefix="lines")
 
+        formset.attach_item_labels()
         context = {
             **self.admin_site.each_context(request),
             "title": "New in-store sale",
             "opts": self.model._meta,
             "form": form,
             "formset": formset,
+            # jQuery + Select2 for the item picker, as Unfold's own select uses.
+            "media": form.media + UnfoldAdminSelect2Widget().media,
         }
         return TemplateResponse(request, "admin/orders/in_store_sale.html", context)
 

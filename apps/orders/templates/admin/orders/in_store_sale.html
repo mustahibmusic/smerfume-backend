@@ -1,6 +1,10 @@
 {% extends "admin/base_site.html" %}
 {% load i18n %}
 
+{% block extrahead %}
+{{ block.super }}{{ media }}
+{% endblock %}
+
 {% block breadcrumbs %}{% endblock %}
 
 {% block content %}
@@ -11,48 +15,256 @@
         In-store orders cannot be returned online.
     </p>
 
-    <form method="post" novalidate>
+    <form method="post" id="in-store-sale" novalidate>
         {% csrf_token %}
 
         {% if form.non_field_errors %}
-            <div class="mb-6">
+            <div class="mb-6" role="alert">
                 {% include "unfold/helpers/form_errors.html" with errors=form.non_field_errors %}
             </div>
         {% endif %}
 
-        <h2 class="font-semibold mb-4">Customer & payment</h2>
-        <div class="grid gap-x-6 md:grid-cols-2">
-            {% for field in form %}
-                {% include "unfold/helpers/field.html" with field=field %}
-            {% endfor %}
+        <h2 class="font-semibold mb-4">Customer &amp; payment</h2>
+        <div class="grid gap-4 grid-cols-1 md:grid-cols-3">
+            <div>{% include "unfold/helpers/field.html" with field=form.customer_mobile %}</div>
+            <div>{% include "unfold/helpers/field.html" with field=form.customer_name %}</div>
+            <div>{% include "unfold/helpers/field.html" with field=form.warehouse %}</div>
+            <div>{% include "unfold/helpers/field.html" with field=form.payment_method %}</div>
+            <div>{% include "unfold/helpers/field.html" with field=form.payment_reference %}</div>
+            <div>{% include "unfold/helpers/field.html" with field=form.discount_amount %}</div>
+            <div class="md:col-span-3">{% include "unfold/helpers/field.html" with field=form.notes %}</div>
         </div>
 
         <h2 class="font-semibold mb-4 mt-4">Items</h2>
         {{ formset.management_form }}
         {% if formset.non_form_errors %}
-            <div class="mb-4">
+            <div class="mb-4" role="alert">
                 {% include "unfold/helpers/form_errors.html" with errors=formset.non_form_errors %}
             </div>
         {% endif %}
-        {% for line in formset %}
-            <div class="grid gap-x-6 md:grid-cols-3">
-                <div class="md:col-span-2">
-                    {% include "unfold/helpers/field.html" with field=line.sku %}
-                </div>
-                {% include "unfold/helpers/field.html" with field=line.quantity %}
-            </div>
-        {% endfor %}
 
-        <div class="flex gap-4 mt-4">
+        <div class="border border-base-200 dark:border-base-700 overflow-x-auto rounded-default">
+            <table class="text-sm w-full">
+                <thead>
+                    <tr class="border-b border-base-200 dark:border-base-700 text-base-500 dark:text-base-400 text-left text-xs uppercase">
+                        <th class="font-semibold px-3 py-2">Item</th>
+                        <th class="font-semibold px-3 py-2 w-32">Qty</th>
+                        <th class="font-semibold px-3 py-2 text-right w-32">Rate</th>
+                        <th class="font-semibold px-3 py-2 text-right w-32">Amount</th>
+                        <th class="px-3 py-2 w-10"><span class="hidden">Remove</span></th>
+                    </tr>
+                </thead>
+                <tbody id="sale-lines">
+                    {% for line in formset %}
+                        {% include "admin/orders/in_store_sale_line.html" with line=line %}
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        <template id="sale-line-template">
+            {% include "admin/orders/in_store_sale_line.html" with line=formset.empty_form %}
+        </template>
+
+        <div class="flex flex-wrap gap-4 justify-between mt-4">
+            <button type="button" id="add-line"
+                    class="bg-white border border-base-200 cursor-pointer dark:bg-base-900 dark:border-base-700 dark:hover:bg-base-800 focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium gap-2 hover:bg-base-50 inline-flex items-center px-3 py-2 rounded-default self-start shadow-xs text-sm">
+                <span class="material-symbols-outlined" aria-hidden="true">add</span>
+                Add row
+            </button>
+            <dl class="max-w-sm text-sm w-full" aria-live="polite">
+                <div class="flex justify-between py-1"><dt>Subtotal</dt><dd id="sale-subtotal">0.00</dd></div>
+                <div class="flex justify-between py-1"><dt>Discount</dt><dd id="sale-discount">0.00</dd></div>
+                <div class="border-t border-base-200 dark:border-base-700 flex font-semibold justify-between mt-1 py-2 text-base">
+                    <dt>Total (₹)</dt><dd id="sale-total">0.00</dd>
+                </div>
+                <p class="text-base-500 dark:text-base-400 text-xs">Shown for checking only. Prices and totals are recalculated when the sale is recorded.</p>
+            </dl>
+        </div>
+
+        <div class="flex gap-4 mt-6">
             <button type="submit"
-                    class="bg-primary-600 border border-transparent font-medium px-3 py-2 rounded-default text-sm text-white">
+                    class="bg-primary-600 border border-transparent cursor-pointer focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium hover:bg-primary-700 px-3 py-2 rounded-default text-sm text-white">
                 Record sale
             </button>
             <a href="{% url 'admin:orders_order_changelist' %}"
-               class="border border-base-200 font-medium px-3 py-2 rounded-default text-sm">
+               class="border border-transparent dark:hover:bg-base-800 focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium hover:bg-base-100 px-3 py-2 rounded-default text-sm">
                 Cancel
             </a>
         </div>
     </form>
 </div>
+
+<script>
+{# Sale-line CRUD only: rows come from the formset's empty_form and are removed by ticking DELETE, so indices and TOTAL_FORMS stay valid. Item search is server-side; the server re-prices everything. #}
+(function () {
+    const $ = django.jQuery;
+    const searchUrl = "{% url 'admin:orders_order_in_store_items' %}";
+    const form = document.getElementById("in-store-sale");
+    const body = document.getElementById("sale-lines");
+    const total = form.querySelector('[name="lines-TOTAL_FORMS"]');
+    const warehouse = form.querySelector('[name="warehouse"]');
+    const discount = form.querySelector('[name="discount_amount"]');
+
+    const toPaise = (value) => Math.round(parseFloat(value || 0) * 100) || 0;
+    const money = (paise) => (paise / 100).toFixed(2);
+    const liveRows = () => Array.from(body.querySelectorAll("tr[data-line]")).filter((row) => !row.hidden && !row.classList.contains("hidden"));
+    const field = (row, name) => row.querySelector(`[name$="-${name}"]`);
+    const warehouseName = () => warehouse.options[warehouse.selectedIndex]?.text || "this warehouse";
+
+    function setItem(row, item) {
+        row.dataset.sku = item ? item.sku : "";
+        row.dataset.price = item ? item.price : "";
+        row.dataset.stock = item ? item.stock : "";
+        row.querySelector("[data-rate]").textContent = item ? item.price : "";
+        row.querySelector("[data-meta]").textContent = item
+            ? [item.sku, item.barcode, `${item.stock} in stock`].filter(Boolean).join(" · ") : "";
+    }
+
+    function recalc() {
+        let subtotal = 0;
+        const wanted = {};
+        liveRows().forEach((row) => {
+            const qty = parseInt(field(row, "quantity").value, 10) || 0;
+            const amount = row.dataset.price ? toPaise(row.dataset.price) * qty : 0;
+            row.querySelector("[data-amount]").textContent = row.dataset.price ? money(amount) : "";
+            subtotal += amount;
+            if (row.dataset.sku) wanted[row.dataset.sku] = (wanted[row.dataset.sku] || 0) + qty;
+        });
+        liveRows().forEach((row) => {
+            const warn = row.querySelector("[data-stock-warning]");
+            const stock = row.dataset.stock === "" ? null : parseInt(row.dataset.stock, 10);
+            // A line the server already refused shows the server's message instead.
+            const short = row.dataset.sku && stock !== null && wanted[row.dataset.sku] > stock
+                && !row.querySelector("td.errors");
+            warn.textContent = short
+                ? `Only ${stock} ${stock === 1 ? "unit is" : "units are"} available in ${warehouseName()}.` : "";
+        });
+        const off = Math.min(toPaise(discount.value), subtotal);
+        document.getElementById("sale-subtotal").textContent = money(subtotal);
+        document.getElementById("sale-discount").textContent = money(off);
+        document.getElementById("sale-total").textContent = money(subtotal - off);
+    }
+
+    function refreshStock() {
+        const skus = [...new Set(liveRows().map((row) => row.dataset.sku || field(row, "sku").value).filter(Boolean))];
+        if (!skus.length) { recalc(); return; }
+        $.getJSON(searchUrl, { skus: skus.join(","), warehouse: warehouse.value }, (data) => {
+            const bySku = Object.fromEntries(data.results.map((item) => [item.sku, item]));
+            liveRows().forEach((row) => {
+                const sku = row.dataset.sku || field(row, "sku").value;
+                if (bySku[sku]) setItem(row, bySku[sku]);
+            });
+            recalc();
+        });
+    }
+
+    function itemResult(item) {
+        if (!item.sku) return item.text;
+        const box = document.createElement("div");
+        const name = document.createElement("div");
+        name.textContent = item.text;
+        const meta = document.createElement("div");
+        meta.className = "text-xs";
+        meta.textContent = [item.sku, item.barcode, `Stock: ${item.stock}`, `₹${item.price}`].filter(Boolean).join(" · ");
+        box.append(name, meta);
+        return box;
+    }
+
+    function chooseItem(row, item) {
+        const select = field(row, "sku");
+        const twin = liveRows().find((other) => other !== row && other.dataset.sku === item.sku);
+        if (twin) {
+            // Same SKU again: one visible line, one more unit.
+            const qty = field(twin, "quantity");
+            qty.value = (parseInt(qty.value, 10) || 0) + 1;
+            $(select).val(row.dataset.sku || null).trigger("change.select2");
+            qty.focus();
+            recalc();
+            return;
+        }
+        if (!select.querySelector(`option[value="${CSS.escape(item.sku)}"]`)) select.append(new Option(item.text, item.sku));
+        $(select).val(item.sku).trigger("change.select2");
+        setItem(row, item);
+        const qty = field(row, "quantity");
+        if (!qty.value) qty.value = 1;
+        qty.focus();
+        qty.select();
+        recalc();
+    }
+
+    function initRow(row) {
+        const select = $(field(row, "sku"));
+        select.select2({
+            theme: "admin-autocomplete",
+            width: "100%",
+            placeholder: "Type or scan an item",
+            minimumInputLength: 1,
+            ajax: {
+                url: searchUrl,
+                delay: 250,
+                data: (params) => ({ q: params.term, warehouse: warehouse.value }),
+                processResults: (data) => ({ results: data.results }),
+            },
+            templateResult: itemResult,
+        });
+        select.on("select2:select", (event) => chooseItem(row, event.params.data));
+        field(row, "quantity").addEventListener("input", recalc);
+        row.querySelector("[data-remove]").addEventListener("click", () => removeRow(row));
+    }
+
+    function addRow() {
+        const index = parseInt(total.value, 10);
+        const html = document.getElementById("sale-line-template").innerHTML.replace(/__prefix__/g, index);
+        body.insertAdjacentHTML("beforeend", html);
+        total.value = index + 1;
+        const row = body.lastElementChild;
+        initRow(row);
+        $(field(row, "sku")).select2("open");
+        return row;
+    }
+
+    function removeRow(row) {
+        field(row, "DELETE").checked = true;
+        $(field(row, "sku")).select2("close");
+        row.classList.add("hidden");
+        if (!liveRows().length) addRow();
+        recalc();
+    }
+
+    // Scanners type the code and press Enter: pick an exact barcode/SKU
+    // match at once instead of waiting for the search delay.
+    document.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" || !event.target.classList.contains("select2-search__field")) return;
+        const open = liveRows().find((row) => $(field(row, "sku")).data("select2")?.isOpen());
+        const term = event.target.value.trim();
+        if (!open || !term) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const select = $(field(open, "sku"));
+        $.getJSON(searchUrl, { q: term, warehouse: warehouse.value }, (data) => {
+            const exact = data.results.filter((item) => item.exact);
+            if (exact.length === 1) {
+                select.select2("close");
+                chooseItem(open, exact[0]);
+            } else {
+                select.data("select2").trigger("results:select", {});
+            }
+        });
+    }, true);
+
+    // Enter in a line field adds a row; the sale is only recorded by its button.
+    body.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && event.target.matches('input[name$="-quantity"]')) {
+            event.preventDefault();
+            addRow();
+        }
+    });
+
+    document.getElementById("add-line").addEventListener("click", addRow);
+    warehouse.addEventListener("change", refreshStock);
+    discount.addEventListener("input", recalc);
+    liveRows().forEach(initRow);
+    refreshStock();
+})();
+</script>
 {% endblock %}

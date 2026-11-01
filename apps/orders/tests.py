@@ -37,6 +37,7 @@ Test groups:
     InStoreSaleAdminTests         — DEC-008: admin 'New in-store sale' page
 """
 
+import re
 import threading
 import uuid
 from datetime import timedelta
@@ -4375,3 +4376,185 @@ class InStoreItemSearchTests(TestCase):
             _counter_variant("Many", f"Many {i}", None, f"MANY-{i}")
         _make_decant_pair(source_size_ml=100, decant_volume_ml=10, source_retail_quantity=2)
         self.assertEqual(count("many"), one)
+
+
+# ── In-store item table: line formset ────────────────────────────────────────
+
+class InStoreLineFormsetTests(TestCase):
+    """Rows are added from the formset's empty_form and removed by ticking
+    their DELETE box, so indices and TOTAL_FORMS always stay valid."""
+
+    def setUp(self):
+        self.admin_user = User.objects.create_superuser(
+            username="lineformset", email="lineformset@example.com", password="testpass123",
+        )
+        self.client.force_login(self.admin_user)
+        self.warehouse = Warehouse.objects.get(is_default=True)
+        self.a = _make_variant(selling_price="1000.00")
+        self.b = _make_variant(selling_price="250.00")
+        self.c = _make_variant(selling_price="40.00")
+
+    def _post(self, rows, **overrides):
+        """rows: list of (sku, quantity, deleted)."""
+        data = {
+            "customer_mobile": "9811100777", "customer_name": "", "payment_method": "cash",
+            "payment_reference": "", "discount_amount": "0", "warehouse": str(self.warehouse.pk), "notes": "",
+            "lines-TOTAL_FORMS": str(len(rows)), "lines-INITIAL_FORMS": "0",
+            "lines-MIN_NUM_FORMS": "0", "lines-MAX_NUM_FORMS": "50",
+        }
+        for i, (sku, quantity, deleted) in enumerate(rows):
+            data[f"lines-{i}-sku"] = sku
+            data[f"lines-{i}-quantity"] = str(quantity)
+            if deleted:
+                data[f"lines-{i}-DELETE"] = "on"
+        data.update(overrides)
+        return self.client.post(ADMIN_IN_STORE_URL, data)
+
+    def _sold(self):
+        order = Order.objects.get()
+        return {item.variant_id: item.quantity for item in order.items.all()}
+
+    def _line_errors(self, resp, index):
+        return resp.context["formset"].forms[index].errors
+
+    def test_page_starts_with_one_row_and_an_empty_form_template(self):
+        resp = self.client.get(ADMIN_IN_STORE_URL)
+        html = resp.content.decode()
+        self.assertIn('name="lines-TOTAL_FORMS" value="1"', html)
+        self.assertIn('name="lines-0-sku"', html)
+        self.assertNotIn('name="lines-1-sku"', html)
+        self.assertIn('name="lines-__prefix__-sku"', html)
+        self.assertIn('name="lines-0-DELETE"', html)
+
+    def test_delete_middle_row(self):
+        resp = self._post([(self.a.sku, 1, False), (self.b.sku, 2, True), (self.c.sku, 3, False)])
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(self._sold(), {self.a.pk: 1, self.c.pk: 3})
+
+    def test_deleted_row_with_bad_data_is_ignored(self):
+        resp = self._post([(self.a.sku, 1, False), ("NOPE", "x", True)])
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(self._sold(), {self.a.pk: 1})
+
+    def test_add_after_delete(self):
+        resp = self._post([(self.a.sku, 1, False), (self.b.sku, 1, True), ("", "", False), (self.c.sku, 2, False)])
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(self._sold(), {self.a.pk: 1, self.c.pk: 2})
+
+    def test_repeated_add_remove_cycles(self):
+        rows = [
+            (self.a.sku, 1, True), (self.b.sku, 1, False), ("", "", True), (self.c.sku, 4, True),
+            (self.a.sku, 2, False), ("", "", False), (self.c.sku, 1, False), (self.b.sku, 9, True),
+        ]
+        resp = self._post(rows)
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(self._sold(), {self.b.pk: 1, self.a.pk: 2, self.c.pk: 1})
+
+    def test_all_rows_deleted(self):
+        resp = self._post([(self.a.sku, 1, True), (self.b.sku, 1, True)])
+        self.assertContains(resp, "Add at least one item")
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_missing_management_form_is_an_error_not_a_crash(self):
+        resp = self._post([(self.a.sku, 1, False)], **{"lines-TOTAL_FORMS": ""})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.context["formset"].non_form_errors())
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_deleted_rows_stay_hidden_after_an_error(self):
+        resp = self._post([(self.a.sku, 1, False), (self.b.sku, 1, True), ("NOPE", 1, False)])
+        self.assertEqual(resp.status_code, 200)
+        rows = re.findall(r"<tr\b[^>]*data-line[^>]*>.*?</tr>", resp.content.decode(), re.S)
+        deleted = next(row for row in rows if 'name="lines-1-sku"' in row)
+        self.assertRegex(deleted.split(">", 1)[0], r"\bhidden\b")
+        kept = next(row for row in rows if 'name="lines-0-sku"' in row)
+        self.assertNotRegex(kept.split(">", 1)[0], r"\bhidden\b")
+
+    # Quantity and stock ----------------------------------------------------
+
+    def test_zero_and_negative_quantity_refused(self):
+        for quantity in (0, -2):
+            with self.subTest(quantity=quantity):
+                resp = self._post([(self.a.sku, quantity, False)])
+                self.assertIn("quantity", self._line_errors(resp, 0))
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_quantity_above_stock_is_an_inline_line_error(self):
+        InventoryStock.objects.filter(variant=self.a).update(quantity=Decimal("4"))
+        resp = self._post([(self.b.sku, 1, False), (self.a.sku, 5, False)])
+        self.assertEqual(self._line_errors(resp, 1)["quantity"],
+                         ["Only 4 units are available in Default Warehouse."])
+        self.assertEqual(self._line_errors(resp, 0), {})
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_single_unit_message(self):
+        InventoryStock.objects.filter(variant=self.a).update(quantity=Decimal("1"))
+        resp = self._post([(self.a.sku, 2, False)])
+        self.assertEqual(self._line_errors(resp, 0)["quantity"], ["Only 1 unit is available in Default Warehouse."])
+
+    def test_same_sku_on_two_rows_checked_together(self):
+        InventoryStock.objects.filter(variant=self.a).update(quantity=Decimal("3"))
+        resp = self._post([(self.a.sku, 2, False), (self.a.sku, 2, False)])
+        self.assertIn("quantity", self._line_errors(resp, 1))
+        self.assertEqual(Order.objects.count(), 0)
+        resp = self._post([(self.a.sku, 2, False), (self.a.sku, 1, False)])
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(self._sold(), {self.a.pk: 3})
+
+    def test_stock_checked_in_chosen_warehouse(self):
+        other = Warehouse.objects.create(name="Counter Four")
+        resp = self._post([(self.a.sku, 1, False)], warehouse=str(other.pk))
+        self.assertEqual(self._line_errors(resp, 0)["quantity"], ["Only 0 units are available in Counter Four."])
+
+    def test_race_after_the_check_still_fails_safely(self):
+        InventoryStock.objects.filter(variant=self.a).update(quantity=Decimal("1"))
+        with patch("apps.orders.admin.in_store_available", return_value={self.a.pk: 99}):
+            resp = self._post([(self.a.sku, 2, False)])
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.context["form"].non_field_errors())
+        self.assertEqual(Order.objects.count(), 0)
+        self.assertEqual(InventoryStock.objects.get(variant=self.a).quantity_reserved, 0)
+
+    # Pricing ----------------------------------------------------------------
+
+    def test_browser_rate_and_totals_are_ignored(self):
+        resp = self._post(
+            [(self.a.sku, 2, False), (self.b.sku, 1, False)],
+            **{"lines-0-rate": "1.00", "lines-0-amount": "2.00", "subtotal": "3", "total": "3",
+               "discount_amount": "250"},
+        )
+        self.assertEqual(resp.status_code, 302)
+        order = Order.objects.get()
+        self.assertEqual((order.subtotal, order.discount_amount, order.total),
+                         (Decimal("2250.00"), Decimal("250.00"), Decimal("2000.00")))
+        self.assertEqual(order.items.get(variant=self.a).unit_price, Decimal("1000.00"))
+
+    def test_sale_still_delivered_and_stock_deducted(self):
+        resp = self._post([(self.a.sku, 3, False)])
+        self.assertEqual(resp.status_code, 302)
+        order = Order.objects.get()
+        self.assertEqual(order.status, Order.STATUS_DELIVERED)
+        self.assertEqual(InventoryStock.objects.get(variant=self.a).quantity, Decimal("97"))
+
+
+class InStoreTemplateStylingTests(TestCase):
+    def test_templates_only_use_classes_unfold_ships(self):
+        # Unfold ships prebuilt Tailwind CSS: a utility class it never uses
+        # has no styles at all on a custom admin page.
+        import os
+
+        import unfold
+        from django.conf import settings
+
+        with open(os.path.join(os.path.dirname(unfold.__file__), "static", "unfold", "css", "styles.css")) as handle:
+            css = handle.read()
+        folder = os.path.join(settings.BASE_DIR, "apps", "orders", "templates", "admin", "orders")
+        missing = set()
+        for name in ("in_store_sale.html", "in_store_sale_line.html"):
+            with open(os.path.join(folder, name), encoding="utf-8") as handle:
+                source = handle.read()
+            for attr in re.findall(r'class="([^"{}%]*)"', source):
+                for css_class in attr.split():
+                    if "." + re.sub(r"([:\[\]./])", lambda m: chr(92) + m.group(1), css_class) not in css:
+                        missing.add(css_class)
+        self.assertEqual(sorted(missing), [])

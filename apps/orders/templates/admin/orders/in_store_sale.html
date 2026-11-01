@@ -48,7 +48,7 @@
                 <thead>
                     <tr class="border-b border-base-200 dark:border-base-700 text-base-500 dark:text-base-400 text-left text-xs uppercase">
                         <th class="font-semibold px-3 py-2">Item</th>
-                        <th class="font-semibold px-3 py-2 w-32">Qty</th>
+                        <th class="font-semibold px-3 py-2 w-40">Qty</th>
                         <th class="font-semibold px-3 py-2 text-right w-32">Rate</th>
                         <th class="font-semibold px-3 py-2 text-right w-32">Amount</th>
                         <th class="px-3 py-2 w-10"><span class="hidden">Remove</span></th>
@@ -192,6 +192,12 @@
         recalc();
     }
 
+    // Once a line is edited, the server's earlier message about it is stale.
+    function clearServerErrors(row) {
+        row.querySelectorAll("[data-server-error]").forEach((node) => node.remove());
+        row.querySelectorAll("td.errors").forEach((cell) => cell.classList.remove("errors"));
+    }
+
     function initRow(row) {
         const select = $(field(row, "sku"));
         select.select2({
@@ -207,8 +213,8 @@
             },
             templateResult: itemResult,
         });
-        select.on("select2:select", (event) => chooseItem(row, event.params.data));
-        field(row, "quantity").addEventListener("input", recalc);
+        select.on("select2:select", (event) => { clearServerErrors(row); chooseItem(row, event.params.data); });
+        field(row, "quantity").addEventListener("input", () => { clearServerErrors(row); recalc(); });
         row.querySelector("[data-remove]").addEventListener("click", () => removeRow(row));
     }
 

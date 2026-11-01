@@ -3,12 +3,12 @@
     <td class="px-3 py-2">
         {{ line.sku }}
         <div class="mt-1 text-base-500 dark:text-base-400 text-xs" data-meta></div>
-        {% include "unfold/helpers/form_errors.html" with errors=line.sku.errors %}
+        <div data-server-error>{% include "unfold/helpers/form_errors.html" with errors=line.sku.errors %}</div>
     </td>
     <td class="px-3 py-2 {% if line.quantity.errors %}errors group{% endif %}">
         {{ line.quantity }}
         <div class="mt-1 text-red-600 dark:text-red-500 text-xs" data-stock-warning></div>
-        {% include "unfold/helpers/form_errors.html" with errors=line.quantity.errors %}
+        <div data-server-error>{% include "unfold/helpers/form_errors.html" with errors=line.quantity.errors %}</div>
     </td>
     <td class="px-3 py-2 text-right" data-rate></td>
     <td class="font-medium px-3 py-2 text-right" data-amount></td>

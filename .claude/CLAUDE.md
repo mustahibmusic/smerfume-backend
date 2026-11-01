@@ -220,29 +220,60 @@ When creating or modifying an API:
 
 ## Development Workflow
 
-Before implementation:
+### Branching Rules
+
+Never implement features, bug fixes, defects, refactors, migrations, or other code changes directly on `dev`, `uat`, or `main`.
+
+If the current branch is `dev`, `uat`, or `main` and the task requires code changes, create a new branch before editing files.
+
+Do not reuse an old feature branch for unrelated new work.
+
+For every meaningful code change:
+
+1. Start from the approved `dev` baseline.
+2. Verify the working tree is clean.
+3. Verify local `dev` matches the expected `origin/dev`.
+4. If `origin/dev` has advanced unexpectedly, stop and report before branching.
+5. Create a new branch before modifying code.
+6. Use a clear branch prefix:
+   - `feat/` for features
+   - `fix/` for bugs/defects
+   - `refactor/` for refactors
+   - `chore/` for maintenance/tooling
+   - `docs/` for documentation-only changes
+7. Keep unrelated work out of the branch.
+8. Do not merge into `dev` without explicit confirmation.
+9. Do not push or modify `uat` or `main` unless explicitly instructed.
+
+Examples:
+
+- `feat/redis-throttling`
+- `fix/order-cancellation-stock-release`
+- `refactor/inventory-reservation-locking`
+- `docs/booked-incoming-architecture`
+
+### Before implementation
 
 1. Understand the existing implementation.
 2. Identify affected files/modules.
 3. Check relevant business requirements.
 4. Check approved business decisions.
 5. Check relevant technical decisions.
-6. For significant architectural changes, explain the proposed approach
-   before implementation.
+6. For significant architectural changes, explain the proposed approach before implementation.
 
-During implementation:
+### During implementation
 
 - Make the smallest appropriate change.
 - Avoid unrelated refactoring.
 - Follow existing patterns.
 - Add or update tests.
 
-After implementation:
+### After implementation
 
 - Run relevant tests.
 - Check for regressions.
-- Update CURRENT_STATE.md if the task meaningfully changes project state.
-- Record significant technical decisions in DECISIONS.md.
+- Update `CURRENT_STATE.md` if the task meaningfully changes project state.
+- Record significant technical decisions in `DECISIONS.md`.
 
 ## Security
 
@@ -287,3 +318,138 @@ Entire Repository
 
 The goal is to maintain a clean, scalable and understandable codebase while
 minimizing unnecessary context and token consumption.
+
+## Session Handoff and Project State
+
+Maintain two local project-state files:
+
+- `.claude/SESSION_HANDOFF.md`
+  - short-lived handoff between Claude Code sessions
+  - updated before `/clear` or `/compact`
+  - records only the context needed to continue the current work
+
+- `.claude/CURRENT_STATE.md`
+  - durable summary of the actual project state
+  - tracks completed/pending modules, branches, remote state,
+    migrations, test baseline, deployment prerequisites and known debt
+
+Both files are local working-state files and must not be staged or committed
+unless explicitly instructed.
+
+### Before `/clear` or `/compact`
+
+When the user indicates that the current session is ending, being cleared,
+or being compacted:
+
+1. Update `.claude/SESSION_HANDOFF.md`.
+2. Update `.claude/CURRENT_STATE.md` if the project state changed during
+   the session.
+3. Do not perform a broad repository reread just to update these files.
+   Use the work and results already established in the current session.
+
+`SESSION_HANDOFF.md` should contain only:
+
+- current branch and HEAD
+- base branch / relevant remote status
+- current task or phase
+- what was completed in this session
+- commits created
+- tests/checks already run and their results
+- important decisions made
+- uncommitted changes that must be preserved
+- blockers or prerequisites
+- exact next recommended step
+
+Keep it concise. Do not turn it into project documentation.
+
+### When CURRENT_STATE.md must be updated
+
+Update `.claude/CURRENT_STATE.md` whenever a meaningful project-state
+transition occurs, including:
+
+- a feature, bug fix, defect, refactor or other meaningful change is merged
+- a branch is pushed to a remote
+- `dev`, `uat`, `staging`, `main` or another deployment branch changes
+- a feature is deployed to an environment
+- a major phase/module becomes complete
+- a feature flag is enabled or disabled as part of rollout
+- migrations are applied to a shared environment
+- the canonical test baseline changes materially
+- a blocker or deployment prerequisite is resolved or introduced
+- an important pending item becomes completed or obsolete
+
+Do not wait for the end of the session if one of these events happens.
+
+### Remote-state recording
+
+When work is pushed or deployed, CURRENT_STATE.md must explicitly record:
+
+- branch
+- local HEAD
+- corresponding remote HEAD when known
+- whether local and remote match
+- merge status
+- environment affected
+- migration status if relevant
+- feature-flag status if relevant
+- latest relevant test/check result
+
+Never claim something is pushed, merged or deployed unless it was actually
+verified.
+
+### Before ending a substantial task
+
+Check that SESSION_HANDOFF.md and CURRENT_STATE.md do not contradict each
+other.
+
+If CURRENT_STATE.md contains stale information discovered during the task,
+correct it locally before handoff.
+
+
+## Figma Read-Only Design Reference
+
+The connected Smerfume Figma file is a READ-ONLY product/design reference.
+
+Claude may:
+- inspect Figma files, pages, frames and components
+- read layout, text, fields, states and interaction context
+- use Figma to understand customer-facing and admin-facing workflows
+- compare Figma requirements with the existing backend
+- reference Figma when designing APIs, models, services and admin workflows
+
+Claude must NEVER:
+- create Figma frames
+- modify designs
+- move, resize or delete layers
+- edit text
+- change components, styles, variables or prototypes
+- write to the Figma canvas
+- generate or send designs back into Figma
+
+If a Figma tool/action would modify the Figma file, DO NOT use it.
+
+Before backend implementation for a UI-driven feature:
+1. Inspect only the relevant Figma frames.
+2. Identify the user actions, fields, states, validations and data required.
+3. Compare them with the existing backend.
+4. Report mismatches before implementation.
+
+Figma is the authoritative UI/product reference, but it does not override:
+- approved DEC decisions
+- backend data-integrity rules
+- security/permission rules
+- GST/accounting decisions
+- inventory/ledger invariants
+
+If Figma conflicts with an approved backend decision, stop and report the
+conflict instead of changing either side automatically.
+
+Do not broadly scan the whole Figma file unless explicitly requested.
+Use only the relevant frames for the current feature.
+
+## Smerfume Figma
+
+Primary Figma file:
+https://www.figma.com/design/Ryqnrl7GMJrSFajJeLs3BT/Smerfume?node-id=259-476&t=8pDGaaVrRsQ1ulPr-1
+
+Use this file through the connected Figma MCP as a read-only reference.

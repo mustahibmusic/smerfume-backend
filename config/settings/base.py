@@ -106,6 +106,47 @@ def trusted_proxy_ssl_header():
     return None
 
 
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+def _below_warning(record):
+    return record.levelno < 30  # logging.WARNING
+
+
+def logging_config(level):
+    """Container logging: DEBUG/INFO to stdout, WARNING and above (including
+    django.request 500 tracebacks) to stderr, for the host to collect. No
+    mail_admins and no external vendor. Tracebacks never reach responses."""
+    level = str(level).strip().upper()
+    if level not in LOG_LEVELS:
+        raise ImproperlyConfigured(f"LOG_LEVEL must be one of {', '.join(LOG_LEVELS)}.")
+    handlers = ["stdout", "stderr"]
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "standard": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"},
+        },
+        "filters": {
+            "below_warning": {"()": "django.utils.log.CallbackFilter", "callback": _below_warning},
+        },
+        "handlers": {
+            "stdout": {
+                "class": "logging.StreamHandler", "stream": "ext://sys.stdout",
+                "formatter": "standard", "filters": ["below_warning"],
+            },
+            "stderr": {
+                "class": "logging.StreamHandler", "stream": "ext://sys.stderr",
+                "formatter": "standard", "level": "WARNING",
+            },
+        },
+        "root": {"handlers": handlers, "level": level},
+        "loggers": {
+            "django": {"handlers": handlers, "level": level, "propagate": False},
+        },
+    }
+
+
 def parse_num_proxies(raw):
     """NUM_PROXIES must be a non-negative integer. The value itself is
     environment-specific and must match the real proxy topology."""

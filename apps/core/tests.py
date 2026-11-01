@@ -1,4 +1,7 @@
 import importlib
+import io
+import logging
+import logging.config
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -7,10 +10,12 @@ from django.conf import settings
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
 from django.test import SimpleTestCase, TestCase, override_settings
+from django.urls import path
+from django.utils.log import configure_logging
 from redis.exceptions import RedisError
 from rest_framework.test import APIClient
 
-from config.settings.base import database_config, parse_num_proxies, redis_cache, require_env
+from config.settings.base import database_config, logging_config, parse_num_proxies, redis_cache, require_env
 
 
 class SettingsHelperTests(SimpleTestCase):
@@ -200,6 +205,17 @@ class DeployedSettingsFailFastTests(SimpleTestCase):
                 self.assertEqual((db["HOST"], db["NAME"], db["CONN_MAX_AGE"]), ("db.example.com", "shop", 60))
                 self.assertTrue(db["CONN_HEALTH_CHECKS"])
 
+    def test_deployed_logging_goes_to_stdout_and_stderr(self):
+        for name in self.DEPLOYED:
+            with self.subTest(name):
+                module = self._import(name, {**self.VALID, "LOG_LEVEL": "warning"})
+                handlers = module.LOGGING["handlers"]
+                self.assertEqual(handlers["stdout"]["stream"], "ext://sys.stdout")
+                self.assertEqual(handlers["stderr"]["stream"], "ext://sys.stderr")
+                self.assertEqual(module.LOGGING["root"]["level"], "WARNING")
+                with self.assertRaisesMessage(ImproperlyConfigured, "LOG_LEVEL"):
+                    self._import(name, {**self.VALID, "LOG_LEVEL": "loud"})
+
     def test_api_docs_not_public_when_deployed(self):
         for name in self.DEPLOYED:
             with self.subTest(name):
@@ -355,3 +371,53 @@ class DatabaseConfigTests(SimpleTestCase):
         with self.assertRaises(ImproperlyConfigured) as ctx:
             self._config({"DATABASE_URL": "mysql://user:secret@h/db"})
         self.assertNotIn("secret", str(ctx.exception))
+
+
+
+def _boom(request):
+    raise RuntimeError("internal detail 7f3a")
+
+
+urlpatterns = [path("boom/", _boom)]
+
+
+@override_settings(ROOT_URLCONF="apps.core.tests", DEBUG=False)
+class StdoutLoggingTests(SimpleTestCase):
+    """Unhandled 500s reach the provider's log stream with a traceback;
+    the HTTP response never carries it."""
+
+    def _with_logging(self, level="INFO"):
+        out, err = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", out), patch("sys.stderr", err):
+            logging.config.dictConfig(logging_config(level))
+        return out, err
+
+    def tearDown(self):
+        configure_logging(settings.LOGGING_CONFIG, settings.LOGGING)
+
+    def test_unhandled_error_logs_traceback_to_stderr_only(self):
+        out, err = self._with_logging()
+        client = self.client_class(raise_request_exception=False)
+        resp = client.get("/boom/")
+        self.assertEqual(resp.status_code, 500)
+        self.assertNotIn("internal detail 7f3a", resp.content.decode())
+        self.assertNotIn("Traceback", resp.content.decode())
+        self.assertIn("Traceback", err.getvalue())
+        self.assertIn("internal detail 7f3a", err.getvalue())
+        self.assertNotIn("internal detail 7f3a", out.getvalue())
+
+    def test_info_goes_to_stdout_not_stderr(self):
+        out, err = self._with_logging()
+        logging.getLogger("apps.core").info("hello stdout")
+        self.assertIn("hello stdout", out.getvalue())
+        self.assertNotIn("hello stdout", err.getvalue())
+
+    def test_level_is_respected(self):
+        out, err = self._with_logging("WARNING")
+        logging.getLogger("apps.core").info("quiet info")
+        self.assertNotIn("quiet info", out.getvalue() + err.getvalue())
+
+    def test_no_mail_admins_handler(self):
+        config = logging_config("INFO")
+        self.assertNotIn("mail_admins", config["handlers"])
+        self.assertEqual(config["loggers"]["django"]["handlers"], ["stdout", "stderr"])

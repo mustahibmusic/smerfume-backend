@@ -15,6 +15,7 @@ DATABASES = {"default": database_config(default_conn_max_age=60)}
 # Trust X-Forwarded-Proto only when the proxy in front always sets it;
 # without it, SECURE_SSL_REDIRECT behind a TLS-terminating proxy loops.
 SECURE_PROXY_SSL_HEADER = trusted_proxy_ssl_header()
+LOGGING = logging_config(os.getenv("LOG_LEVEL", "INFO"))
 
 CORS_ALLOWED_ORIGINS = [
     origin.strip()

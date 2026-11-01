@@ -6,11 +6,21 @@ DEBUG = False
 
 # No hardcoded fallback domain — staging must be configured explicitly,
 # same fail-closed principle as production/uat.
-ALLOWED_HOSTS = [
-    host.strip()
-    for host in os.getenv("ALLOWED_HOSTS", "").split(",")
-    if host.strip()
-]
+ALLOWED_HOSTS = require_env_list("ALLOWED_HOSTS")
+CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS")
+
+# ── Deployment (provider-neutral) ─────────────────────────────────────────
+SECRET_KEY = require_env("SECRET_KEY")
+DATABASES = {"default": database_config(default_conn_max_age=60)}
+# Trust X-Forwarded-Proto only when the proxy in front always sets it;
+# without it, SECURE_SSL_REDIRECT behind a TLS-terminating proxy loops.
+SECURE_PROXY_SSL_HEADER = trusted_proxy_ssl_header()
+LOGGING = logging_config(os.getenv("LOG_LEVEL", "INFO"))
+# Static files are collected into the image and served by WhiteNoise.
+STORAGES = {
+    **STORAGES,
+    "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},
+}
 
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
@@ -34,8 +44,8 @@ SIMPLE_JWT = {
 SECURE_BROWSER_XSS_FILTER = True
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = "DENY"
-SECURE_HSTS_SECONDS = 3600
-SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+SECURE_HSTS_SECONDS = env_int("SECURE_HSTS_SECONDS", 300)
+SECURE_HSTS_INCLUDE_SUBDOMAINS = False
 SECURE_SSL_REDIRECT = True
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True

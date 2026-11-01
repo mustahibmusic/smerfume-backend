@@ -592,10 +592,16 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
             "more": len(variants) > ITEM_SEARCH_LIMIT,
         })
 
+    def has_new_in_store_sale_permission(self, request, object_id=None):
+        # A method, not the dotted "orders.add_order": Unfold's system check
+        # queries auth_permission for dotted action permissions, which fails
+        # on an empty database before the first migrate.
+        return request.user.has_perm("orders.add_order")
+
     @action(
         description="New in-store sale",
         url_path="in-store-sale",
-        permissions=["orders.add_order"],
+        permissions=["new_in_store_sale"],
         icon="point_of_sale",
     )
     def new_in_store_sale(self, request):

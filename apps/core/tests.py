@@ -1,4 +1,7 @@
 import importlib
+import io
+import logging
+import logging.config
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -6,11 +9,28 @@ from unittest.mock import MagicMock, patch
 from django.conf import settings
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase, TestCase, override_settings
+from django.urls import path
+from django.utils.log import configure_logging
 from redis.exceptions import RedisError
 from rest_framework.test import APIClient
 
-from config.settings.base import parse_num_proxies, redis_cache, require_env
+from config.settings.base import (
+    database_config, logging_config, object_storage_settings, parse_num_proxies, redis_cache, require_env,
+)
+
+
+S3_ENV = {
+    "USE_S3": "True",
+    "AWS_ACCESS_KEY_ID": "test-key-id",
+    "AWS_SECRET_ACCESS_KEY": "test-secret",
+    "AWS_STORAGE_BUCKET_NAME": "smerfume-public",
+    "AWS_PRIVATE_STORAGE_BUCKET_NAME": "smerfume-private",
+    "AWS_S3_ENDPOINT_URL": "https://account.r2.example.com",
+    "AWS_S3_CUSTOM_DOMAIN": "media.example.com",
+    "AWS_S3_REGION_NAME": "",
+    "AWS_S3_ADDRESSING_STYLE": "",
+}
 
 
 class SettingsHelperTests(SimpleTestCase):
@@ -84,13 +104,25 @@ class DeployedSettingsFailFastTests(SimpleTestCase):
 
     DEPLOYED = ("staging", "uat", "production")
     VALID = {"REDIS_URL": "redis://cache:6379/0", "NUM_PROXIES": "1"}
+    # Required everywhere deployed; tests about Redis/proxies get them for free.
+    BASELINE = {
+        "SECRET_KEY": "test-secret", "ALLOWED_HOSTS": "api.example.com",
+        "CSRF_TRUSTED_ORIGINS": "https://api.example.com",
+    }
+    MANAGED = (
+        "REDIS_URL", "NUM_PROXIES", "SECRET_KEY", "ALLOWED_HOSTS", "CSRF_TRUSTED_ORIGINS", "UAT_HOST",
+        "TRUST_PROXY_SSL_HEADER", "SECURE_HSTS_SECONDS", "DATABASE_URL", "CONN_MAX_AGE", "LOG_LEVEL",
+        "USE_S3", *S3_ENV,
+    )
 
     def _import(self, name, env):
         # base is re-executed too, so it reads the patched environment.
         module_name = f"config.settings.{name}"
         base = sys.modules["config.settings.base"]
-        clean = {k: v for k, v in os.environ.items() if k not in self.VALID}
-        with patch.dict("os.environ", {**clean, **env}, clear=True):
+        clean = {k: v for k, v in os.environ.items() if k not in self.MANAGED}
+        # Production always needs object storage; other tests get a valid one.
+        baseline = {**self.BASELINE, **(S3_ENV if name == "production" else {})}
+        with patch.dict("os.environ", {**clean, **baseline, **env}, clear=True):
             sys.modules.pop(module_name, None)
             sys.modules.pop("config.settings.base", None)
             try:
@@ -134,6 +166,205 @@ class DeployedSettingsFailFastTests(SimpleTestCase):
                 )
                 self.assertEqual(module.REST_FRAMEWORK["NUM_PROXIES"], 1)
 
+    # Secrets, hosts and origins -------------------------------------------
+
+    def test_secret_key_required(self):
+        for name in self.DEPLOYED:
+            with self.subTest(name), self.assertRaisesMessage(ImproperlyConfigured, "SECRET_KEY"):
+                self._import(name, {**self.VALID, "SECRET_KEY": ""})
+
+    def test_allowed_hosts_required_and_parsed(self):
+        for name in self.DEPLOYED:
+            with self.subTest(name), self.assertRaisesMessage(ImproperlyConfigured, "ALLOWED_HOSTS"):
+                self._import(name, {**self.VALID, "ALLOWED_HOSTS": " , "})
+            module = self._import(name, {**self.VALID, "ALLOWED_HOSTS": "api.example.com, admin.example.com"})
+            self.assertEqual(module.ALLOWED_HOSTS, ["api.example.com", "admin.example.com"])
+
+    def test_uat_keeps_uat_host_fallback(self):
+        module = self._import("uat", {**self.VALID, "ALLOWED_HOSTS": "", "UAT_HOST": "uat.example.com"})
+        self.assertEqual(module.ALLOWED_HOSTS, ["uat.example.com"])
+
+    def test_production_requires_csrf_trusted_origins(self):
+        with self.assertRaisesMessage(ImproperlyConfigured, "CSRF_TRUSTED_ORIGINS"):
+            self._import("production", {**self.VALID, "CSRF_TRUSTED_ORIGINS": ""})
+        module = self._import("production", self.VALID)
+        self.assertEqual(module.CSRF_TRUSTED_ORIGINS, ["https://api.example.com"])
+
+    # Proxy / HTTPS ---------------------------------------------------------
+
+    def test_proxy_ssl_header_only_when_explicitly_trusted(self):
+        for name in self.DEPLOYED:
+            with self.subTest(name):
+                self.assertIsNone(getattr(self._import(name, self.VALID), "SECURE_PROXY_SSL_HEADER", None))
+                module = self._import(name, {**self.VALID, "TRUST_PROXY_SSL_HEADER": "True"})
+                self.assertEqual(module.SECURE_PROXY_SSL_HEADER, ("HTTP_X_FORWARDED_PROTO", "https"))
+                other = self._import(name, {**self.VALID, "TRUST_PROXY_SSL_HEADER": "yes"})
+                self.assertIsNone(getattr(other, "SECURE_PROXY_SSL_HEADER", None))
+
+    def test_initial_hsts_is_short_without_subdomains_or_preload(self):
+        for name in ("staging", "production"):
+            with self.subTest(name):
+                module = self._import(name, self.VALID)
+                self.assertTrue(module.SECURE_SSL_REDIRECT)
+                self.assertEqual(module.SECURE_HSTS_SECONDS, 300)
+                self.assertFalse(module.SECURE_HSTS_INCLUDE_SUBDOMAINS)
+                self.assertFalse(getattr(module, "SECURE_HSTS_PRELOAD", False))
+                longer = self._import(name, {**self.VALID, "SECURE_HSTS_SECONDS": "86400"})
+                self.assertEqual(longer.SECURE_HSTS_SECONDS, 86400)
+                with self.assertRaisesMessage(ImproperlyConfigured, "SECURE_HSTS_SECONDS"):
+                    self._import(name, {**self.VALID, "SECURE_HSTS_SECONDS": "a year"})
+
+    def test_deployed_database_prefers_url_with_persistent_connections(self):
+        for name in self.DEPLOYED:
+            with self.subTest(name):
+                module = self._import(name, {**self.VALID, "DATABASE_URL": "postgres://u:p@db.example.com:5432/shop"})
+                db = module.DATABASES["default"]
+                self.assertEqual((db["HOST"], db["NAME"], db["CONN_MAX_AGE"]), ("db.example.com", "shop", 60))
+                self.assertTrue(db["CONN_HEALTH_CHECKS"])
+
+    def test_deployed_logging_goes_to_stdout_and_stderr(self):
+        for name in self.DEPLOYED:
+            with self.subTest(name):
+                module = self._import(name, {**self.VALID, "LOG_LEVEL": "warning"})
+                handlers = module.LOGGING["handlers"]
+                self.assertEqual(handlers["stdout"]["stream"], "ext://sys.stdout")
+                self.assertEqual(handlers["stderr"]["stream"], "ext://sys.stderr")
+                self.assertEqual(module.LOGGING["root"]["level"], "WARNING")
+                with self.assertRaisesMessage(ImproperlyConfigured, "LOG_LEVEL"):
+                    self._import(name, {**self.VALID, "LOG_LEVEL": "loud"})
+
+    def test_s3_storage_uses_separate_public_and_private_backends(self):
+        env = {**self.VALID, **S3_ENV}
+        for name in self.DEPLOYED:
+            with self.subTest(name):
+                module = self._import(name, env)
+                self.assertEqual(module.STORAGES["default"]["BACKEND"], "apps.core.storage.PublicMediaStorage")
+                self.assertEqual(module.STORAGES["private_documents"]["BACKEND"],
+                                 "apps.core.storage.PrivateMediaStorage")
+                self.assertEqual(module.MEDIA_URL, "https://media.example.com/")
+
+    def test_invalid_s3_configuration_refuses_to_start(self):
+        for name in self.DEPLOYED:
+            for change, needle in (
+                ({"AWS_PRIVATE_STORAGE_BUCKET_NAME": ""}, "AWS_PRIVATE_STORAGE_BUCKET_NAME"),
+                ({"AWS_PRIVATE_STORAGE_BUCKET_NAME": "SMERFUME-PUBLIC"}, "different"),
+            ):
+                with self.subTest(name=name, change=change), self.assertRaisesMessage(ImproperlyConfigured, needle):
+                    self._import(name, {**self.VALID, **S3_ENV, **change})
+
+    def test_deployed_static_files_use_whitenoise_manifest(self):
+        for name in self.DEPLOYED:
+            with self.subTest(name):
+                module = self._import(name, self.VALID)
+                self.assertEqual(module.STORAGES["staticfiles"]["BACKEND"],
+                                 "whitenoise.storage.CompressedManifestStaticFilesStorage")
+                # Uploaded media keeps its own storage, never WhiteNoise.
+                self.assertNotIn("whitenoise", module.STORAGES["default"]["BACKEND"])
+                self.assertNotIn("whitenoise", module.STORAGES["private_documents"]["BACKEND"])
+
+    # Production object storage ------------------------------------------
+
+    def test_production_refuses_to_start_without_object_storage(self):
+        for value in ("", "False", "false", "1"):
+            with self.subTest(USE_S3=value), self.assertRaisesMessage(ImproperlyConfigured, "USE_S3"):
+                self._import("production", {**self.VALID, "USE_S3": value})
+
+    def test_production_refuses_incomplete_object_storage(self):
+        for change, needle in (
+            ({"AWS_STORAGE_BUCKET_NAME": ""}, "AWS_STORAGE_BUCKET_NAME"),
+            ({"AWS_PRIVATE_STORAGE_BUCKET_NAME": ""}, "AWS_PRIVATE_STORAGE_BUCKET_NAME"),
+            ({"AWS_PRIVATE_STORAGE_BUCKET_NAME": "smerfume-public"}, "different"),
+            ({"AWS_ACCESS_KEY_ID": ""}, "AWS_ACCESS_KEY_ID"),
+            ({"AWS_SECRET_ACCESS_KEY": ""}, "AWS_SECRET_ACCESS_KEY"),
+            ({"AWS_S3_CUSTOM_DOMAIN": ""}, "AWS_S3_CUSTOM_DOMAIN"),
+        ):
+            with self.subTest(change), self.assertRaisesMessage(ImproperlyConfigured, needle):
+                self._import("production", {**self.VALID, **change})
+
+    def test_production_with_valid_object_storage_starts(self):
+        module = self._import("production", self.VALID)
+        self.assertEqual(module.STORAGES["default"]["BACKEND"], "apps.core.storage.PublicMediaStorage")
+        self.assertEqual(module.STORAGES["private_documents"]["BACKEND"], "apps.core.storage.PrivateMediaStorage")
+
+    def test_staging_and_uat_keep_object_storage_optional(self):
+        for name in ("staging", "uat"):
+            with self.subTest(name):
+                module = self._import(name, {**self.VALID, "USE_S3": ""})
+                self.assertEqual(module.STORAGES["default"]["BACKEND"],
+                                 "django.core.files.storage.FileSystemStorage")
+
+    def test_api_docs_not_public_when_deployed(self):
+        for name in self.DEPLOYED:
+            with self.subTest(name):
+                self.assertFalse(self._import(name, self.VALID).API_DOCS_PUBLIC)
+
+
+@override_settings(
+    SECURE_SSL_REDIRECT=True, SECURE_PROXY_SSL_HEADER=("HTTP_X_FORWARDED_PROTO", "https"),
+    ALLOWED_HOSTS=["api.example.com"],
+)
+class TrustedProxyRedirectTests(TestCase):
+    """Behind a TLS-terminating proxy the app sees plain HTTP; trusting the
+    proxy's X-Forwarded-Proto header is what prevents a redirect loop."""
+
+    URL = "/admin/login/"
+
+    def test_forwarded_https_is_served_not_redirected(self):
+        resp = self.client.get(self.URL, HTTP_HOST="api.example.com", HTTP_X_FORWARDED_PROTO="https")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_plain_http_is_redirected_once_to_https(self):
+        resp = self.client.get(self.URL, HTTP_HOST="api.example.com")
+        self.assertEqual(resp.status_code, 301)
+        self.assertEqual(resp["Location"], "https://api.example.com/admin/login/")
+
+    @override_settings(SECURE_PROXY_SSL_HEADER=None)
+    def test_untrusted_header_is_ignored(self):
+        resp = self.client.get(self.URL, HTTP_HOST="api.example.com", HTTP_X_FORWARDED_PROTO="https")
+        self.assertEqual(resp.status_code, 301)
+
+
+class ApiDocsAccessTests(TestCase):
+    """The OpenAPI schema and doc pages are staff-only outside local."""
+
+    URLS = ("/api/schema/", "/api/docs/", "/api/redoc/")
+
+    def setUp(self):
+        from django.contrib.auth import get_user_model
+        users = get_user_model()
+        self.staff = users.objects.create_user(
+            username="docstaff", email="docstaff@example.com", password="x", is_staff=True,
+        )
+        self.customer = users.objects.create_user(username="doccust", email="doccust@example.com", password="x")
+
+    def _statuses(self, user=None):
+        if user:
+            self.client.force_login(user)
+        else:
+            self.client.logout()
+        return [self.client.get(url).status_code for url in self.URLS]
+
+    @override_settings(API_DOCS_PUBLIC=False)
+    def test_staff_only_outside_local(self):
+        for status_code in self._statuses():
+            self.assertIn(status_code, (401, 403))
+        self.assertEqual(self._statuses(self.customer), [403, 403, 403])
+        self.assertEqual(self._statuses(self.staff), [200, 200, 200])
+
+    @override_settings(API_DOCS_PUBLIC=False)
+    def test_inactive_staff_refused(self):
+        self.staff.is_active = False
+        self.staff.save()
+        for status_code in self._statuses(self.staff):
+            self.assertIn(status_code, (401, 403))
+
+    @override_settings(API_DOCS_PUBLIC=True)
+    def test_open_in_local_development(self):
+        self.assertEqual(self._statuses(), [200, 200, 200])
+
+    def test_local_settings_keep_docs_open(self):
+        self.assertTrue(settings.API_DOCS_PUBLIC)
+
 
 def _broken_cache():
     broken = MagicMock()
@@ -156,3 +387,391 @@ class FailOpenThrottleTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertIn("scope=anon", logs.output[0])
         self.assertNotIn("connection refused", resp.content.decode())
+
+
+
+class DatabaseConfigTests(SimpleTestCase):
+    """DATABASE_URL (any provider) with the DB_* variables as the local fallback."""
+
+    DB_VARS = ("DATABASE_URL", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST", "DB_PORT", "DB_SSLMODE", "CONN_MAX_AGE")
+
+    def _config(self, env, **kwargs):
+        clean = {k: v for k, v in os.environ.items() if k not in self.DB_VARS}
+        with patch.dict("os.environ", {**clean, **env}, clear=True):
+            return database_config(**kwargs)
+
+    def test_database_url_with_encoded_credentials_and_sslmode(self):
+        db = self._config({"DATABASE_URL": "postgres://us%40er:p%2Fss%3Aword@db.example.com:6543/shop?sslmode=require"})
+        self.assertEqual(db["ENGINE"], "django.db.backends.postgresql")
+        self.assertEqual((db["USER"], db["PASSWORD"], db["HOST"], db["PORT"], db["NAME"]),
+                         ("us@er", "p/ss:word", "db.example.com", 6543, "shop"))
+        self.assertEqual(db["OPTIONS"]["sslmode"], "require")
+        self.assertTrue(db["CONN_HEALTH_CHECKS"])
+
+    def test_postgresql_scheme_and_default_port(self):
+        db = self._config({"DATABASE_URL": "postgresql://u:p@db.example.com/shop"})
+        self.assertEqual((db["HOST"], db["NAME"]), ("db.example.com", "shop"))
+        self.assertIn(db["PORT"], ("", None, 5432, "5432"))
+
+    def test_db_vars_fallback_when_no_url(self):
+        db = self._config({"DB_NAME": "smerfume", "DB_USER": "dev", "DB_PASSWORD": "pw",
+                           "DB_HOST": "localhost", "DB_PORT": "5433"})
+        self.assertEqual((db["ENGINE"], db["NAME"], db["USER"], db["PASSWORD"], db["HOST"], db["PORT"]),
+                         ("django.db.backends.postgresql", "smerfume", "dev", "pw", "localhost", "5433"))
+        self.assertTrue(db["CONN_HEALTH_CHECKS"])
+        self.assertNotIn("sslmode", db.get("OPTIONS", {}))
+
+    def test_local_prefers_db_vars_over_a_stray_url(self):
+        env = {"DATABASE_URL": "postgres://u:p@elsewhere/otherdb", "DB_NAME": "smerfume"}
+        self.assertEqual(self._config(env, prefer_url=False)["NAME"], "smerfume")
+        self.assertEqual(self._config(env)["NAME"], "otherdb")
+        self.assertEqual(self._config({"DATABASE_URL": "postgres://u:p@h/only"}, prefer_url=False)["NAME"], "only")
+
+    def test_blank_url_uses_fallback(self):
+        db = self._config({"DATABASE_URL": "  ", "DB_NAME": "smerfume"})
+        self.assertEqual(db["NAME"], "smerfume")
+
+    def test_conn_max_age_env_and_default(self):
+        self.assertEqual(self._config({"DB_NAME": "x"})["CONN_MAX_AGE"], 0)
+        self.assertEqual(self._config({"DB_NAME": "x"}, default_conn_max_age=60)["CONN_MAX_AGE"], 60)
+        self.assertEqual(self._config({"DB_NAME": "x", "CONN_MAX_AGE": "30"}, default_conn_max_age=60)["CONN_MAX_AGE"], 30)
+        with self.assertRaises(ImproperlyConfigured):
+            self._config({"DB_NAME": "x", "CONN_MAX_AGE": "soon"})
+
+    def test_db_sslmode_applies_to_both_paths(self):
+        db = self._config({"DB_NAME": "x", "DB_SSLMODE": "require"})
+        self.assertEqual(db["OPTIONS"]["sslmode"], "require")
+        db = self._config({"DATABASE_URL": "postgres://u:p@h/db", "DB_SSLMODE": "verify-full"})
+        self.assertEqual(db["OPTIONS"]["sslmode"], "verify-full")
+
+    def test_non_postgres_url_refused_without_echoing_it(self):
+        with self.assertRaises(ImproperlyConfigured) as ctx:
+            self._config({"DATABASE_URL": "mysql://user:secret@h/db"})
+        self.assertNotIn("secret", str(ctx.exception))
+
+
+
+def _boom(request):
+    raise RuntimeError("internal detail 7f3a")
+
+
+urlpatterns = [path("boom/", _boom)]
+
+
+@override_settings(ROOT_URLCONF="apps.core.tests", DEBUG=False)
+class StdoutLoggingTests(SimpleTestCase):
+    """Unhandled 500s reach the provider's log stream with a traceback;
+    the HTTP response never carries it."""
+
+    def _with_logging(self, level="INFO"):
+        out, err = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", out), patch("sys.stderr", err):
+            logging.config.dictConfig(logging_config(level))
+        return out, err
+
+    def tearDown(self):
+        configure_logging(settings.LOGGING_CONFIG, settings.LOGGING)
+
+    def test_unhandled_error_logs_traceback_to_stderr_only(self):
+        out, err = self._with_logging()
+        client = self.client_class(raise_request_exception=False)
+        resp = client.get("/boom/")
+        self.assertEqual(resp.status_code, 500)
+        self.assertNotIn("internal detail 7f3a", resp.content.decode())
+        self.assertNotIn("Traceback", resp.content.decode())
+        self.assertIn("Traceback", err.getvalue())
+        self.assertIn("internal detail 7f3a", err.getvalue())
+        self.assertNotIn("internal detail 7f3a", out.getvalue())
+
+    def test_info_goes_to_stdout_not_stderr(self):
+        out, err = self._with_logging()
+        logging.getLogger("apps.core").info("hello stdout")
+        self.assertIn("hello stdout", out.getvalue())
+        self.assertNotIn("hello stdout", err.getvalue())
+
+    def test_level_is_respected(self):
+        out, err = self._with_logging("WARNING")
+        logging.getLogger("apps.core").info("quiet info")
+        self.assertNotIn("quiet info", out.getvalue() + err.getvalue())
+
+    def test_no_mail_admins_handler(self):
+        config = logging_config("INFO")
+        self.assertNotIn("mail_admins", config["handlers"])
+        self.assertEqual(config["loggers"]["django"]["handlers"], ["stdout", "stderr"])
+
+
+
+@override_settings(ALLOWED_HOSTS=["api.example.com"], SECURE_SSL_REDIRECT=True)
+class LivenessTests(TestCase):
+    """/healthz/ answers before host and HTTPS handling so a provider's
+    internal probe (IP Host header, plain HTTP) works. Only that exact
+    path and GET/HEAD get the bypass, and it touches nothing."""
+
+    def test_ok_for_internal_probe_without_db_or_cache(self):
+        broken = MagicMock(side_effect=AssertionError("cache touched"))
+        with self.assertNumQueries(0), patch.object(cache, "get", broken), patch.object(cache, "set", broken):
+            resp = self.client.get("/healthz/", HTTP_HOST="10.0.0.7:8000")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.content, b"ok")
+        self.assertEqual(resp["Content-Type"], "text/plain")
+        self.assertEqual(resp["Cache-Control"], "no-store")
+
+    def test_head_allowed(self):
+        self.assertEqual(self.client.head("/healthz/", HTTP_HOST="10.0.0.7").status_code, 200)
+
+    def test_no_build_or_environment_details(self):
+        resp = self.client.get("/healthz/?verbose=1", HTTP_HOST="10.0.0.7")
+        self.assertEqual(resp.content, b"ok")
+        for header in ("Server", "X-Version", "X-Environment"):
+            self.assertNotIn(header, resp)
+
+    def test_only_the_exact_path_bypasses(self):
+        for path in ("/healthz", "/healthz/x", "/HEALTHZ/", "/healthz//", "/api/healthz/", "/admin/"):
+            with self.subTest(path):
+                self.assertEqual(self.client.get(path, HTTP_HOST="10.0.0.7").status_code, 400)
+
+    def test_other_methods_do_not_bypass(self):
+        for method in ("post", "put", "delete", "options"):
+            with self.subTest(method):
+                resp = getattr(self.client, method)("/healthz/", HTTP_HOST="10.0.0.7")
+                self.assertEqual(resp.status_code, 400)
+
+    def test_middleware_runs_first(self):
+        self.assertEqual(settings.MIDDLEWARE[0], "apps.core.health.LivenessMiddleware")
+
+
+@override_settings(ALLOWED_HOSTS=["api.example.com"])
+class ReadinessTests(TestCase):
+    """/readyz/ goes through normal request handling and checks only the
+    primary database (SELECT 1); Redis is not a readiness dependency."""
+
+    def _get(self, **extra):
+        return self.client.get("/readyz/", HTTP_HOST="api.example.com", **extra)
+
+    def test_ready_when_database_answers(self):
+        broken = MagicMock(side_effect=AssertionError("cache touched"))
+        with self.assertNumQueries(1), patch.object(cache, "get", broken):
+            resp = self._get()
+        self.assertEqual((resp.status_code, resp.content), (200, b"ok"))
+        self.assertEqual(resp["Cache-Control"], "no-store")
+
+    def test_unavailable_without_detail_when_database_fails(self):
+        from django.db import OperationalError
+
+        with patch("apps.core.views.connection.cursor", side_effect=OperationalError("password authentication failed for db-host")), \
+                self.assertLogs("apps.core.views", "ERROR"):
+            resp = self._get()
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.content, b"unavailable")
+        self.assertNotIn(b"password", resp.content)
+
+    def test_normal_host_validation_applies(self):
+        self.assertEqual(self.client.get("/readyz/", HTTP_HOST="10.0.0.7").status_code, 400)
+
+    @override_settings(SECURE_SSL_REDIRECT=True)
+    def test_normal_https_handling_applies(self):
+        self.assertEqual(self._get().status_code, 301)
+
+    def test_no_login_needed_and_get_only(self):
+        self.assertEqual(self._get().status_code, 200)
+        self.assertEqual(self.client.post("/readyz/", HTTP_HOST="api.example.com").status_code, 405)
+
+
+
+class ObjectStorageSettingsTests(SimpleTestCase):
+    """S3-compatible storage (AWS, R2, B2, ...) with two physically separate
+    buckets; misconfiguration refuses to start."""
+
+    def _settings(self, **changes):
+        return object_storage_settings({**S3_ENV, **changes})
+
+    def test_r2_style_endpoint_with_public_domain(self):
+        config = self._settings()
+        self.assertEqual(config["AWS_S3_ENDPOINT_URL"], "https://account.r2.example.com")
+        self.assertEqual(config["AWS_S3_CUSTOM_DOMAIN"], "media.example.com")
+        self.assertEqual(config["AWS_S3_REGION_NAME"], "auto")
+        self.assertEqual(config["AWS_S3_SIGNATURE_VERSION"], "s3v4")
+        self.assertIsNone(config["AWS_S3_ADDRESSING_STYLE"])
+        self.assertEqual((config["AWS_STORAGE_BUCKET_NAME"], config["AWS_PRIVATE_STORAGE_BUCKET_NAME"]),
+                         ("smerfume-public", "smerfume-private"))
+
+    def test_aws_defaults_without_endpoint(self):
+        config = self._settings(AWS_S3_ENDPOINT_URL="", AWS_S3_CUSTOM_DOMAIN="")
+        self.assertIsNone(config["AWS_S3_ENDPOINT_URL"])
+        self.assertIsNone(config["AWS_S3_CUSTOM_DOMAIN"])
+        self.assertEqual(config["AWS_S3_REGION_NAME"], "ap-south-1")
+
+    def test_explicit_region_and_path_addressing(self):
+        config = self._settings(AWS_S3_REGION_NAME="us-west-004", AWS_S3_ADDRESSING_STYLE="path")
+        self.assertEqual((config["AWS_S3_REGION_NAME"], config["AWS_S3_ADDRESSING_STYLE"]), ("us-west-004", "path"))
+
+    def test_required_values(self):
+        for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_STORAGE_BUCKET_NAME",
+                     "AWS_PRIVATE_STORAGE_BUCKET_NAME"):
+            with self.subTest(name), self.assertRaisesMessage(ImproperlyConfigured, name):
+                self._settings(**{name: " "})
+
+    def test_public_and_private_buckets_must_differ(self):
+        with self.assertRaisesMessage(ImproperlyConfigured, "different"):
+            self._settings(AWS_PRIVATE_STORAGE_BUCKET_NAME=" Smerfume-Public ")
+
+    def test_custom_endpoint_needs_a_public_domain(self):
+        with self.assertRaisesMessage(ImproperlyConfigured, "AWS_S3_CUSTOM_DOMAIN"):
+            self._settings(AWS_S3_CUSTOM_DOMAIN="")
+
+    def test_custom_domain_is_a_bare_host(self):
+        with self.assertRaisesMessage(ImproperlyConfigured, "AWS_S3_CUSTOM_DOMAIN"):
+            self._settings(AWS_S3_CUSTOM_DOMAIN="https://media.example.com/")
+
+    def test_errors_do_not_echo_secrets(self):
+        with self.assertRaises(ImproperlyConfigured) as ctx:
+            self._settings(AWS_PRIVATE_STORAGE_BUCKET_NAME="smerfume-public")
+        self.assertNotIn("test-secret", str(ctx.exception))
+
+
+@override_settings(
+    AWS_ACCESS_KEY_ID="test-key-id", AWS_SECRET_ACCESS_KEY="test-secret",
+    AWS_STORAGE_BUCKET_NAME="smerfume-public", AWS_PRIVATE_STORAGE_BUCKET_NAME="smerfume-private",
+    AWS_S3_ENDPOINT_URL="https://account.r2.example.com", AWS_S3_CUSTOM_DOMAIN="media.example.com",
+    AWS_S3_REGION_NAME="auto", AWS_S3_SIGNATURE_VERSION="s3v4",
+)
+class StorageBackendTests(SimpleTestCase):
+    """The two backends never share a bucket or a public URL. No network:
+    URLs are built (and private ones presigned) locally."""
+
+    def test_public_media_storage(self):
+        from apps.core.storage import PublicMediaStorage
+
+        storage = PublicMediaStorage()
+        self.assertEqual(storage.bucket_name, "smerfume-public")
+        self.assertEqual(storage.custom_domain, "media.example.com")
+        self.assertFalse(storage.querystring_auth)
+        self.assertFalse(storage.file_overwrite)
+        self.assertIsNone(storage.default_acl)
+        self.assertEqual(storage.url("catalog/variants/a.webp"), "https://media.example.com/catalog/variants/a.webp")
+
+    def test_private_media_storage(self):
+        from apps.core.storage import PrivateMediaStorage
+
+        storage = PrivateMediaStorage()
+        self.assertEqual(storage.bucket_name, "smerfume-private")
+        self.assertIsNone(storage.custom_domain)
+        self.assertTrue(storage.querystring_auth)
+        self.assertEqual(storage.querystring_expire, 300)
+        self.assertFalse(storage.file_overwrite)
+        self.assertIsNone(storage.default_acl)
+        self.assertEqual(storage.location, "")
+        url = storage.url("supplier-payments/x.pdf")
+        self.assertNotIn("media.example.com", url)
+        self.assertIn("smerfume-private", url)
+        self.assertIn("X-Amz-Signature=", url)
+
+    def test_options_cannot_point_private_at_the_public_domain(self):
+        from apps.core.storage import PrivateMediaStorage
+
+        with self.assertRaises(ImproperlyConfigured):
+            PrivateMediaStorage(custom_domain="media.example.com")
+        with self.assertRaises(ImproperlyConfigured):
+            PrivateMediaStorage(bucket_name="smerfume-public")
+
+
+
+class StaticFilesTests(SimpleTestCase):
+    """WhiteNoise serves only collected static files; uploads stay out."""
+
+    def test_whitenoise_right_after_security_middleware(self):
+        middleware = settings.MIDDLEWARE
+        self.assertEqual(middleware.index("whitenoise.middleware.WhiteNoiseMiddleware"),
+                         middleware.index("django.middleware.security.SecurityMiddleware") + 1)
+
+    def test_media_is_never_inside_static(self):
+        from pathlib import Path
+
+        static_root, media_root = Path(settings.STATIC_ROOT).resolve(), Path(settings.MEDIA_ROOT).resolve()
+        self.assertNotIn(static_root, media_root.parents)
+        self.assertNotEqual(static_root, media_root)
+        self.assertFalse(settings.MEDIA_URL.startswith(settings.STATIC_URL))
+        self.assertFalse(getattr(settings, "WHITENOISE_ROOT", None))
+
+    def test_local_static_storage_unchanged(self):
+        self.assertEqual(settings.STORAGES["staticfiles"]["BACKEND"],
+                         "django.contrib.staticfiles.storage.StaticFilesStorage")
+
+
+
+class GunicornConfigTests(SimpleTestCase):
+    """gunicorn.conf.py reads only PORT, WEB_CONCURRENCY, GUNICORN_TIMEOUT."""
+
+    def _load(self, env):
+        import runpy
+
+        clean = {k: v for k, v in os.environ.items() if k not in ("PORT", "WEB_CONCURRENCY", "GUNICORN_TIMEOUT")}
+        with patch.dict("os.environ", {**clean, **env}, clear=True):
+            return runpy.run_path(str(settings.BASE_DIR / "gunicorn.conf.py"))
+
+    def test_low_cost_defaults(self):
+        conf = self._load({})
+        self.assertEqual((conf["bind"], conf["workers"], conf["timeout"]), ("0.0.0.0:8000", 1, 120))
+        self.assertEqual((conf["accesslog"], conf["errorlog"]), ("-", "-"))
+
+    def test_environment_overrides(self):
+        conf = self._load({"PORT": "10000", "WEB_CONCURRENCY": "3", "GUNICORN_TIMEOUT": "60"})
+        self.assertEqual((conf["bind"], conf["workers"], conf["timeout"]), ("0.0.0.0:10000", 3, 60))
+
+    def test_invalid_values_refused(self):
+        for env in ({"WEB_CONCURRENCY": "0"}, {"PORT": "http"}, {"GUNICORN_TIMEOUT": "-5"}):
+            with self.subTest(env), self.assertRaises(ValueError):
+                self._load(env)
+
+    def test_dockerfile_has_no_release_steps_or_provider_commands(self):
+        dockerfile = (settings.BASE_DIR / "Dockerfile").read_text()
+        self.assertIn("FROM python:3.13-slim", dockerfile)
+        self.assertIn("USER app", dockerfile)
+        self.assertIn('CMD ["gunicorn", "config.wsgi:application", "--config", "gunicorn.conf.py"]', dockerfile)
+        instructions = "\n".join(
+            line for line in dockerfile.lower().splitlines() if not line.lstrip().startswith("#")
+        )
+        for forbidden in ("migrate", "railway", "render", "flyctl", "fly.io", "heroku"):
+            self.assertNotIn(forbidden, instructions)
+
+    def test_dockerignore_keeps_secrets_and_local_data_out(self):
+        ignored = set((settings.BASE_DIR / ".dockerignore").read_text().split())
+        for entry in (".env", ".env.*", ".git", ".claude", "media", "private_media", "staticfiles", "venv",
+                      "**/__pycache__"):
+            self.assertIn(entry, ignored)
+
+
+class SystemChecksNeedNoDatabaseTests(TestCase):
+    """System checks run before migrations on an empty database (first
+    deploy), so no admin or app check may query the database. Unfold's
+    action check queries auth_permission for dotted "app.codename" action
+    permissions; our actions use has_<name>_permission methods instead."""
+
+    def test_admin_and_app_checks_run_without_queries(self):
+        from django.core import checks
+
+        with self.assertNumQueries(0):
+            errors = checks.run_checks(include_deployment_checks=False)
+        self.assertEqual([e for e in errors if e.is_serious()], [])
+
+    def test_no_admin_action_uses_a_dotted_permission(self):
+        from django.contrib import admin as django_admin
+
+        dotted = []
+        for model_admin in django_admin.site._registry.values():
+            getters = [getattr(model_admin, name, None) for name in (
+                "_get_base_actions_list", "_get_base_actions_detail",
+                "_get_base_actions_row", "_get_base_actions_submit_line",
+            )]
+            for getter in filter(None, getters):
+                for unfold_action in getter():
+                    for permission in getattr(unfold_action.method, "allowed_permissions", ()):
+                        if "." in permission:
+                            dotted.append(f"{model_admin.__class__.__name__}.{unfold_action.method.__name__}: {permission}")
+        self.assertEqual(dotted, [])
+
+
+
+class LocalStorageUnchangedTests(SimpleTestCase):
+    def test_local_and_tests_do_not_need_object_storage(self):
+        self.assertEqual(settings.STORAGES["default"]["BACKEND"], "django.core.files.storage.FileSystemStorage")

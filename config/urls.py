@@ -20,9 +20,13 @@ from django.contrib import admin
 from django.urls import include, path
 from drf_spectacular.views import SpectacularAPIView, SpectacularRedocView, SpectacularSwaggerView
 
+from apps.core.views import readiness
+
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/", include("config.api_urls")),
+    # Readiness (database). Liveness /healthz/ is apps.core.health middleware.
+    path("readyz/", readiness, name="readiness"),
 
     # ── API Documentation ──────────────────────────────────────────────────
     # Raw OpenAPI 3.0 schema (JSON/YAML download)

@@ -4,11 +4,30 @@ from .base import *
 
 DEBUG = False
 
-ALLOWED_HOSTS = [
-    host.strip()
-    for host in os.getenv("ALLOWED_HOSTS", "smerfume.com,www.smerfume.com").split(",")
-    if host.strip()
-]
+# Uploads (product images, private payment proof) must live in object
+# storage: a container's disk is erased on restart and deploy. base.py has
+# already validated the S3 settings (buckets, credentials) when USE_S3=True.
+if os.getenv("USE_S3") != "True":
+    raise ImproperlyConfigured(
+        "USE_S3=True is required in production: uploads must go to object storage, "
+        "never to the container's disk."
+    )
+
+ALLOWED_HOSTS = require_env_list("ALLOWED_HOSTS")
+CSRF_TRUSTED_ORIGINS = require_env_list("CSRF_TRUSTED_ORIGINS")
+
+# ── Deployment (provider-neutral) ─────────────────────────────────────────
+SECRET_KEY = require_env("SECRET_KEY")
+DATABASES = {"default": database_config(default_conn_max_age=60)}
+# Trust X-Forwarded-Proto only when the proxy in front always sets it;
+# without it, SECURE_SSL_REDIRECT behind a TLS-terminating proxy loops.
+SECURE_PROXY_SSL_HEADER = trusted_proxy_ssl_header()
+LOGGING = logging_config(os.getenv("LOG_LEVEL", "INFO"))
+# Static files are collected into the image and served by WhiteNoise.
+STORAGES = {
+    **STORAGES,
+    "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},
+}
 
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
@@ -29,9 +48,11 @@ SIMPLE_JWT = {
 SECURE_BROWSER_XSS_FILTER = True
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = "DENY"
-SECURE_HSTS_SECONDS = 31536000          # 1 year
-SECURE_HSTS_INCLUDE_SUBDOMAINS = True
-SECURE_HSTS_PRELOAD = True
+# Initial rollout (docs/DEPLOYMENT.md): short HSTS, no subdomains, no
+# preload until every Smerfume subdomain is confirmed HTTPS-only.
+SECURE_HSTS_SECONDS = env_int("SECURE_HSTS_SECONDS", 300)
+SECURE_HSTS_INCLUDE_SUBDOMAINS = False
+SECURE_HSTS_PRELOAD = False
 SECURE_SSL_REDIRECT = True
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True

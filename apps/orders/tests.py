@@ -4581,3 +4581,28 @@ class InStoreOutOfStockMarkingTests(TestCase):
         self.assertIn('badge.textContent = "Out of stock"', html)
         # Defined once, used by the picker result and by the chosen line.
         self.assertEqual(html.count("outOfStockBadge()"), 3)
+
+
+class InStoreSaleActionPermissionTests(TestCase):
+    """The New in-store sale action is still gated by orders.add_order,
+    now through has_new_in_store_sale_permission()."""
+
+    def _staff(self, username, *codenames):
+        from django.contrib.auth.models import Permission
+
+        user = User.objects.create_user(
+            username=username, email=f"{username}@example.com", password="x", is_staff=True,
+            mobile_number=f"+9197{uuid.uuid4().int % 10**8:08d}",
+        )
+        user.user_permissions.add(*Permission.objects.filter(content_type__app_label="orders", codename__in=codenames))
+        return User.objects.get(pk=user.pk)
+
+    def test_view_only_staff_cannot_see_or_open_it(self):
+        self.client.force_login(self._staff("isviewonly", "view_order"))
+        self.assertNotContains(self.client.get("/admin/orders/order/"), "in-store-sale")
+        self.assertEqual(self.client.get(ADMIN_IN_STORE_URL).status_code, 403)
+
+    def test_add_order_staff_can(self):
+        self.client.force_login(self._staff("isadder", "view_order", "add_order"))
+        self.assertContains(self.client.get("/admin/orders/order/"), "in-store-sale")
+        self.assertEqual(self.client.get(ADMIN_IN_STORE_URL).status_code, 200)

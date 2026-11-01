@@ -1,6 +1,8 @@
 from pathlib import Path
 import os
 from urllib.parse import urlsplit
+
+import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
 from django.templatetags.static import static
 from django.urls import reverse_lazy
@@ -54,7 +56,11 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # First: /healthz/ answers before host and HTTPS checks (apps.core.health).
+    "apps.core.health.LivenessMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    # Collected static files only (STATIC_ROOT); uploaded media never.
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -70,6 +76,79 @@ def require_env(name):
     if not value:
         raise ImproperlyConfigured(f"{name} must be set in this environment.")
     return value
+
+
+def env_list(name):
+    """Comma-separated environment variable as a list, blanks dropped."""
+    return [item.strip() for item in os.getenv(name, "").split(",") if item.strip()]
+
+
+def require_env_list(name):
+    """A required comma-separated list (ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS)."""
+    values = env_list(name)
+    if not values:
+        raise ImproperlyConfigured(f"{name} must list at least one value in this environment.")
+    return values
+
+
+def env_int(name, default):
+    """Non-negative integer environment variable, or `default` when unset."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    if not raw.isdigit():
+        raise ImproperlyConfigured(f"{name} must be a non-negative integer.")
+    return int(raw)
+
+
+def trusted_proxy_ssl_header():
+    """The X-Forwarded-Proto header Django may trust for HTTPS detection,
+    only when TRUST_PROXY_SSL_HEADER=True: the proxy in front must always
+    set or overwrite it, otherwise a client could fake HTTPS."""
+    if os.getenv("TRUST_PROXY_SSL_HEADER", "").strip() == "True":
+        return ("HTTP_X_FORWARDED_PROTO", "https")
+    return None
+
+
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+def _below_warning(record):
+    return record.levelno < 30  # logging.WARNING
+
+
+def logging_config(level):
+    """Container logging: DEBUG/INFO to stdout, WARNING and above (including
+    django.request 500 tracebacks) to stderr, for the host to collect. No
+    mail_admins and no external vendor. Tracebacks never reach responses."""
+    level = str(level).strip().upper()
+    if level not in LOG_LEVELS:
+        raise ImproperlyConfigured(f"LOG_LEVEL must be one of {', '.join(LOG_LEVELS)}.")
+    handlers = ["stdout", "stderr"]
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "standard": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"},
+        },
+        "filters": {
+            "below_warning": {"()": "django.utils.log.CallbackFilter", "callback": _below_warning},
+        },
+        "handlers": {
+            "stdout": {
+                "class": "logging.StreamHandler", "stream": "ext://sys.stdout",
+                "formatter": "standard", "filters": ["below_warning"],
+            },
+            "stderr": {
+                "class": "logging.StreamHandler", "stream": "ext://sys.stderr",
+                "formatter": "standard", "level": "WARNING",
+            },
+        },
+        "root": {"handlers": handlers, "level": level},
+        "loggers": {
+            "django": {"handlers": handlers, "level": level, "propagate": False},
+        },
+    }
 
 
 def parse_num_proxies(raw):
@@ -149,6 +228,9 @@ REST_FRAMEWORK = {
 }
 
 # Per-mobile OTP send limit (request + resend), enforced in PostgreSQL.
+# The internal API schema and doc pages are open only in local development.
+API_DOCS_PUBLIC = False
+
 OTP_MAX_SENDS_PER_MOBILE_PER_HOUR = int(os.getenv("OTP_MAX_SENDS_PER_MOBILE_PER_HOUR", "").strip() or "5")
 
 # ── API Documentation (drf-spectacular) ───────────────────────────────────────
@@ -164,6 +246,8 @@ SPECTACULAR_SETTINGS = {
     ),
     "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
+    # Schema, Swagger and ReDoc: staff only unless API_DOCS_PUBLIC (local).
+    "SERVE_PERMISSIONS": ["apps.core.permissions.ApiDocsPermission"],
     "COMPONENT_SPLIT_REQUEST": True,
     "TAGS": [
         {"name": "Auth", "description": "OTP-based passwordless authentication and token management"},
@@ -213,16 +297,45 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "config.wsgi.application"
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": os.getenv("DB_NAME"),
-        "USER": os.getenv("DB_USER"),
-        "PASSWORD": os.getenv("DB_PASSWORD"),
-        "HOST": os.getenv("DB_HOST", "localhost"),
-        "PORT": os.getenv("DB_PORT", "5432"),
-    }
-}
+def database_config(default_conn_max_age=0, prefer_url=True):
+    """The primary database: DATABASE_URL when set (any provider), else the
+    DB_* variables. Local development passes prefer_url=False so a machine-
+    wide DATABASE_URL never replaces the DB_* settings in .env.local.
+    DB_SSLMODE overrides any URL sslmode. PostgreSQL only; errors never
+    echo the URL, which holds a password."""
+    raw_age = os.getenv("CONN_MAX_AGE", "").strip()
+    if raw_age and not raw_age.isdigit():
+        raise ImproperlyConfigured("CONN_MAX_AGE must be a non-negative integer (seconds).")
+    conn_max_age = int(raw_age) if raw_age else default_conn_max_age
+
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not prefer_url and os.getenv("DB_NAME", "").strip():
+        url = ""
+    if url:
+        try:
+            config = dict(dj_database_url.parse(url, conn_max_age=conn_max_age, conn_health_checks=True))
+        except ValueError:
+            raise ImproperlyConfigured("DATABASE_URL is malformed.") from None
+        if config.get("ENGINE") != "django.db.backends.postgresql":
+            raise ImproperlyConfigured("DATABASE_URL must be a postgres:// or postgresql:// URL.")
+    else:
+        config = {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": os.getenv("DB_NAME"),
+            "USER": os.getenv("DB_USER"),
+            "PASSWORD": os.getenv("DB_PASSWORD"),
+            "HOST": os.getenv("DB_HOST", "localhost"),
+            "PORT": os.getenv("DB_PORT", "5432"),
+            "CONN_MAX_AGE": conn_max_age,
+            "CONN_HEALTH_CHECKS": True,
+        }
+    sslmode = os.getenv("DB_SSLMODE", "").strip()
+    if sslmode:
+        config["OPTIONS"] = {**config.get("OPTIONS", {}), "sslmode": sslmode}
+    return config
+
+
+DATABASES = {"default": database_config(prefer_url=False)}
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
@@ -256,55 +369,76 @@ STORAGES = {
 }
 
 # ── File Storage ───────────────────────────────────────────────────────────────
-# Set USE_S3=True in your environment to switch to Amazon S3.
-# Required env vars when USE_S3 is True:
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_STORAGE_BUCKET_NAME,
-#   AWS_S3_REGION_NAME (default: ap-south-1)
-if os.getenv("USE_S3") == "True":
-    AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-    AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-    AWS_STORAGE_BUCKET_NAME = os.getenv("AWS_STORAGE_BUCKET_NAME")
-    AWS_S3_REGION_NAME = os.getenv("AWS_S3_REGION_NAME", "ap-south-1")
-    AWS_S3_CUSTOM_DOMAIN = f"{AWS_STORAGE_BUCKET_NAME}.s3.{AWS_S3_REGION_NAME}.amazonaws.com"
-    AWS_DEFAULT_ACL = None          # inherit bucket policy (Block Public Access)
-    AWS_S3_FILE_OVERWRITE = False   # keep original filename on re-upload
+# USE_S3=True switches uploads to S3-compatible object storage (AWS S3,
+# Cloudflare R2, Backblaze B2, ...) with two physically separate buckets:
+# public (product images) and private (payment proof). See
+# object_storage_settings() and apps.core.storage. Static files are never
+# in a bucket. Variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+# AWS_STORAGE_BUCKET_NAME (public), AWS_PRIVATE_STORAGE_BUCKET_NAME,
+# AWS_S3_ENDPOINT_URL (blank for AWS), AWS_S3_CUSTOM_DOMAIN (public host,
+# required with a custom endpoint), AWS_S3_REGION_NAME, AWS_S3_ADDRESSING_STYLE.
+def object_storage_settings(env=None):
+    """Validated AWS_* settings for S3-compatible storage. Refuses to start
+    on missing credentials or buckets, a private bucket equal to the public
+    one, or a custom endpoint without a public domain. Messages never echo
+    credentials."""
+    env = os.environ if env is None else env
 
-    STORAGES = {
-        "default": {
-            "BACKEND": "storages.backends.s3boto3.S3Boto3Storage",
-            "OPTIONS": {
-                "access_key": AWS_ACCESS_KEY_ID,
-                "secret_key": AWS_SECRET_ACCESS_KEY,
-                "bucket_name": AWS_STORAGE_BUCKET_NAME,
-                "region_name": AWS_S3_REGION_NAME,
-                "custom_domain": AWS_S3_CUSTOM_DOMAIN,
-                "file_overwrite": AWS_S3_FILE_OVERWRITE,
-                "default_acl": AWS_DEFAULT_ACL,
-            },
-        },
-        "staticfiles": {
-            "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
-        },
-        # DEC-011: same bucket, "private/" prefix, signed 5-minute URLs and no
-        # public custom domain. The bucket policy must not make "private/"
-        # publicly readable.
-        "private_documents": {
-            "BACKEND": "storages.backends.s3boto3.S3Boto3Storage",
-            "OPTIONS": {
-                "access_key": AWS_ACCESS_KEY_ID,
-                "secret_key": AWS_SECRET_ACCESS_KEY,
-                "bucket_name": AWS_STORAGE_BUCKET_NAME,
-                "region_name": AWS_S3_REGION_NAME,
-                "location": "private",
-                "custom_domain": None,
-                "querystring_auth": True,
-                "querystring_expire": 300,
-                "file_overwrite": False,
-                "default_acl": None,
-            },
-        },
+    def value(name):
+        return (env.get(name) or "").strip()
+
+    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_STORAGE_BUCKET_NAME",
+                 "AWS_PRIVATE_STORAGE_BUCKET_NAME"):
+        if not value(name):
+            raise ImproperlyConfigured(f"{name} must be set when USE_S3=True.")
+    public, private = value("AWS_STORAGE_BUCKET_NAME"), value("AWS_PRIVATE_STORAGE_BUCKET_NAME")
+    if public.lower() == private.lower():
+        raise ImproperlyConfigured(
+            "AWS_PRIVATE_STORAGE_BUCKET_NAME must be a different bucket from AWS_STORAGE_BUCKET_NAME."
+        )
+    endpoint, domain = value("AWS_S3_ENDPOINT_URL"), value("AWS_S3_CUSTOM_DOMAIN")
+    if "/" in domain or ":" in domain:
+        raise ImproperlyConfigured("AWS_S3_CUSTOM_DOMAIN must be a bare host name, e.g. media.example.com.")
+    if endpoint and not domain:
+        raise ImproperlyConfigured(
+            "AWS_S3_CUSTOM_DOMAIN must be set with a custom AWS_S3_ENDPOINT_URL "
+            "(the provider's API endpoint is not a public URL)."
+        )
+    return {
+        "AWS_ACCESS_KEY_ID": value("AWS_ACCESS_KEY_ID"),
+        "AWS_SECRET_ACCESS_KEY": value("AWS_SECRET_ACCESS_KEY"),
+        "AWS_STORAGE_BUCKET_NAME": public,
+        "AWS_PRIVATE_STORAGE_BUCKET_NAME": private,
+        "AWS_S3_ENDPOINT_URL": endpoint or None,
+        "AWS_S3_CUSTOM_DOMAIN": domain or None,
+        "AWS_S3_REGION_NAME": value("AWS_S3_REGION_NAME") or ("auto" if endpoint else "ap-south-1"),
+        "AWS_S3_ADDRESSING_STYLE": value("AWS_S3_ADDRESSING_STYLE") or None,
+        "AWS_S3_SIGNATURE_VERSION": "s3v4",
+        "AWS_DEFAULT_ACL": None,
+        "AWS_S3_FILE_OVERWRITE": False,
     }
-    MEDIA_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/"
+
+
+if os.getenv("USE_S3") == "True":
+    _s3 = object_storage_settings()
+    AWS_ACCESS_KEY_ID = _s3["AWS_ACCESS_KEY_ID"]
+    AWS_SECRET_ACCESS_KEY = _s3["AWS_SECRET_ACCESS_KEY"]
+    AWS_STORAGE_BUCKET_NAME = _s3["AWS_STORAGE_BUCKET_NAME"]
+    AWS_PRIVATE_STORAGE_BUCKET_NAME = _s3["AWS_PRIVATE_STORAGE_BUCKET_NAME"]
+    AWS_S3_ENDPOINT_URL = _s3["AWS_S3_ENDPOINT_URL"]
+    AWS_S3_CUSTOM_DOMAIN = _s3["AWS_S3_CUSTOM_DOMAIN"]
+    AWS_S3_REGION_NAME = _s3["AWS_S3_REGION_NAME"]
+    AWS_S3_ADDRESSING_STYLE = _s3["AWS_S3_ADDRESSING_STYLE"]
+    AWS_S3_SIGNATURE_VERSION = _s3["AWS_S3_SIGNATURE_VERSION"]
+    AWS_DEFAULT_ACL = _s3["AWS_DEFAULT_ACL"]
+    AWS_S3_FILE_OVERWRITE = _s3["AWS_S3_FILE_OVERWRITE"]
+    STORAGES = {
+        **STORAGES,
+        "default": {"BACKEND": "apps.core.storage.PublicMediaStorage"},
+        "private_documents": {"BACKEND": "apps.core.storage.PrivateMediaStorage"},
+    }
+    if AWS_S3_CUSTOM_DOMAIN:
+        MEDIA_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/"
 
 
 # ── SMS Backend ────────────────────────────────────────────────────────────

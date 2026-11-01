@@ -59,6 +59,8 @@ MIDDLEWARE = [
     # First: /healthz/ answers before host and HTTPS checks (apps.core.health).
     "apps.core.health.LivenessMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    # Collected static files only (STATIC_ROOT); uploaded media never.
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",

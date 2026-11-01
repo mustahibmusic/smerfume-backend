@@ -250,6 +250,16 @@ class DeployedSettingsFailFastTests(SimpleTestCase):
                 with self.subTest(name=name, change=change), self.assertRaisesMessage(ImproperlyConfigured, needle):
                     self._import(name, {**self.VALID, **S3_ENV, **change})
 
+    def test_deployed_static_files_use_whitenoise_manifest(self):
+        for name in self.DEPLOYED:
+            with self.subTest(name):
+                module = self._import(name, self.VALID)
+                self.assertEqual(module.STORAGES["staticfiles"]["BACKEND"],
+                                 "whitenoise.storage.CompressedManifestStaticFilesStorage")
+                # Uploaded media keeps its own storage, never WhiteNoise.
+                self.assertEqual(module.STORAGES["default"]["BACKEND"],
+                                 "django.core.files.storage.FileSystemStorage")
+
     def test_api_docs_not_public_when_deployed(self):
         for name in self.DEPLOYED:
             with self.subTest(name):
@@ -630,3 +640,26 @@ class StorageBackendTests(SimpleTestCase):
             PrivateMediaStorage(custom_domain="media.example.com")
         with self.assertRaises(ImproperlyConfigured):
             PrivateMediaStorage(bucket_name="smerfume-public")
+
+
+
+class StaticFilesTests(SimpleTestCase):
+    """WhiteNoise serves only collected static files; uploads stay out."""
+
+    def test_whitenoise_right_after_security_middleware(self):
+        middleware = settings.MIDDLEWARE
+        self.assertEqual(middleware.index("whitenoise.middleware.WhiteNoiseMiddleware"),
+                         middleware.index("django.middleware.security.SecurityMiddleware") + 1)
+
+    def test_media_is_never_inside_static(self):
+        from pathlib import Path
+
+        static_root, media_root = Path(settings.STATIC_ROOT).resolve(), Path(settings.MEDIA_ROOT).resolve()
+        self.assertNotIn(static_root, media_root.parents)
+        self.assertNotEqual(static_root, media_root)
+        self.assertFalse(settings.MEDIA_URL.startswith(settings.STATIC_URL))
+        self.assertFalse(getattr(settings, "WHITENOISE_ROOT", None))
+
+    def test_local_static_storage_unchanged(self):
+        self.assertEqual(settings.STORAGES["staticfiles"]["BACKEND"],
+                         "django.contrib.staticfiles.storage.StaticFilesStorage")

@@ -17,6 +17,11 @@ DATABASES = {"default": database_config(default_conn_max_age=60)}
 # without it, SECURE_SSL_REDIRECT behind a TLS-terminating proxy loops.
 SECURE_PROXY_SSL_HEADER = trusted_proxy_ssl_header()
 LOGGING = logging_config(os.getenv("LOG_LEVEL", "INFO"))
+# Static files are collected into the image and served by WhiteNoise.
+STORAGES = {
+    **STORAGES,
+    "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},
+}
 
 CORS_ALLOWED_ORIGINS = [
     origin.strip()

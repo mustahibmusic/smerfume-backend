@@ -240,6 +240,9 @@ class ProductVariant(BaseModel):
     image = models.ImageField(upload_to="catalog/variants/", null=True, blank=True)
 
     sku = models.CharField(max_length=64, unique=True, db_index=True)
+    # Manufacturer barcode (EAN/UPC) as printed on the item, for counter
+    # scanning. Optional; NULL (never "") when absent so it stays unique.
+    barcode = models.CharField(max_length=32, unique=True, null=True, blank=True)
     size_ml = models.PositiveIntegerField()
     is_decant = models.BooleanField(default=False)
 

@@ -67,10 +67,12 @@
         {% csrf_token %}
 
         {% if editable %}
+            {# Zoho-like order: amount and mode, date beside the payment number, then the paying account. #}
             <div class="grid grid-cols-1 md:gap-4 md:grid-cols-2">
                 <div>{% include "unfold/helpers/field.html" with field=form.amount %}</div>
-                <div>{% include "unfold/helpers/field.html" with field=form.entry_date %}</div>
                 <div>{% include "unfold/helpers/field.html" with field=form.method %}</div>
+                <div>{% include "unfold/helpers/field.html" with field=form.entry_date %}</div>
+                <div>{% include "unfold/helpers/field.html" with field=form.payment_number %}</div>
                 <div>{% include "unfold/helpers/field.html" with field=form.paid_through %}</div>
                 <div>{% include "unfold/helpers/field.html" with field=form.reference %}</div>
             </div>
@@ -97,7 +99,24 @@
                 <p class="text-base-500 text-sm">No attachments.</p>
             {% endif %}
             {% if can_add_proof %}
-                {% include "unfold/helpers/field.html" with field=form.attachments %}
+                <div class="{% if form.attachments.errors %}errors {% endif %}flex flex-col group mb-5">
+                    <span class="block font-semibold mb-2 text-font-important-light dark:text-font-important-dark">Attachments</span>
+                    {# The real file input sits transparent over this label, so click, Enter and Space open the picker. #}
+                    <label class="bg-white border border-base-200 cursor-pointer dark:bg-base-900 dark:border-base-700 focus-within:outline-2 focus-within:outline-primary-600 font-medium gap-2 hover:bg-base-50 dark:hover:bg-base-800 inline-flex items-center px-3 py-2 relative rounded-default self-start shadow-xs text-sm">
+                        <span class="material-symbols-outlined" aria-hidden="true">upload</span>
+                        Upload files
+                        {{ form.attachments }}
+                    </label>
+                    <p id="payment-files-chosen" class="mt-2 text-base-500 text-xs" aria-live="polite"></p>
+                    {% include "unfold/helpers/form_errors.html" with errors=form.attachments.errors %}
+                    {% include "unfold/helpers/help_text.html" with help_text=form.attachments.help_text %}
+                </div>
+                <script>
+                    document.getElementById("id_attachments").addEventListener("change", function () {
+                        document.getElementById("payment-files-chosen").textContent =
+                            Array.from(this.files, function (file) { return file.name; }).join(", ");
+                    });
+                </script>
                 {% if entry and not editable %}
                     <p class="text-base-500 text-xs">Proof on a posted payment can be added but not removed.</p>
                 {% endif %}
@@ -109,26 +128,26 @@
                 {# Save as Draft comes first so Enter in a field saves a draft, never posts. #}
                 {% if can_draft %}
                     <button type="submit" name="_draft" value="1"
-                            class="border border-base-200 font-medium px-3 py-2 rounded-default text-sm">
+                            class="bg-white border border-base-200 cursor-pointer dark:bg-base-900 dark:border-base-700 dark:hover:bg-base-800 focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium hover:bg-base-50 px-3 py-2 rounded-default shadow-xs text-sm">
                         Save as Draft
                     </button>
                 {% endif %}
                 {% if can_post %}
                     <button type="submit" name="_post" value="1"
-                            class="bg-primary-600 border border-transparent font-medium px-3 py-2 rounded-default text-sm text-white">
+                            class="bg-primary-600 border border-transparent cursor-pointer focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium hover:bg-primary-700 px-3 py-2 rounded-default text-sm text-white">
                         Save as Paid
                     </button>
                 {% endif %}
             {% elif can_add_proof %}
                 <button type="submit" name="_add_proof" value="1"
-                        class="bg-primary-600 border border-transparent font-medium px-3 py-2 rounded-default text-sm text-white">
+                        class="bg-primary-600 border border-transparent cursor-pointer focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium hover:bg-primary-700 px-3 py-2 rounded-default text-sm text-white">
                     Add attachments
                 </button>
             {% endif %}
-            <a href="{{ back_url }}" class="border border-base-200 font-medium px-3 py-2 rounded-default text-sm">Cancel</a>
+            <a href="{{ back_url }}" class="border border-transparent dark:hover:bg-base-800 focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium hover:bg-base-100 px-3 py-2 rounded-default text-sm">Cancel</a>
             {% if is_draft and can_draft %}
                 <button type="submit" form="payment-housekeeping" name="_delete" value="1"
-                        class="border border-red-200 font-medium ml-auto px-3 py-2 rounded-default text-red-600 text-sm">
+                        class="border border-red-200 cursor-pointer focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium ml-auto px-3 py-2 rounded-default text-red-600 text-sm">
                     Delete draft
                 </button>
             {% endif %}

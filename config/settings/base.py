@@ -1,6 +1,8 @@
 from pathlib import Path
 import os
 from urllib.parse import urlsplit
+
+import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
 from django.templatetags.static import static
 from django.urls import reverse_lazy
@@ -213,16 +215,45 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "config.wsgi.application"
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": os.getenv("DB_NAME"),
-        "USER": os.getenv("DB_USER"),
-        "PASSWORD": os.getenv("DB_PASSWORD"),
-        "HOST": os.getenv("DB_HOST", "localhost"),
-        "PORT": os.getenv("DB_PORT", "5432"),
-    }
-}
+def database_config(default_conn_max_age=0, prefer_url=True):
+    """The primary database: DATABASE_URL when set (any provider), else the
+    DB_* variables. Local development passes prefer_url=False so a machine-
+    wide DATABASE_URL never replaces the DB_* settings in .env.local.
+    DB_SSLMODE overrides any URL sslmode. PostgreSQL only; errors never
+    echo the URL, which holds a password."""
+    raw_age = os.getenv("CONN_MAX_AGE", "").strip()
+    if raw_age and not raw_age.isdigit():
+        raise ImproperlyConfigured("CONN_MAX_AGE must be a non-negative integer (seconds).")
+    conn_max_age = int(raw_age) if raw_age else default_conn_max_age
+
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not prefer_url and os.getenv("DB_NAME", "").strip():
+        url = ""
+    if url:
+        try:
+            config = dict(dj_database_url.parse(url, conn_max_age=conn_max_age, conn_health_checks=True))
+        except ValueError:
+            raise ImproperlyConfigured("DATABASE_URL is malformed.") from None
+        if config.get("ENGINE") != "django.db.backends.postgresql":
+            raise ImproperlyConfigured("DATABASE_URL must be a postgres:// or postgresql:// URL.")
+    else:
+        config = {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": os.getenv("DB_NAME"),
+            "USER": os.getenv("DB_USER"),
+            "PASSWORD": os.getenv("DB_PASSWORD"),
+            "HOST": os.getenv("DB_HOST", "localhost"),
+            "PORT": os.getenv("DB_PORT", "5432"),
+            "CONN_MAX_AGE": conn_max_age,
+            "CONN_HEALTH_CHECKS": True,
+        }
+    sslmode = os.getenv("DB_SSLMODE", "").strip()
+    if sslmode:
+        config["OPTIONS"] = {**config.get("OPTIONS", {}), "sslmode": sslmode}
+    return config
+
+
+DATABASES = {"default": database_config(prefer_url=False)}
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},

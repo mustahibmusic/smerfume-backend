@@ -10,7 +10,7 @@ from django.test import SimpleTestCase, TestCase
 from redis.exceptions import RedisError
 from rest_framework.test import APIClient
 
-from config.settings.base import parse_num_proxies, redis_cache, require_env
+from config.settings.base import database_config, parse_num_proxies, redis_cache, require_env
 
 
 class SettingsHelperTests(SimpleTestCase):
@@ -156,3 +156,64 @@ class FailOpenThrottleTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertIn("scope=anon", logs.output[0])
         self.assertNotIn("connection refused", resp.content.decode())
+
+
+
+class DatabaseConfigTests(SimpleTestCase):
+    """DATABASE_URL (any provider) with the DB_* variables as the local fallback."""
+
+    DB_VARS = ("DATABASE_URL", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST", "DB_PORT", "DB_SSLMODE", "CONN_MAX_AGE")
+
+    def _config(self, env, **kwargs):
+        clean = {k: v for k, v in os.environ.items() if k not in self.DB_VARS}
+        with patch.dict("os.environ", {**clean, **env}, clear=True):
+            return database_config(**kwargs)
+
+    def test_database_url_with_encoded_credentials_and_sslmode(self):
+        db = self._config({"DATABASE_URL": "postgres://us%40er:p%2Fss%3Aword@db.example.com:6543/shop?sslmode=require"})
+        self.assertEqual(db["ENGINE"], "django.db.backends.postgresql")
+        self.assertEqual((db["USER"], db["PASSWORD"], db["HOST"], db["PORT"], db["NAME"]),
+                         ("us@er", "p/ss:word", "db.example.com", 6543, "shop"))
+        self.assertEqual(db["OPTIONS"]["sslmode"], "require")
+        self.assertTrue(db["CONN_HEALTH_CHECKS"])
+
+    def test_postgresql_scheme_and_default_port(self):
+        db = self._config({"DATABASE_URL": "postgresql://u:p@db.example.com/shop"})
+        self.assertEqual((db["HOST"], db["NAME"]), ("db.example.com", "shop"))
+        self.assertIn(db["PORT"], ("", None, 5432, "5432"))
+
+    def test_db_vars_fallback_when_no_url(self):
+        db = self._config({"DB_NAME": "smerfume", "DB_USER": "dev", "DB_PASSWORD": "pw",
+                           "DB_HOST": "localhost", "DB_PORT": "5433"})
+        self.assertEqual((db["ENGINE"], db["NAME"], db["USER"], db["PASSWORD"], db["HOST"], db["PORT"]),
+                         ("django.db.backends.postgresql", "smerfume", "dev", "pw", "localhost", "5433"))
+        self.assertTrue(db["CONN_HEALTH_CHECKS"])
+        self.assertNotIn("sslmode", db.get("OPTIONS", {}))
+
+    def test_local_prefers_db_vars_over_a_stray_url(self):
+        env = {"DATABASE_URL": "postgres://u:p@elsewhere/otherdb", "DB_NAME": "smerfume"}
+        self.assertEqual(self._config(env, prefer_url=False)["NAME"], "smerfume")
+        self.assertEqual(self._config(env)["NAME"], "otherdb")
+        self.assertEqual(self._config({"DATABASE_URL": "postgres://u:p@h/only"}, prefer_url=False)["NAME"], "only")
+
+    def test_blank_url_uses_fallback(self):
+        db = self._config({"DATABASE_URL": "  ", "DB_NAME": "smerfume"})
+        self.assertEqual(db["NAME"], "smerfume")
+
+    def test_conn_max_age_env_and_default(self):
+        self.assertEqual(self._config({"DB_NAME": "x"})["CONN_MAX_AGE"], 0)
+        self.assertEqual(self._config({"DB_NAME": "x"}, default_conn_max_age=60)["CONN_MAX_AGE"], 60)
+        self.assertEqual(self._config({"DB_NAME": "x", "CONN_MAX_AGE": "30"}, default_conn_max_age=60)["CONN_MAX_AGE"], 30)
+        with self.assertRaises(ImproperlyConfigured):
+            self._config({"DB_NAME": "x", "CONN_MAX_AGE": "soon"})
+
+    def test_db_sslmode_applies_to_both_paths(self):
+        db = self._config({"DB_NAME": "x", "DB_SSLMODE": "require"})
+        self.assertEqual(db["OPTIONS"]["sslmode"], "require")
+        db = self._config({"DATABASE_URL": "postgres://u:p@h/db", "DB_SSLMODE": "verify-full"})
+        self.assertEqual(db["OPTIONS"]["sslmode"], "verify-full")
+
+    def test_non_postgres_url_refused_without_echoing_it(self):
+        with self.assertRaises(ImproperlyConfigured) as ctx:
+            self._config({"DATABASE_URL": "mysql://user:secret@h/db"})
+        self.assertNotIn("secret", str(ctx.exception))

@@ -3,10 +3,14 @@ from django.contrib import admin
 from django.contrib import messages
 from django.contrib.admin.models import LogEntry
 from django.contrib.contenttypes.models import ContentType
-from django.db.models import Exists, OuterRef, Q
+from django.core.exceptions import PermissionDenied
+from django.db.models import Case, Exists, IntegerField, OuterRef, Q, Value, When
+from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
-from django.urls import reverse
+from django.urls import path, reverse
+from django.utils.decorators import method_decorator
+from django.views.decorators.http import require_GET
 from django.utils.html import format_html, format_html_join
 from rest_framework import serializers as drf_serializers
 from unfold.admin import ModelAdmin
@@ -21,6 +25,7 @@ from unfold.widgets import (
 
 from apps.catalog.models import ProductVariant
 from apps.inventory.models import StockMovement, StockReservationAllocation, Warehouse
+from apps.inventory.selectors import in_store_available
 from apps.inventory.services.reservation import InsufficientStockError
 
 from . import services as order_services
@@ -29,6 +34,50 @@ from .serializers import validate_mobile_number
 
 
 # ── In-store sale form (DEC-008) ─────────────────────────────────────────────
+
+ITEM_SEARCH_LIMIT = 20
+
+
+def counter_item_rows(variants, warehouse, query=""):
+    """JSON rows for the in-store item picker: name, SKU, barcode, physical
+    stock in `warehouse` and the current selling price. The SKU is the row
+    id the sale form submits; database ids are never exposed."""
+    variants = list(variants)
+    stock = in_store_available([v.pk for v in variants], warehouse)
+    wanted = query.strip().lower()
+    return [
+        {
+            "id": v.sku, "text": str(v), "sku": v.sku, "barcode": v.barcode,
+            "stock": stock[v.pk], "price": str(v.selling_price),
+            "exact": bool(wanted) and wanted in (v.sku.lower(), (v.barcode or "").lower()),
+        }
+        for v in variants
+    ]
+
+
+def search_counter_items(query, limit=ITEM_SEARCH_LIMIT):
+    """Active variants matching every word of `query` against brand,
+    product, edition, SKU or barcode. Exact barcode first, then exact SKU,
+    then the rest by name. Returns up to limit + 1 (the extra one only
+    tells the caller there are more)."""
+    terms = query.split()[:5]
+    if not terms:
+        return []
+    variants = ProductVariant.objects.filter(is_active=True).select_related("edition__product__brand")
+    for term in terms:
+        variants = variants.filter(
+            Q(edition__product__name__icontains=term) | Q(edition__product__brand__name__icontains=term)
+            | Q(edition__name__icontains=term) | Q(sku__icontains=term) | Q(barcode__icontains=term)
+        )
+    whole = query.strip()
+    rank = Case(
+        When(barcode__iexact=whole, then=Value(0)), When(sku__iexact=whole, then=Value(1)),
+        default=Value(2), output_field=IntegerField(),
+    )
+    return list(variants.annotate(rank=rank).order_by(
+        "rank", "edition__product__brand__name", "edition__product__name", "edition__name", "size_ml", "sku",
+    )[:limit + 1])
+
 
 class InStoreSaleForm(forms.Form):
     customer_mobile = forms.CharField(
@@ -467,6 +516,36 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
             ),
         )
         return format_html("<table><tbody>{}</tbody></table>", rows) if entries else "—"
+
+    def get_urls(self):
+        return [
+            path(
+                "in-store-sale/items/", self.admin_site.admin_view(self.in_store_item_search),
+                name="orders_order_in_store_items",
+            ),
+        ] + super().get_urls()
+
+    @method_decorator(require_GET)
+    def in_store_item_search(self, request):
+        """Read-only JSON for the in-store item picker. ?q= searches (max 20,
+        exact barcode/SKU first); ?skus=A,B refreshes stock for lines
+        already chosen. Stock is physical, in ?warehouse=<id>."""
+        if not request.user.has_perm("orders.add_order"):
+            raise PermissionDenied
+        try:
+            warehouse = Warehouse.objects.get(pk=int(request.GET.get("warehouse", "")))
+        except (ValueError, Warehouse.DoesNotExist):
+            return JsonResponse({"error": "Choose a valid warehouse."}, status=400)
+        if "skus" in request.GET:
+            skus = [s.strip() for s in request.GET["skus"].split(",") if s.strip()][:50]
+            variants = ProductVariant.objects.filter(sku__in=skus).select_related("edition__product__brand")
+            return JsonResponse({"results": counter_item_rows(variants, warehouse), "more": False})
+        query = request.GET.get("q", "")
+        variants = search_counter_items(query)
+        return JsonResponse({
+            "results": counter_item_rows(variants[:ITEM_SEARCH_LIMIT], warehouse, query),
+            "more": len(variants) > ITEM_SEARCH_LIMIT,
+        })
 
     @action(
         description="New in-store sale",

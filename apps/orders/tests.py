@@ -4223,3 +4223,155 @@ class InStoreAvailableTests(TestCase):
         with CaptureQueriesContext(connection) as ctx:
             in_store_available(ids, self.warehouse)
         self.assertLessEqual(len(ctx.captured_queries), 3)
+
+
+# ── In-store item table: item search endpoint ────────────────────────────────
+
+ITEM_SEARCH_URL = "/admin/orders/order/in-store-sale/items/"
+
+
+def _counter_variant(brand, product, edition, sku, barcode=None, price="1000.00", quantity=10, size_ml=100):
+    brand_obj = Brand.objects.get_or_create(name=brand, slug=brand.lower().replace(" ", "-"))[0]
+    category = Category.objects.get_or_create(name="CounterCat", slug="countercat")[0]
+    product_obj = Product.objects.get_or_create(
+        name=product, slug=f"{brand_obj.slug}-{product.lower().replace(' ', '-')}",
+        defaults={"brand": brand_obj, "category": category},
+    )[0]
+    edition_obj = ProductEdition.objects.get_or_create(
+        product=product_obj, slug=f"{product_obj.slug}-{(edition or 'std').lower().replace(' ', '-')}",
+        defaults={"name": edition, "concentration": "edp", "gender": "unisex"},
+    )[0]
+    variant = ProductVariant.objects.create(
+        edition=edition_obj, size_ml=size_ml, selling_price=price, mrp=price, sku=sku, barcode=barcode,
+    )
+    InventoryStock.objects.create(
+        variant=variant, warehouse=Warehouse.objects.get(is_default=True),
+        stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal(quantity),
+    )
+    return variant
+
+
+class InStoreItemSearchTests(TestCase):
+    def setUp(self):
+        self.admin_user = User.objects.create_superuser(
+            username="itemsearch", email="itemsearch@example.com", password="testpass123",
+        )
+        self.client.force_login(self.admin_user)
+        self.warehouse = Warehouse.objects.get(is_default=True)
+        self.hawas = _counter_variant("Rasasi", "Hawas", "Ice", "RAS-HAW-ICE-100", barcode="6291100000011",
+                                      price="4850.00", quantity=4)
+        self.sauvage = _counter_variant("Dior", "Sauvage", "Elixir", "DIO-SAU-ELX-60", price="9800.00", size_ml=60)
+
+    def _search(self, **params):
+        params.setdefault("warehouse", self.warehouse.pk)
+        resp = self.client.get(ITEM_SEARCH_URL, params)
+        self.assertEqual(resp.status_code, 200)
+        return resp.json()
+
+    def _skus(self, data):
+        return [row["sku"] for row in data["results"]]
+
+    def test_search_by_product_brand_edition_sku_and_barcode(self):
+        for q in ("hawas", "rasasi", "ice", "RAS-HAW", "6291100000011", "rasasi ice"):
+            with self.subTest(q=q):
+                self.assertEqual(self._skus(self._search(q=q)), ["RAS-HAW-ICE-100"])
+
+    def test_result_shape(self):
+        row = self._search(q="hawas")["results"][0]
+        self.assertEqual(row, {
+            "id": "RAS-HAW-ICE-100", "text": str(self.hawas), "sku": "RAS-HAW-ICE-100",
+            "barcode": "6291100000011", "stock": 4, "price": "4850.00", "exact": False,
+        })
+        self.assertNotIn(str(self.hawas.pk), [str(v) for v in row.values()])
+
+    def test_exact_barcode_then_exact_sku_first(self):
+        _counter_variant("Zeta", "Contains 6291100000011 in name", None, "ZZZ-1")
+        _counter_variant("Alpha", "RAS-HAW-ICE-100 refill", None, "AAA-1")
+        data = self._search(q="6291100000011")
+        self.assertEqual(data["results"][0]["sku"], "RAS-HAW-ICE-100")
+        self.assertTrue(data["results"][0]["exact"])
+        data = self._search(q="ras-haw-ice-100")
+        self.assertEqual(data["results"][0]["sku"], "RAS-HAW-ICE-100")
+        self.assertTrue(data["results"][0]["exact"])
+        self.assertFalse(data["results"][1]["exact"])
+
+    def test_limit_twenty(self):
+        for i in range(25):
+            _counter_variant("Bulk", f"Bulk {i:02d}", None, f"BULK-{i:02d}")
+        data = self._search(q="bulk")
+        self.assertEqual(len(data["results"]), 20)
+        self.assertTrue(data["more"])
+
+    def test_inactive_variant_hidden(self):
+        ProductVariant.objects.filter(pk=self.sauvage.pk).update(is_active=False)
+        self.assertEqual(self._search(q="sauvage")["results"], [])
+
+    def test_empty_query_returns_nothing(self):
+        self.assertEqual(self._search(q="  ")["results"], [])
+
+    def test_stock_for_selected_warehouse(self):
+        other = Warehouse.objects.create(name="Counter Three")
+        InventoryStock.objects.create(
+            variant=self.hawas, warehouse=other, stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal("9"),
+        )
+        self.assertEqual(self._search(q="hawas", warehouse=other.pk)["results"][0]["stock"], 9)
+        self.assertEqual(self._search(q="hawas")["results"][0]["stock"], 4)
+
+    def test_booked_incoming_not_exposed(self):
+        from django.test import override_settings
+        _book_incoming(self.hawas, 50)
+        with override_settings(BOOKED_INCOMING_SALES_ENABLED=True):
+            data = self._search(q="hawas")
+        self.assertEqual(data["results"][0]["stock"], 4)
+        self.assertNotIn("incoming", str(data).lower())
+
+    def test_decant_stock(self):
+        source, decant = _make_decant_pair(source_size_ml=100, decant_volume_ml=10, source_retail_quantity=2)
+        row = next(r for r in self._search(q=decant.sku)["results"] if r["sku"] == decant.sku)
+        self.assertEqual(row["stock"], 20)
+
+    def test_refresh_selected_skus(self):
+        data = self._search(skus="RAS-HAW-ICE-100,DIO-SAU-ELX-60,NOPE")
+        self.assertEqual(sorted(self._skus(data)), ["DIO-SAU-ELX-60", "RAS-HAW-ICE-100"])
+
+    def test_bad_warehouse_rejected(self):
+        resp = self.client.get(ITEM_SEARCH_URL, {"q": "hawas", "warehouse": "x"})
+        self.assertEqual(resp.status_code, 400)
+        resp = self.client.get(ITEM_SEARCH_URL, {"q": "hawas", "warehouse": "999999"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_permissions(self):
+        from django.contrib.auth.models import Permission
+        staff = User.objects.create_user(username="noperm", email="noperm@example.com", password="x", is_staff=True)
+        self.client.force_login(staff)
+        self.assertEqual(self.client.get(ITEM_SEARCH_URL, {"q": "hawas"}).status_code, 403)
+        staff.user_permissions.add(Permission.objects.get(content_type__app_label="orders", codename="add_order"))
+        self.client.force_login(User.objects.get(pk=staff.pk))
+        self.assertEqual(self.client.get(ITEM_SEARCH_URL, {"q": "hawas", "warehouse": self.warehouse.pk}).status_code,
+                         200)
+        self.client.logout()
+        resp = self.client.get(ITEM_SEARCH_URL, {"q": "hawas"})
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("/admin/login/", resp["Location"])
+
+    def test_read_only(self):
+        before = (Order.objects.count(), StockReservation.objects.count(),
+                  list(InventoryStock.objects.values_list("quantity", "quantity_reserved")))
+        self._search(q="hawas")
+        self.assertEqual(self.client.post(ITEM_SEARCH_URL, {"q": "hawas"}).status_code, 405)
+        after = (Order.objects.count(), StockReservation.objects.count(),
+                 list(InventoryStock.objects.values_list("quantity", "quantity_reserved")))
+        self.assertEqual(before, after)
+
+    def test_fixed_query_count(self):
+        def count(q):
+            self.client.get(ITEM_SEARCH_URL, {"q": q, "warehouse": self.warehouse.pk})  # warm session
+            with CaptureQueriesContext(connection) as ctx:
+                self._search(q=q)
+            return len(ctx.captured_queries)
+
+        one = count("hawas")
+        for i in range(10):
+            _counter_variant("Many", f"Many {i}", None, f"MANY-{i}")
+        _make_decant_pair(source_size_ml=100, decant_volume_ml=10, source_retail_quantity=2)
+        self.assertEqual(count("many"), one)

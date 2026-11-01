@@ -51,9 +51,14 @@ local media, caches and virtualenvs out of the image.
 ## 4. Release (once per deploy, before the new web process starts)
 
 ```
-python manage.py migrate --noinput
+python manage.py migrate --noinput --skip-checks
 python manage.py check --deploy
 ```
+
+`--skip-checks` is required: on an empty database, `migrate`'s own system
+checks include Unfold's admin check, which queries `auth_permission`
+before that table exists, so the very first deploy would fail. The full
+checks still run, after migrating, in `check --deploy`.
 
 Run these as a separate one-off process using the same image and
 environment. Never run migrations in the Docker `CMD`, at app startup or
@@ -66,7 +71,7 @@ Where each provider runs a release command (configuration, not code):
 | Render | Service "Pre-Deploy Command" |
 | Railway | Service "Pre-Deploy Command" |
 | Fly.io | `[deploy] release_command` in `fly.toml` |
-| VPS / Docker Compose | `docker compose run --rm web python manage.py migrate --noinput` before `docker compose up -d` |
+| VPS / Docker Compose | `docker compose run --rm web sh -c "python manage.py migrate --noinput --skip-checks && python manage.py check --deploy"` before `docker compose up -d` |
 
 Rules:
 

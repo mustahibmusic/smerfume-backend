@@ -120,7 +120,9 @@ class DeployedSettingsFailFastTests(SimpleTestCase):
         module_name = f"config.settings.{name}"
         base = sys.modules["config.settings.base"]
         clean = {k: v for k, v in os.environ.items() if k not in self.MANAGED}
-        with patch.dict("os.environ", {**clean, **self.BASELINE, **env}, clear=True):
+        # Production always needs object storage; other tests get a valid one.
+        baseline = {**self.BASELINE, **(S3_ENV if name == "production" else {})}
+        with patch.dict("os.environ", {**clean, **baseline, **env}, clear=True):
             sys.modules.pop(module_name, None)
             sys.modules.pop("config.settings.base", None)
             try:
@@ -257,6 +259,37 @@ class DeployedSettingsFailFastTests(SimpleTestCase):
                 self.assertEqual(module.STORAGES["staticfiles"]["BACKEND"],
                                  "whitenoise.storage.CompressedManifestStaticFilesStorage")
                 # Uploaded media keeps its own storage, never WhiteNoise.
+                self.assertNotIn("whitenoise", module.STORAGES["default"]["BACKEND"])
+                self.assertNotIn("whitenoise", module.STORAGES["private_documents"]["BACKEND"])
+
+    # Production object storage ------------------------------------------
+
+    def test_production_refuses_to_start_without_object_storage(self):
+        for value in ("", "False", "false", "1"):
+            with self.subTest(USE_S3=value), self.assertRaisesMessage(ImproperlyConfigured, "USE_S3"):
+                self._import("production", {**self.VALID, "USE_S3": value})
+
+    def test_production_refuses_incomplete_object_storage(self):
+        for change, needle in (
+            ({"AWS_STORAGE_BUCKET_NAME": ""}, "AWS_STORAGE_BUCKET_NAME"),
+            ({"AWS_PRIVATE_STORAGE_BUCKET_NAME": ""}, "AWS_PRIVATE_STORAGE_BUCKET_NAME"),
+            ({"AWS_PRIVATE_STORAGE_BUCKET_NAME": "smerfume-public"}, "different"),
+            ({"AWS_ACCESS_KEY_ID": ""}, "AWS_ACCESS_KEY_ID"),
+            ({"AWS_SECRET_ACCESS_KEY": ""}, "AWS_SECRET_ACCESS_KEY"),
+            ({"AWS_S3_CUSTOM_DOMAIN": ""}, "AWS_S3_CUSTOM_DOMAIN"),
+        ):
+            with self.subTest(change), self.assertRaisesMessage(ImproperlyConfigured, needle):
+                self._import("production", {**self.VALID, **change})
+
+    def test_production_with_valid_object_storage_starts(self):
+        module = self._import("production", self.VALID)
+        self.assertEqual(module.STORAGES["default"]["BACKEND"], "apps.core.storage.PublicMediaStorage")
+        self.assertEqual(module.STORAGES["private_documents"]["BACKEND"], "apps.core.storage.PrivateMediaStorage")
+
+    def test_staging_and_uat_keep_object_storage_optional(self):
+        for name in ("staging", "uat"):
+            with self.subTest(name):
+                module = self._import(name, {**self.VALID, "USE_S3": ""})
                 self.assertEqual(module.STORAGES["default"]["BACKEND"],
                                  "django.core.files.storage.FileSystemStorage")
 
@@ -736,3 +769,9 @@ class SystemChecksNeedNoDatabaseTests(TestCase):
                         if "." in permission:
                             dotted.append(f"{model_admin.__class__.__name__}.{unfold_action.method.__name__}: {permission}")
         self.assertEqual(dotted, [])
+
+
+
+class LocalStorageUnchangedTests(SimpleTestCase):
+    def test_local_and_tests_do_not_need_object_storage(self):
+        self.assertEqual(settings.STORAGES["default"]["BACKEND"], "django.core.files.storage.FileSystemStorage")

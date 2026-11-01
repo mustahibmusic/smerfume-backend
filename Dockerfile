@@ -18,13 +18,19 @@ RUN pip install -r requirements.txt
 COPY . .
 
 # Static files are collected into the image and served by WhiteNoise.
-# Build-only placeholder values: nothing connects to a database or Redis.
+# Build-only placeholder values: nothing connects to a database, Redis or
+# object storage (static files stay on the image filesystem).
 RUN DJANGO_ENV=production \
     SECRET_KEY=collectstatic-build-only \
     ALLOWED_HOSTS=localhost \
     CSRF_TRUSTED_ORIGINS=https://localhost \
     REDIS_URL=redis://localhost:6379/0 \
     NUM_PROXIES=0 \
+    USE_S3=True \
+    AWS_ACCESS_KEY_ID=build-only \
+    AWS_SECRET_ACCESS_KEY=build-only \
+    AWS_STORAGE_BUCKET_NAME=build-only-public \
+    AWS_PRIVATE_STORAGE_BUCKET_NAME=build-only-private \
     python manage.py collectstatic --noinput
 
 # Non-root runtime user. media/ and private_media/ exist only for hosts

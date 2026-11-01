@@ -4,6 +4,15 @@ from .base import *
 
 DEBUG = False
 
+# Uploads (product images, private payment proof) must live in object
+# storage: a container's disk is erased on restart and deploy. base.py has
+# already validated the S3 settings (buckets, credentials) when USE_S3=True.
+if os.getenv("USE_S3") != "True":
+    raise ImproperlyConfigured(
+        "USE_S3=True is required in production: uploads must go to object storage, "
+        "never to the container's disk."
+    )
+
 ALLOWED_HOSTS = require_env_list("ALLOWED_HOSTS")
 CSRF_TRUSTED_ORIGINS = require_env_list("CSRF_TRUSTED_ORIGINS")
 

@@ -31,7 +31,8 @@ values in the provider's environment settings; never commit them.
 - `DJANGO_ENV` must be `production`, `staging` or `uat`. The WSGI entry point
   refuses to start without it.
 - Required in deployed environments: `SECRET_KEY`, `ALLOWED_HOSTS`,
-  `REDIS_URL`, `NUM_PROXIES`, and in production `CSRF_TRUSTED_ORIGINS`.
+  `REDIS_URL`, `NUM_PROXIES`, and in production `CSRF_TRUSTED_ORIGINS` and
+  object storage (`USE_S3=True` and the `AWS_*` variables, section 8).
 - Database: `DATABASE_URL` (parsed by dj-database-url; `?sslmode=require`
   is honoured). `DB_SSLMODE` overrides the URL's SSL mode. Deployed
   environments keep connections for `CONN_MAX_AGE` seconds (default 60)
@@ -130,6 +131,12 @@ HSTS rollout:
 
 ## 8. Object storage
 
+Object storage is **mandatory in production**: with `DJANGO_ENV=production`
+the app refuses to start unless `USE_S3=True` and the storage settings
+below are complete. Product images and private payment proof must never
+be written to a container's disk, which is erased on restart and deploy.
+Staging and UAT may use it or not; local development and tests do not.
+
 `USE_S3=True` stores uploads in S3-compatible storage (AWS S3, Cloudflare
 R2, Backblaze B2, ...). Two physically separate buckets:
 
@@ -145,9 +152,10 @@ as the public bucket, or if a custom `AWS_S3_ENDPOINT_URL` has no
 Leave `AWS_S3_ENDPOINT_URL` blank for AWS S3. Use `AWS_S3_REGION_NAME=auto`
 for R2.
 
-Without `USE_S3`, uploads go to the container filesystem, which most
-container hosts erase on every deploy. Only use that with a persistent
-volume mounted at `/app/media` and `/app/private_media`.
+Without `USE_S3` (staging/UAT only), uploads go to the container
+filesystem, which most container hosts erase on every deploy. Only use
+that with a persistent volume mounted at `/app/media` and
+`/app/private_media`.
 
 ## 9. Uploads
 

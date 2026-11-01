@@ -4133,3 +4133,93 @@ class ReturnShippingOverridePermissionTests(TestCase):
         self.assertNotIn(
             "base_shipping_refund_override", model_admin.get_readonly_fields(request, return_request),
         )
+
+
+# ── In-store item table: physical availability (selector) ────────────────────
+
+from django.test.utils import CaptureQueriesContext  # noqa: E402
+
+from apps.inventory.selectors import in_store_available  # noqa: E402
+
+
+class InStoreAvailableTests(TestCase):
+    """Physical stock a counter sale can take: retail available for normal
+    variants, whole decants from open-bottle ml plus sealed bottles for
+    decant variants. Booked incoming is never counted."""
+
+    def setUp(self):
+        self.staff = _make_staff(mobile="+919700000901", username="avail-staff")
+        self.warehouse = Warehouse.objects.get(is_default=True)
+        self.variant = _make_variant(selling_price="1000.00")
+
+    def _stock(self, variant, warehouse=None):
+        return InventoryStock.objects.get(variant=variant, warehouse=warehouse or self.warehouse, stock_type="retail")
+
+    def test_retail_available_excludes_reserved(self):
+        InventoryStock.objects.filter(pk=self._stock(self.variant).pk).update(
+            quantity=Decimal("7"), quantity_reserved=Decimal("3"),
+        )
+        self.assertEqual(in_store_available([self.variant.pk], self.warehouse), {self.variant.pk: 4})
+
+    def test_never_negative_and_zero_without_stock_row(self):
+        InventoryStock.objects.filter(pk=self._stock(self.variant).pk).update(
+            quantity=Decimal("1"), quantity_reserved=Decimal("2"),
+        )
+        bare = _make_variant()
+        InventoryStock.objects.filter(variant=bare).delete()
+        self.assertEqual(in_store_available([self.variant.pk, bare.pk], self.warehouse),
+                         {self.variant.pk: 0, bare.pk: 0})
+
+    def test_only_retail_stock_counts(self):
+        InventoryStock.objects.create(
+            variant=self.variant, warehouse=self.warehouse,
+            stock_type=InventoryStock.STOCK_TYPE_DAMAGED, quantity=Decimal("50"),
+        )
+        self.assertEqual(in_store_available([self.variant.pk], self.warehouse)[self.variant.pk], 100)
+
+    def test_warehouse_specific(self):
+        other = Warehouse.objects.create(name="Counter Two")
+        InventoryStock.objects.create(
+            variant=self.variant, warehouse=other, stock_type=InventoryStock.STOCK_TYPE_RETAIL, quantity=Decimal("2"),
+        )
+        self.assertEqual(in_store_available([self.variant.pk], other)[self.variant.pk], 2)
+        self.assertEqual(in_store_available([self.variant.pk], self.warehouse)[self.variant.pk], 100)
+
+    def test_booked_incoming_never_counted(self):
+        from django.test import override_settings
+        InventoryStock.objects.filter(variant=self.variant).update(quantity=Decimal("1"))
+        _book_incoming(self.variant, 5)
+        with override_settings(BOOKED_INCOMING_SALES_ENABLED=True):
+            self.assertEqual(in_store_available([self.variant.pk], self.warehouse)[self.variant.pk], 1)
+
+    def test_decant_capacity_from_lots_and_sealed_bottles(self):
+        source, decant = _make_decant_pair(source_size_ml=100, decant_volume_ml=10, source_retail_quantity=5)
+        order_services.create_in_store_order(
+            lines=[(decant, 2)], staff_user=self.staff, customer_mobile="9811100901",
+            payment_method=Order.PAYMENT_METHOD_CASH,
+        )
+        # 4 sealed bottles (400ml) + 80ml left in the opened one = 48 decants.
+        self.assertEqual(in_store_available([decant.pk, source.pk], self.warehouse), {decant.pk: 48, source.pk: 4})
+
+    def test_matches_what_the_reservation_allows(self):
+        source, decant = _make_decant_pair(source_size_ml=100, decant_volume_ml=30, source_retail_quantity=1)
+        available = in_store_available([decant.pk], self.warehouse)[decant.pk]
+        self.assertEqual(available, 3)
+        with self.assertRaises(reservation_service.InsufficientStockError):
+            order_services.create_in_store_order(
+                lines=[(decant, available + 1)], staff_user=self.staff, customer_mobile="9811100902",
+                payment_method=Order.PAYMENT_METHOD_CASH,
+            )
+        order_services.create_in_store_order(
+            lines=[(decant, available)], staff_user=self.staff, customer_mobile="9811100903",
+            payment_method=Order.PAYMENT_METHOD_CASH,
+        )
+
+    def test_fixed_query_count(self):
+        variants = [_make_variant() for _ in range(5)]
+        decants = [_make_decant_pair(source_size_ml=100, decant_volume_ml=10, source_retail_quantity=2)[1]
+                   for _ in range(3)]
+        ids = [v.pk for v in variants + decants]
+        with CaptureQueriesContext(connection) as ctx:
+            in_store_available(ids, self.warehouse)
+        self.assertLessEqual(len(ctx.captured_queries), 3)

@@ -5081,6 +5081,171 @@ class PaidThroughGroupedSelectTests(_PrivateStorageMixin, _PaymentServiceBase):
         self.assertEqual(groups, ["Cash", "Bank", "UPI", "Card", "Owner", "Employee-paid"])
 
 
+class SupplierPaymentFormControlTests(_PrivateStorageMixin, _PaymentServiceBase):
+    """Record Payment form controls: input types, inline errors next to the
+    field, values kept after errors and on draft edit. The services stay the
+    authority; these checks only move their messages under the right field."""
+
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(_purchases_staff(
+            "fc_staff", "view_purchaseorder", "view_purchaseorderpayment", "record_po_payment", "post_po_payment",
+        ))
+
+    def _record_url(self):
+        return reverse("admin:purchases_purchaseorder_record_payment", args=[self.po.pk])
+
+    def _entry_url(self, entry):
+        return reverse("admin:purchases_purchaseorder_payment_entry", args=[entry.public_id])
+
+    def _data(self, button, **overrides):
+        data = {
+            "amount": "250.00", "entry_date": timezone.localdate().isoformat(), "method": "upi",
+            "reference": "UTR-31", "notes": "", "paid_through": self.account.pk, button: "1",
+        }
+        data.update(overrides)
+        return data
+
+    def _tag(self, html, name):
+        return re.search(r'<(?:input|select|textarea)\b[^>]*name="' + name + r'"[^>]*>', html).group(0)
+
+    def _refused(self, resp):
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(PurchaseOrderPayment.objects.filter(entry_type=PAYMENT).exists())
+        return resp.context["form"]
+
+    # Widgets ---------------------------------------------------------------
+
+    def test_field_input_types(self):
+        html = self.client.get(self._record_url()).content.decode()
+        self.assertRegex(self._tag(html, "amount"), r'type="number".*min="0\.01".*step="0\.01"')
+        self.assertIn('type="date"', self._tag(html, "entry_date"))
+        self.assertIn("<select", self._tag(html, "method"))
+        self.assertIn("unfold-admin-autocomplete", self._tag(html, "paid_through"))
+        self.assertIn('type="text"', self._tag(html, "reference"))
+        self.assertIn("<textarea", self._tag(html, "notes"))
+        attachments = self._tag(html, "attachments")
+        self.assertIn('type="file"', attachments)
+        self.assertIn("multiple", attachments)
+
+    def test_method_choices(self):
+        choices = [label for _, label in PurchaseOrderPayment.METHOD_CHOICES]
+        html = self.client.get(self._record_url()).content.decode()
+        select = re.search(r'<select name="method".*?</select>', html, re.S).group(0)
+        self.assertEqual(re.findall(r"<option [^>]*>([^<]*)</option>", select), choices)
+
+    def test_date_is_native_picker_capped_at_today(self):
+        html = self.client.get(self._record_url()).content.decode()
+        tag = self._tag(html, "entry_date")
+        today = timezone.localdate().isoformat()
+        self.assertIn(f'value="{today}"', tag)
+        self.assertIn(f'max="{today}"', tag)
+        # The Django admin calendar popup needs admin jsi18n, which this page
+        # does not load; the native picker needs no script.
+        self.assertNotIn("DateTimeShortcuts", html)
+
+    def test_typed_day_month_date_is_refused_not_misread(self):
+        # en-us parsing would read 01/11/2026 as 11 January.
+        form = self._refused(self.client.post(self._record_url(), self._data("_draft", entry_date="01/11/2026")))
+        self.assertIn("entry_date", form.errors)
+
+    def test_payment_number_is_read_only_until_posted(self):
+        html = self.client.get(self._record_url()).content.decode()
+        tag = self._tag(html, "payment_number")
+        self.assertIn("disabled", tag)
+        self.assertIn("Assigned when saved as paid", tag)
+        resp = self.client.post(self._record_url(), self._data("_post", payment_number="SPAY-999999"))
+        self.assertEqual(resp.status_code, 302)
+        self.assertNotEqual(PurchaseOrderPayment.objects.get().payment_number, "SPAY-999999")
+
+    def test_enter_key_defaults_to_save_as_draft(self):
+        html = self.client.get(self._entry_url(self._create_draft(paid_through=None))).content.decode()
+        form = re.search(r'<form method="post" enctype="multipart/form-data".*?</form>', html, re.S).group(0)
+        buttons = re.findall(r"<button\b[^>]*>", form)
+        # The first submit button owned by the form is the implicit (Enter) one.
+        own = [b for b in buttons if 'form="' not in b]
+        self.assertIn('name="_draft"', own[0])
+
+    # Inline errors ---------------------------------------------------------
+
+    def test_future_date_error_under_the_date_field(self):
+        tomorrow = (timezone.localdate() + datetime.timedelta(days=1)).isoformat()
+        form = self._refused(self.client.post(self._record_url(), self._data("_draft", entry_date=tomorrow)))
+        self.assertIn("future", str(form.errors["entry_date"]))
+
+    def test_reference_rules_inline_per_method(self):
+        cases = (
+            ("bank_transfer", "", "", True),
+            ("upi", "", "", True),
+            ("cheque", "", "", True),
+            ("card", "", "", True),
+            ("cash", "", "", False),
+            ("other", "", "short", True),
+            ("other", "", "Paid by the owner from personal funds", False),
+            ("other", "REF-1", "", False),
+        )
+        for method, reference, notes, refused in cases:
+            with self.subTest(method=method, notes=notes):
+                resp = self.client.post(self._record_url(), self._data(
+                    "_draft", method=method, reference=reference, notes=notes,
+                ))
+                if refused:
+                    self.assertIn("reference", self._refused(resp).errors)
+                else:
+                    self.assertEqual(resp.status_code, 302)
+                    PurchaseOrderPayment.objects.all().delete()
+
+    def test_paid_through_required_only_to_save_as_paid(self):
+        form = self._refused(self.client.post(self._record_url(), self._data("_post", paid_through="")))
+        self.assertIn("paid_through", form.errors)
+        resp = self.client.post(self._record_url(), self._data("_draft", paid_through=""))
+        self.assertEqual(resp.status_code, 302)
+
+    def test_inactive_draft_account_refused_inline_when_saving_as_paid(self):
+        closed = _account("Old Bank", PaymentAccount.KIND_BANK)
+        draft = self._create_draft(paid_through=closed)
+        PaymentAccount.objects.filter(pk=closed.pk).update(is_active=False)
+        resp = self.client.post(self._entry_url(draft), self._data("_post", paid_through=closed.pk))
+        self.assertIn("inactive", str(resp.context["form"].errors["paid_through"]))
+        draft.refresh_from_db()
+        self.assertTrue(draft.is_draft)
+
+    def test_field_error_marks_input_invalid(self):
+        resp = self.client.post(self._record_url(), self._data("_draft", reference=""))
+        tag = self._tag(resp.content.decode(), "reference")
+        self.assertIn('aria-invalid="true"', tag)
+
+    # Values kept -----------------------------------------------------------
+
+    def test_values_kept_after_validation_error(self):
+        resp = self.client.post(self._record_url(), self._data(
+            "_draft", amount="123.45", entry_date="2026-01-15", method="cheque", reference="", notes="Kept text",
+        ))
+        html = resp.content.decode()
+        self.assertIn('value="123.45"', self._tag(html, "amount"))
+        self.assertIn('value="2026-01-15"', self._tag(html, "entry_date"))
+        self.assertRegex(html, r'<option value="cheque" selected>')
+        self.assertRegex(html, r'<textarea name="notes"[^>]*>\s*Kept text</textarea>')
+
+    def test_draft_edit_shows_stored_values(self):
+        draft = self._create_draft(
+            amount=Decimal("321.00"), entry_date=datetime.date(2026, 1, 5), method="card",
+            reference="SLIP-9", notes="Stored note",
+        )
+        html = self.client.get(self._entry_url(draft)).content.decode()
+        self.assertIn('value="321.00"', self._tag(html, "amount"))
+        self.assertIn('value="2026-01-05"', self._tag(html, "entry_date"))
+        self.assertIn('value="SLIP-9"', self._tag(html, "reference"))
+        self.assertRegex(html, r'<option value="card" selected>')
+        self.assertRegex(html, rf'<option value="{self.account.pk}" selected>')
+        self.assertRegex(html, r'<textarea name="notes"[^>]*>\s*Stored note</textarea>')
+
+    def test_attachment_help_lists_limits_and_reselect_note(self):
+        html = self.client.get(self._record_url()).content.decode()
+        for text in ("PDF, JPG, PNG or WebP", "5 files", "5 MB each", "select the files again"):
+            self.assertIn(text, html)
+
+
 class PaymentAccountKindMigrationTests(TransactionTestCase):
     """0010 retires the 'Other' kind without guessing what an Other account is."""
 

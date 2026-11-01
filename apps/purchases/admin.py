@@ -7,6 +7,7 @@ from django.contrib import admin, messages
 from django.db import transaction
 from django.db.models import Count, Exists, OuterRef, Q, Sum
 from django.utils.html import format_html, format_html_join
+from django.utils.safestring import mark_safe
 from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
@@ -16,6 +17,7 @@ from unfold.admin import ModelAdmin, TabularInline
 from unfold.decorators import action, display
 from unfold.enums import ActionVariant
 from unfold.widgets import (
+    DATETIME_CLASSES,
     UnfoldAdminDateWidget,
     UnfoldAdminDecimalFieldWidget,
     UnfoldAdminSelect2Widget,
@@ -305,6 +307,17 @@ class SupplierPaymentForm(forms.Form):
             del self.fields["paid_through"]
 
 
+class PaymentDateInput(forms.DateInput):
+    """Native date picker: keyboard entry and a calendar without the admin
+    calendar script (which needs jsi18n), and an unambiguous ISO value."""
+
+    input_type = "date"
+    template_name = "unfold/widgets/date.html"
+
+    def __init__(self, attrs=None):
+        super().__init__(attrs={"class": " ".join(DATETIME_CLASSES), **(attrs or {})}, format="%Y-%m-%d")
+
+
 class MultipleFileInput(forms.ClearableFileInput):
     allow_multiple_selected = True
 
@@ -313,10 +326,11 @@ class MultipleFileField(forms.FileField):
     """Several proof files in one input; the service validates their content."""
 
     def __init__(self, *args, **kwargs):
+        # Unfold's prebuilt CSS has no file: utilities, so the input is
+        # transparent over a styled "Upload files" label in the template.
         kwargs.setdefault("widget", MultipleFileInput(attrs={
             "accept": "application/pdf,image/jpeg,image/png,image/webp",
-            "class": "block text-sm file:mr-3 file:rounded-default file:border file:border-base-200 "
-                     "file:bg-white file:px-3 file:py-2 file:text-sm",
+            "class": "absolute cursor-pointer inset-0 opacity-0",
         }))
         kwargs.setdefault("required", False)
         super().__init__(*args, **kwargs)
@@ -330,7 +344,9 @@ class MultipleFileField(forms.FileField):
 
 class PaymentProofForm(forms.Form):
     attachments = MultipleFileField(
-        label="Attachments", help_text="PDF, JPEG, PNG or WebP. Up to 5 files per payment, 5 MB each.",
+        label="Attachments",
+        help_text="PDF, JPG, PNG or WebP. Up to 5 files per payment, 5 MB each. "
+                  "If the form shows an error, select the files again.",
     )
 
     def __init__(self, *args, existing_count=0, **kwargs):
@@ -350,12 +366,26 @@ class PaymentProofForm(forms.Form):
 class SupplierPaymentEntryForm(SupplierPaymentForm, PaymentProofForm):
     """DEC-011 Record Payment form: Save as Draft or Save as Paid."""
 
-    field_order = ("amount", "entry_date", "method", "paid_through", "reference", "notes", "attachments")
+    # ISO only: en-us parsing would read a typed 01/11/2026 as 11 January.
+    entry_date = forms.DateField(widget=PaymentDateInput, input_formats=["%Y-%m-%d"], label="Payment date")
+    # Display only: disabled fields ignore submitted data; the service numbers on posting.
+    payment_number = forms.CharField(
+        required=False, disabled=True, label="Payment #",
+        widget=UnfoldAdminTextInputWidget(attrs={"placeholder": "Assigned when saved as paid"}),
+    )
 
-    def __init__(self, *args, current_account=None, **kwargs):
+    field_order = (
+        "amount", "method", "entry_date", "payment_number", "paid_through", "reference", "notes", "attachments",
+    )
+
+    def __init__(self, *args, current_account=None, posting=False, **kwargs):
         super().__init__(*args, **kwargs)
-        self.fields["entry_date"].label = "Payment date"
+        self.posting = posting
+        self.fields["entry_date"].widget.attrs["max"] = timezone.localdate().isoformat()
         self.fields["method"].label = "Payment mode"
+        self.fields["notes"].widget.attrs["rows"] = 3
+        # Not a required field (drafts may omit it), so Unfold draws no marker itself.
+        self.fields["paid_through"].label = mark_safe('Paid through <span class="text-red-600">*</span>')
         self.fields["paid_through"].help_text = "Required to save as paid. Optional on a draft."
         if current_account is not None:
             # Keep a draft's now-inactive account visible; posting will refuse it.
@@ -367,6 +397,28 @@ class SupplierPaymentEntryForm(SupplierPaymentForm, PaymentProofForm):
                 "No Paid Through accounts yet. A manager adds them under Purchases > Paid Through Accounts, "
                 "named as the ledger account in Zoho Books. Required to save as paid."
             )
+
+    def clean(self):
+        """Mirror the service input rules so each message shows under its
+        field. The services re-check everything and stay authoritative."""
+        cleaned = super().clean()
+        entry_date = cleaned.get("entry_date")
+        if entry_date and entry_date > timezone.localdate():
+            self.add_error("entry_date", "The date cannot be in the future.")
+        method = cleaned.get("method")
+        reference = (cleaned.get("reference") or "").strip()
+        notes = (cleaned.get("notes") or "").strip()
+        if method in PurchaseOrderPayment.REFERENCE_REQUIRED_METHODS and not reference:
+            self.add_error("reference", "A reference (UTR, cheque or card slip number) is required for this method.")
+        elif method == PurchaseOrderPayment.METHOD_OTHER and not reference and len(notes) < 10:
+            self.add_error("reference", "For 'Other', enter a reference or notes explaining the payment.")
+        if self.posting and "paid_through" in self.fields and "paid_through" not in self.errors:
+            account = cleaned.get("paid_through")
+            if account is None:
+                self.add_error("paid_through", "Paid through is required to post a payment.")
+            elif not account.is_active:
+                self.add_error("paid_through", f"Paid through account '{account.name}' is inactive.")
+        return cleaned
 
 
 class ReversePaymentEntryForm(forms.Form):
@@ -1020,7 +1072,7 @@ class PurchaseOrderAdmin(ModelAdmin):
                 initial = {"amount": remaining} if remaining is not None and remaining > 0 else None
             form = SupplierPaymentEntryForm(
                 request.POST or None, request.FILES or None, initial=initial, existing_count=len(existing),
-                current_account=entry.paid_through if entry else None,
+                current_account=entry.paid_through if entry else None, posting="_post" in request.POST,
             )
         else:
             form = PaymentProofForm(request.POST or None, request.FILES or None, existing_count=len(existing))

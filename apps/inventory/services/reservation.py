@@ -514,12 +514,21 @@ def _reserve_direct(order_item, stock, incoming, warehouse):
     return reservation
 
 
+def decant_capacity_ml(lots_available_ml, retail_available, source_size_ml):
+    """Physical ml a decant can draw from its source: open-lot ml plus
+    sealed retail bottles opened on demand. Shared with
+    apps.inventory.selectors.in_store_available."""
+    return lots_available_ml + retail_available * Decimal(source_size_ml)
+
+
 def _reserve_decant(order_item, decant_source, retail_stock, lots, warehouse):
     source_variant = decant_source.source_variant
     size_ml = Decimal(source_variant.size_ml)
     needed_ml = Decimal(order_item.quantity) * decant_source.decant_volume_ml
 
-    available_ml = sum((lot.available_ml for lot in lots), Decimal("0")) + retail_stock.available * size_ml
+    available_ml = decant_capacity_ml(
+        sum((lot.available_ml for lot in lots), Decimal("0")), retail_stock.available, size_ml,
+    )
     if available_ml < needed_ml:
         raise InsufficientStockError(
             f"Only {available_ml}ml decant capacity available for {source_variant} "

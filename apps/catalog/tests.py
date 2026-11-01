@@ -1988,3 +1988,57 @@ class VariantListGalleryColumnTests(AdminQueryCountMixin, TestCase):
             variant = _gallery_variant(f"FLAT-{i}")
             ProductVariantImage.objects.create(variant=variant, image=_fake_image(), role=PRIMARY)
         self.assertChangelistQueriesFlat(reverse("admin:catalog_productvariant_changelist"), make)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ProductVariant.barcode — optional manufacturer barcode (EAN/UPC)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class VariantBarcodeTests(TestCase):
+    def setUp(self):
+        self.client.force_login(_catalog_staff("barcodesuper", superuser=True))
+
+    def _change_url(self, variant):
+        return reverse("admin:catalog_productvariant_change", args=[variant.pk])
+
+    def _form_data(self, variant, barcode):
+        return {
+            "is_active": "on", "edition": variant.edition_id, "sku": variant.sku, "size_ml": variant.size_ml,
+            "mrp": variant.mrp, "selling_price": variant.selling_price,
+            "shipping_surcharge": variant.shipping_surcharge, "barcode": barcode,
+        }
+
+    def test_existing_variants_have_no_barcode(self):
+        self.assertIsNone(_gallery_variant("BC-NONE").barcode)
+
+    def test_duplicate_barcode_rejected(self):
+        _gallery_variant("BC-1").__class__.objects.filter(sku="BC-1").update(barcode="8901234567890")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            ProductVariant.objects.create(
+                edition=ProductVariant.objects.get(sku="BC-1").edition, size_ml=50, mrp=Decimal("1"),
+                selling_price=Decimal("1"), sku="BC-2", barcode="8901234567890",
+            )
+
+    def test_admin_saves_barcode_and_rejects_duplicate(self):
+        first, second = _gallery_variant("BC-A"), _gallery_variant("BC-B")
+        resp = self.client.post(self._change_url(first), self._form_data(first, " 8901234567890 "))
+        self.assertEqual(resp.status_code, 302)
+        first.refresh_from_db()
+        self.assertEqual(first.barcode, "8901234567890")
+        resp = self.client.post(self._change_url(second), self._form_data(second, "8901234567890"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("barcode", resp.context["adminform"].form.errors)
+
+    def test_blank_barcode_allowed_on_many_variants(self):
+        first, second = _gallery_variant("BC-X"), _gallery_variant("BC-Y")
+        for variant in (first, second):
+            resp = self.client.post(self._change_url(variant), self._form_data(variant, "  "))
+            self.assertEqual(resp.status_code, 302)
+            variant.refresh_from_db()
+            self.assertIsNone(variant.barcode)
+
+    def test_admin_search_by_barcode(self):
+        _gallery_variant("BC-S")
+        ProductVariant.objects.filter(sku="BC-S").update(barcode="5012345678900")
+        resp = self.client.get(reverse("admin:catalog_productvariant_changelist"), {"q": "5012345678900"})
+        self.assertContains(resp, "SKU: BC-S")

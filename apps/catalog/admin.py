@@ -165,9 +165,10 @@ class ProductVariantAdmin(ModelAdmin):
         "edition__name",
         "edition__product__brand__name",
         "sku",
+        "barcode",
     )
     FORM_FIELDS = (
-        "is_active", "edition", "sku", "size_ml", "is_decant",
+        "is_active", "edition", "sku", "barcode", "size_ml", "is_decant",
         "mrp", "selling_price", "shipping_surcharge",
     )
     readonly_fields = ("gallery_preview", "legacy_image")

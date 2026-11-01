@@ -1,0 +1,22 @@
+{# One sale line. A removed line stays in the form, hidden, with DELETE ticked. #}
+<tr data-line class="align-top border-b border-base-200 dark:border-base-700{% if line.DELETE.value %} hidden{% endif %}">
+    <td class="px-3 py-2">
+        {{ line.sku }}
+        <div class="mt-1 text-base-500 dark:text-base-400 text-xs" data-meta></div>
+        <div data-server-error>{% include "unfold/helpers/form_errors.html" with errors=line.sku.errors %}</div>
+    </td>
+    <td class="px-3 py-2 {% if line.quantity.errors %}errors group{% endif %}">
+        {{ line.quantity }}
+        <div class="mt-1 text-red-600 dark:text-red-500 text-xs" data-stock-warning></div>
+        <div data-server-error>{% include "unfold/helpers/form_errors.html" with errors=line.quantity.errors %}</div>
+    </td>
+    <td class="px-3 py-2 text-right" data-rate></td>
+    <td class="font-medium px-3 py-2 text-right" data-amount></td>
+    <td class="px-3 py-2">
+        <span class="hidden">{{ line.DELETE }}</span>
+        <button type="button" data-remove aria-label="Remove line"
+                class="cursor-pointer focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 hover:bg-base-100 dark:hover:bg-base-800 p-1 rounded-default text-base-500">
+            <span class="material-symbols-outlined" aria-hidden="true">close</span>
+        </button>
+    </td>
+</tr>

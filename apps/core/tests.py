@@ -663,3 +663,46 @@ class StaticFilesTests(SimpleTestCase):
     def test_local_static_storage_unchanged(self):
         self.assertEqual(settings.STORAGES["staticfiles"]["BACKEND"],
                          "django.contrib.staticfiles.storage.StaticFilesStorage")
+
+
+
+class GunicornConfigTests(SimpleTestCase):
+    """gunicorn.conf.py reads only PORT, WEB_CONCURRENCY, GUNICORN_TIMEOUT."""
+
+    def _load(self, env):
+        import runpy
+
+        clean = {k: v for k, v in os.environ.items() if k not in ("PORT", "WEB_CONCURRENCY", "GUNICORN_TIMEOUT")}
+        with patch.dict("os.environ", {**clean, **env}, clear=True):
+            return runpy.run_path(str(settings.BASE_DIR / "gunicorn.conf.py"))
+
+    def test_low_cost_defaults(self):
+        conf = self._load({})
+        self.assertEqual((conf["bind"], conf["workers"], conf["timeout"]), ("0.0.0.0:8000", 1, 120))
+        self.assertEqual((conf["accesslog"], conf["errorlog"]), ("-", "-"))
+
+    def test_environment_overrides(self):
+        conf = self._load({"PORT": "10000", "WEB_CONCURRENCY": "3", "GUNICORN_TIMEOUT": "60"})
+        self.assertEqual((conf["bind"], conf["workers"], conf["timeout"]), ("0.0.0.0:10000", 3, 60))
+
+    def test_invalid_values_refused(self):
+        for env in ({"WEB_CONCURRENCY": "0"}, {"PORT": "http"}, {"GUNICORN_TIMEOUT": "-5"}):
+            with self.subTest(env), self.assertRaises(ValueError):
+                self._load(env)
+
+    def test_dockerfile_has_no_release_steps_or_provider_commands(self):
+        dockerfile = (settings.BASE_DIR / "Dockerfile").read_text()
+        self.assertIn("FROM python:3.13-slim", dockerfile)
+        self.assertIn("USER app", dockerfile)
+        self.assertIn('CMD ["gunicorn", "config.wsgi:application", "--config", "gunicorn.conf.py"]', dockerfile)
+        instructions = "\n".join(
+            line for line in dockerfile.lower().splitlines() if not line.lstrip().startswith("#")
+        )
+        for forbidden in ("migrate", "railway", "render", "flyctl", "fly.io", "heroku"):
+            self.assertNotIn(forbidden, instructions)
+
+    def test_dockerignore_keeps_secrets_and_local_data_out(self):
+        ignored = set((settings.BASE_DIR / ".dockerignore").read_text().split())
+        for entry in (".env", ".env.*", ".git", ".claude", "media", "private_media", "staticfiles", "venv",
+                      "**/__pycache__"):
+            self.assertIn(entry, ignored)

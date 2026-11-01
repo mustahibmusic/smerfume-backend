@@ -1,0 +1,38 @@
+# Secrets and environment files
+.env
+.env.*
+*.pem
+*.key
+
+# Version control and tooling
+.git
+.gitignore
+.claude
+.code-review-graph
+.vscode
+.idea
+
+# Local data (uploads, private documents, generated static files)
+media
+private_media
+staticfiles
+
+# Python caches and virtual environments
+venv
+.venv
+env
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.coverage
+htmlcov
+
+# Database dumps and archives
+*.sql
+*.dump
+*.backup
+*.bak
+*.zip
+*.gz
+*.log
+db.sqlite3

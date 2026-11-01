@@ -111,13 +111,24 @@
     const field = (row, name) => row.querySelector(`[name$="-${name}"]`);
     const warehouseName = () => warehouse.options[warehouse.selectedIndex]?.text || "this warehouse";
 
+    // Out-of-stock items stay listed and selectable, but marked in red.
+    function outOfStockBadge() {
+        const badge = document.createElement("span");
+        badge.dataset.outOfStock = "";
+        badge.className = "font-semibold text-red-600 dark:text-red-500";
+        badge.textContent = "Out of stock";
+        return badge;
+    }
+
     function setItem(row, item) {
         row.dataset.sku = item ? item.sku : "";
         row.dataset.price = item ? item.price : "";
         row.dataset.stock = item ? item.stock : "";
         row.querySelector("[data-rate]").textContent = item ? item.price : "";
-        row.querySelector("[data-meta]").textContent = item
-            ? [item.sku, item.barcode, `${item.stock} in stock`].filter(Boolean).join(" · ") : "";
+        const meta = row.querySelector("[data-meta]");
+        meta.textContent = item
+            ? [item.sku, item.barcode, item.stock > 0 ? `${item.stock} in stock` : ""].filter(Boolean).join(" · ") : "";
+        if (item && item.stock <= 0) meta.append(" · ", outOfStockBadge());
     }
 
     function recalc() {
@@ -165,7 +176,9 @@
         name.textContent = item.text;
         const meta = document.createElement("div");
         meta.className = "text-xs";
-        meta.textContent = [item.sku, item.barcode, `Stock: ${item.stock}`, `₹${item.price}`].filter(Boolean).join(" · ");
+        meta.textContent = [item.sku, item.barcode, item.stock > 0 ? `Stock: ${item.stock}` : "", `₹${item.price}`]
+            .filter(Boolean).join(" · ");
+        if (item.stock <= 0) meta.append(" · ", outOfStockBadge());
         box.append(name, meta);
         return box;
     }

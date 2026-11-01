@@ -4558,3 +4558,26 @@ class InStoreTemplateStylingTests(TestCase):
                     if "." + re.sub(r"([:\[\]./])", lambda m: chr(92) + m.group(1), css_class) not in css:
                         missing.add(css_class)
         self.assertEqual(sorted(missing), [])
+
+
+
+class InStoreOutOfStockMarkingTests(TestCase):
+    """Out-of-stock items stay findable (the cashier may be checking) but
+    are clearly marked in the picker and on the line."""
+
+    def setUp(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="oosmark", email="oosmark@example.com", password="testpass123",
+        ))
+        self.warehouse = Warehouse.objects.get(is_default=True)
+
+    def test_zero_stock_items_are_still_returned(self):
+        _counter_variant("Empty", "Shelf", None, "EMPTY-1", quantity=0)
+        rows = self.client.get(ITEM_SEARCH_URL, {"q": "shelf", "warehouse": self.warehouse.pk}).json()["results"]
+        self.assertEqual([(r["sku"], r["stock"]) for r in rows], [("EMPTY-1", 0)])
+
+    def test_page_marks_out_of_stock_in_picker_and_line(self):
+        html = self.client.get(ADMIN_IN_STORE_URL).content.decode()
+        self.assertIn('badge.textContent = "Out of stock"', html)
+        # Defined once, used by the picker result and by the chosen line.
+        self.assertEqual(html.count("outOfStockBadge()"), 3)

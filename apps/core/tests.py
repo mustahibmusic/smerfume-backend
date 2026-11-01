@@ -706,3 +706,33 @@ class GunicornConfigTests(SimpleTestCase):
         for entry in (".env", ".env.*", ".git", ".claude", "media", "private_media", "staticfiles", "venv",
                       "**/__pycache__"):
             self.assertIn(entry, ignored)
+
+
+class SystemChecksNeedNoDatabaseTests(TestCase):
+    """System checks run before migrations on an empty database (first
+    deploy), so no admin or app check may query the database. Unfold's
+    action check queries auth_permission for dotted "app.codename" action
+    permissions; our actions use has_<name>_permission methods instead."""
+
+    def test_admin_and_app_checks_run_without_queries(self):
+        from django.core import checks
+
+        with self.assertNumQueries(0):
+            errors = checks.run_checks(include_deployment_checks=False)
+        self.assertEqual([e for e in errors if e.is_serious()], [])
+
+    def test_no_admin_action_uses_a_dotted_permission(self):
+        from django.contrib import admin as django_admin
+
+        dotted = []
+        for model_admin in django_admin.site._registry.values():
+            getters = [getattr(model_admin, name, None) for name in (
+                "_get_base_actions_list", "_get_base_actions_detail",
+                "_get_base_actions_row", "_get_base_actions_submit_line",
+            )]
+            for getter in filter(None, getters):
+                for unfold_action in getter():
+                    for permission in getattr(unfold_action.method, "allowed_permissions", ()):
+                        if "." in permission:
+                            dotted.append(f"{model_admin.__class__.__name__}.{unfold_action.method.__name__}: {permission}")
+        self.assertEqual(dotted, [])

@@ -51,14 +51,16 @@ local media, caches and virtualenvs out of the image.
 ## 4. Release (once per deploy, before the new web process starts)
 
 ```
-python manage.py migrate --noinput --skip-checks
+python manage.py migrate --noinput
 python manage.py check --deploy
 ```
 
-`--skip-checks` is required: on an empty database, `migrate`'s own system
-checks include Unfold's admin check, which queries `auth_permission`
-before that table exists, so the very first deploy would fail. The full
-checks still run, after migrating, in `check --deploy`.
+`migrate` runs Django's system checks before it migrates, including on
+the first deploy against an empty database, so no system check may query
+the database. Unfold's admin check queries `auth_permission` for action
+permissions written as `"app.codename"`; Smerfume admin actions therefore
+use `has_<name>_permission()` methods instead
+(`apps.core.tests.SystemChecksNeedNoDatabaseTests` enforces this).
 
 Run these as a separate one-off process using the same image and
 environment. Never run migrations in the Docker `CMD`, at app startup or
@@ -71,7 +73,7 @@ Where each provider runs a release command (configuration, not code):
 | Render | Service "Pre-Deploy Command" |
 | Railway | Service "Pre-Deploy Command" |
 | Fly.io | `[deploy] release_command` in `fly.toml` |
-| VPS / Docker Compose | `docker compose run --rm web sh -c "python manage.py migrate --noinput --skip-checks && python manage.py check --deploy"` before `docker compose up -d` |
+| VPS / Docker Compose | `docker compose run --rm web sh -c "python manage.py migrate --noinput && python manage.py check --deploy"` before `docker compose up -d` |
 
 Rules:
 

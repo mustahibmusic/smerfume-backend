@@ -74,6 +74,8 @@ Rules:
   first, remove in a later release).
 - After migrations that add permissions, run `python manage.py
   setup_staff_groups --dry-run`, then without `--dry-run`.
+- `check --deploy` needs the database to be reachable (Unfold's admin check
+  queries it), so run it in the release step, not during the image build.
 - `check --deploy` currently reports W005 (HSTS includeSubDomains) and W021
   (HSTS preload) as warnings. That is intentional during the initial
   rollout (section 7). It fails only on errors.

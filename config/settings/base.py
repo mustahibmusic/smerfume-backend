@@ -367,55 +367,76 @@ STORAGES = {
 }
 
 # ── File Storage ───────────────────────────────────────────────────────────────
-# Set USE_S3=True in your environment to switch to Amazon S3.
-# Required env vars when USE_S3 is True:
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_STORAGE_BUCKET_NAME,
-#   AWS_S3_REGION_NAME (default: ap-south-1)
-if os.getenv("USE_S3") == "True":
-    AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-    AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-    AWS_STORAGE_BUCKET_NAME = os.getenv("AWS_STORAGE_BUCKET_NAME")
-    AWS_S3_REGION_NAME = os.getenv("AWS_S3_REGION_NAME", "ap-south-1")
-    AWS_S3_CUSTOM_DOMAIN = f"{AWS_STORAGE_BUCKET_NAME}.s3.{AWS_S3_REGION_NAME}.amazonaws.com"
-    AWS_DEFAULT_ACL = None          # inherit bucket policy (Block Public Access)
-    AWS_S3_FILE_OVERWRITE = False   # keep original filename on re-upload
+# USE_S3=True switches uploads to S3-compatible object storage (AWS S3,
+# Cloudflare R2, Backblaze B2, ...) with two physically separate buckets:
+# public (product images) and private (payment proof). See
+# object_storage_settings() and apps.core.storage. Static files are never
+# in a bucket. Variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+# AWS_STORAGE_BUCKET_NAME (public), AWS_PRIVATE_STORAGE_BUCKET_NAME,
+# AWS_S3_ENDPOINT_URL (blank for AWS), AWS_S3_CUSTOM_DOMAIN (public host,
+# required with a custom endpoint), AWS_S3_REGION_NAME, AWS_S3_ADDRESSING_STYLE.
+def object_storage_settings(env=None):
+    """Validated AWS_* settings for S3-compatible storage. Refuses to start
+    on missing credentials or buckets, a private bucket equal to the public
+    one, or a custom endpoint without a public domain. Messages never echo
+    credentials."""
+    env = os.environ if env is None else env
 
-    STORAGES = {
-        "default": {
-            "BACKEND": "storages.backends.s3boto3.S3Boto3Storage",
-            "OPTIONS": {
-                "access_key": AWS_ACCESS_KEY_ID,
-                "secret_key": AWS_SECRET_ACCESS_KEY,
-                "bucket_name": AWS_STORAGE_BUCKET_NAME,
-                "region_name": AWS_S3_REGION_NAME,
-                "custom_domain": AWS_S3_CUSTOM_DOMAIN,
-                "file_overwrite": AWS_S3_FILE_OVERWRITE,
-                "default_acl": AWS_DEFAULT_ACL,
-            },
-        },
-        "staticfiles": {
-            "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
-        },
-        # DEC-011: same bucket, "private/" prefix, signed 5-minute URLs and no
-        # public custom domain. The bucket policy must not make "private/"
-        # publicly readable.
-        "private_documents": {
-            "BACKEND": "storages.backends.s3boto3.S3Boto3Storage",
-            "OPTIONS": {
-                "access_key": AWS_ACCESS_KEY_ID,
-                "secret_key": AWS_SECRET_ACCESS_KEY,
-                "bucket_name": AWS_STORAGE_BUCKET_NAME,
-                "region_name": AWS_S3_REGION_NAME,
-                "location": "private",
-                "custom_domain": None,
-                "querystring_auth": True,
-                "querystring_expire": 300,
-                "file_overwrite": False,
-                "default_acl": None,
-            },
-        },
+    def value(name):
+        return (env.get(name) or "").strip()
+
+    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_STORAGE_BUCKET_NAME",
+                 "AWS_PRIVATE_STORAGE_BUCKET_NAME"):
+        if not value(name):
+            raise ImproperlyConfigured(f"{name} must be set when USE_S3=True.")
+    public, private = value("AWS_STORAGE_BUCKET_NAME"), value("AWS_PRIVATE_STORAGE_BUCKET_NAME")
+    if public.lower() == private.lower():
+        raise ImproperlyConfigured(
+            "AWS_PRIVATE_STORAGE_BUCKET_NAME must be a different bucket from AWS_STORAGE_BUCKET_NAME."
+        )
+    endpoint, domain = value("AWS_S3_ENDPOINT_URL"), value("AWS_S3_CUSTOM_DOMAIN")
+    if "/" in domain or ":" in domain:
+        raise ImproperlyConfigured("AWS_S3_CUSTOM_DOMAIN must be a bare host name, e.g. media.example.com.")
+    if endpoint and not domain:
+        raise ImproperlyConfigured(
+            "AWS_S3_CUSTOM_DOMAIN must be set with a custom AWS_S3_ENDPOINT_URL "
+            "(the provider's API endpoint is not a public URL)."
+        )
+    return {
+        "AWS_ACCESS_KEY_ID": value("AWS_ACCESS_KEY_ID"),
+        "AWS_SECRET_ACCESS_KEY": value("AWS_SECRET_ACCESS_KEY"),
+        "AWS_STORAGE_BUCKET_NAME": public,
+        "AWS_PRIVATE_STORAGE_BUCKET_NAME": private,
+        "AWS_S3_ENDPOINT_URL": endpoint or None,
+        "AWS_S3_CUSTOM_DOMAIN": domain or None,
+        "AWS_S3_REGION_NAME": value("AWS_S3_REGION_NAME") or ("auto" if endpoint else "ap-south-1"),
+        "AWS_S3_ADDRESSING_STYLE": value("AWS_S3_ADDRESSING_STYLE") or None,
+        "AWS_S3_SIGNATURE_VERSION": "s3v4",
+        "AWS_DEFAULT_ACL": None,
+        "AWS_S3_FILE_OVERWRITE": False,
     }
-    MEDIA_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/"
+
+
+if os.getenv("USE_S3") == "True":
+    _s3 = object_storage_settings()
+    AWS_ACCESS_KEY_ID = _s3["AWS_ACCESS_KEY_ID"]
+    AWS_SECRET_ACCESS_KEY = _s3["AWS_SECRET_ACCESS_KEY"]
+    AWS_STORAGE_BUCKET_NAME = _s3["AWS_STORAGE_BUCKET_NAME"]
+    AWS_PRIVATE_STORAGE_BUCKET_NAME = _s3["AWS_PRIVATE_STORAGE_BUCKET_NAME"]
+    AWS_S3_ENDPOINT_URL = _s3["AWS_S3_ENDPOINT_URL"]
+    AWS_S3_CUSTOM_DOMAIN = _s3["AWS_S3_CUSTOM_DOMAIN"]
+    AWS_S3_REGION_NAME = _s3["AWS_S3_REGION_NAME"]
+    AWS_S3_ADDRESSING_STYLE = _s3["AWS_S3_ADDRESSING_STYLE"]
+    AWS_S3_SIGNATURE_VERSION = _s3["AWS_S3_SIGNATURE_VERSION"]
+    AWS_DEFAULT_ACL = _s3["AWS_DEFAULT_ACL"]
+    AWS_S3_FILE_OVERWRITE = _s3["AWS_S3_FILE_OVERWRITE"]
+    STORAGES = {
+        **STORAGES,
+        "default": {"BACKEND": "apps.core.storage.PublicMediaStorage"},
+        "private_documents": {"BACKEND": "apps.core.storage.PrivateMediaStorage"},
+    }
+    if AWS_S3_CUSTOM_DOMAIN:
+        MEDIA_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/"
 
 
 # ── SMS Backend ────────────────────────────────────────────────────────────

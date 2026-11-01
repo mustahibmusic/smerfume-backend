@@ -15,7 +15,22 @@ from django.utils.log import configure_logging
 from redis.exceptions import RedisError
 from rest_framework.test import APIClient
 
-from config.settings.base import database_config, logging_config, parse_num_proxies, redis_cache, require_env
+from config.settings.base import (
+    database_config, logging_config, object_storage_settings, parse_num_proxies, redis_cache, require_env,
+)
+
+
+S3_ENV = {
+    "USE_S3": "True",
+    "AWS_ACCESS_KEY_ID": "test-key-id",
+    "AWS_SECRET_ACCESS_KEY": "test-secret",
+    "AWS_STORAGE_BUCKET_NAME": "smerfume-public",
+    "AWS_PRIVATE_STORAGE_BUCKET_NAME": "smerfume-private",
+    "AWS_S3_ENDPOINT_URL": "https://account.r2.example.com",
+    "AWS_S3_CUSTOM_DOMAIN": "media.example.com",
+    "AWS_S3_REGION_NAME": "",
+    "AWS_S3_ADDRESSING_STYLE": "",
+}
 
 
 class SettingsHelperTests(SimpleTestCase):
@@ -97,7 +112,7 @@ class DeployedSettingsFailFastTests(SimpleTestCase):
     MANAGED = (
         "REDIS_URL", "NUM_PROXIES", "SECRET_KEY", "ALLOWED_HOSTS", "CSRF_TRUSTED_ORIGINS", "UAT_HOST",
         "TRUST_PROXY_SSL_HEADER", "SECURE_HSTS_SECONDS", "DATABASE_URL", "CONN_MAX_AGE", "LOG_LEVEL",
-        "USE_S3",
+        "USE_S3", *S3_ENV,
     )
 
     def _import(self, name, env):
@@ -215,6 +230,25 @@ class DeployedSettingsFailFastTests(SimpleTestCase):
                 self.assertEqual(module.LOGGING["root"]["level"], "WARNING")
                 with self.assertRaisesMessage(ImproperlyConfigured, "LOG_LEVEL"):
                     self._import(name, {**self.VALID, "LOG_LEVEL": "loud"})
+
+    def test_s3_storage_uses_separate_public_and_private_backends(self):
+        env = {**self.VALID, **S3_ENV}
+        for name in self.DEPLOYED:
+            with self.subTest(name):
+                module = self._import(name, env)
+                self.assertEqual(module.STORAGES["default"]["BACKEND"], "apps.core.storage.PublicMediaStorage")
+                self.assertEqual(module.STORAGES["private_documents"]["BACKEND"],
+                                 "apps.core.storage.PrivateMediaStorage")
+                self.assertEqual(module.MEDIA_URL, "https://media.example.com/")
+
+    def test_invalid_s3_configuration_refuses_to_start(self):
+        for name in self.DEPLOYED:
+            for change, needle in (
+                ({"AWS_PRIVATE_STORAGE_BUCKET_NAME": ""}, "AWS_PRIVATE_STORAGE_BUCKET_NAME"),
+                ({"AWS_PRIVATE_STORAGE_BUCKET_NAME": "SMERFUME-PUBLIC"}, "different"),
+            ):
+                with self.subTest(name=name, change=change), self.assertRaisesMessage(ImproperlyConfigured, needle):
+                    self._import(name, {**self.VALID, **S3_ENV, **change})
 
     def test_api_docs_not_public_when_deployed(self):
         for name in self.DEPLOYED:
@@ -498,3 +532,101 @@ class ReadinessTests(TestCase):
     def test_no_login_needed_and_get_only(self):
         self.assertEqual(self._get().status_code, 200)
         self.assertEqual(self.client.post("/readyz/", HTTP_HOST="api.example.com").status_code, 405)
+
+
+
+class ObjectStorageSettingsTests(SimpleTestCase):
+    """S3-compatible storage (AWS, R2, B2, ...) with two physically separate
+    buckets; misconfiguration refuses to start."""
+
+    def _settings(self, **changes):
+        return object_storage_settings({**S3_ENV, **changes})
+
+    def test_r2_style_endpoint_with_public_domain(self):
+        config = self._settings()
+        self.assertEqual(config["AWS_S3_ENDPOINT_URL"], "https://account.r2.example.com")
+        self.assertEqual(config["AWS_S3_CUSTOM_DOMAIN"], "media.example.com")
+        self.assertEqual(config["AWS_S3_REGION_NAME"], "auto")
+        self.assertEqual(config["AWS_S3_SIGNATURE_VERSION"], "s3v4")
+        self.assertIsNone(config["AWS_S3_ADDRESSING_STYLE"])
+        self.assertEqual((config["AWS_STORAGE_BUCKET_NAME"], config["AWS_PRIVATE_STORAGE_BUCKET_NAME"]),
+                         ("smerfume-public", "smerfume-private"))
+
+    def test_aws_defaults_without_endpoint(self):
+        config = self._settings(AWS_S3_ENDPOINT_URL="", AWS_S3_CUSTOM_DOMAIN="")
+        self.assertIsNone(config["AWS_S3_ENDPOINT_URL"])
+        self.assertIsNone(config["AWS_S3_CUSTOM_DOMAIN"])
+        self.assertEqual(config["AWS_S3_REGION_NAME"], "ap-south-1")
+
+    def test_explicit_region_and_path_addressing(self):
+        config = self._settings(AWS_S3_REGION_NAME="us-west-004", AWS_S3_ADDRESSING_STYLE="path")
+        self.assertEqual((config["AWS_S3_REGION_NAME"], config["AWS_S3_ADDRESSING_STYLE"]), ("us-west-004", "path"))
+
+    def test_required_values(self):
+        for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_STORAGE_BUCKET_NAME",
+                     "AWS_PRIVATE_STORAGE_BUCKET_NAME"):
+            with self.subTest(name), self.assertRaisesMessage(ImproperlyConfigured, name):
+                self._settings(**{name: " "})
+
+    def test_public_and_private_buckets_must_differ(self):
+        with self.assertRaisesMessage(ImproperlyConfigured, "different"):
+            self._settings(AWS_PRIVATE_STORAGE_BUCKET_NAME=" Smerfume-Public ")
+
+    def test_custom_endpoint_needs_a_public_domain(self):
+        with self.assertRaisesMessage(ImproperlyConfigured, "AWS_S3_CUSTOM_DOMAIN"):
+            self._settings(AWS_S3_CUSTOM_DOMAIN="")
+
+    def test_custom_domain_is_a_bare_host(self):
+        with self.assertRaisesMessage(ImproperlyConfigured, "AWS_S3_CUSTOM_DOMAIN"):
+            self._settings(AWS_S3_CUSTOM_DOMAIN="https://media.example.com/")
+
+    def test_errors_do_not_echo_secrets(self):
+        with self.assertRaises(ImproperlyConfigured) as ctx:
+            self._settings(AWS_PRIVATE_STORAGE_BUCKET_NAME="smerfume-public")
+        self.assertNotIn("test-secret", str(ctx.exception))
+
+
+@override_settings(
+    AWS_ACCESS_KEY_ID="test-key-id", AWS_SECRET_ACCESS_KEY="test-secret",
+    AWS_STORAGE_BUCKET_NAME="smerfume-public", AWS_PRIVATE_STORAGE_BUCKET_NAME="smerfume-private",
+    AWS_S3_ENDPOINT_URL="https://account.r2.example.com", AWS_S3_CUSTOM_DOMAIN="media.example.com",
+    AWS_S3_REGION_NAME="auto", AWS_S3_SIGNATURE_VERSION="s3v4",
+)
+class StorageBackendTests(SimpleTestCase):
+    """The two backends never share a bucket or a public URL. No network:
+    URLs are built (and private ones presigned) locally."""
+
+    def test_public_media_storage(self):
+        from apps.core.storage import PublicMediaStorage
+
+        storage = PublicMediaStorage()
+        self.assertEqual(storage.bucket_name, "smerfume-public")
+        self.assertEqual(storage.custom_domain, "media.example.com")
+        self.assertFalse(storage.querystring_auth)
+        self.assertFalse(storage.file_overwrite)
+        self.assertIsNone(storage.default_acl)
+        self.assertEqual(storage.url("catalog/variants/a.webp"), "https://media.example.com/catalog/variants/a.webp")
+
+    def test_private_media_storage(self):
+        from apps.core.storage import PrivateMediaStorage
+
+        storage = PrivateMediaStorage()
+        self.assertEqual(storage.bucket_name, "smerfume-private")
+        self.assertIsNone(storage.custom_domain)
+        self.assertTrue(storage.querystring_auth)
+        self.assertEqual(storage.querystring_expire, 300)
+        self.assertFalse(storage.file_overwrite)
+        self.assertIsNone(storage.default_acl)
+        self.assertEqual(storage.location, "")
+        url = storage.url("supplier-payments/x.pdf")
+        self.assertNotIn("media.example.com", url)
+        self.assertIn("smerfume-private", url)
+        self.assertIn("X-Amz-Signature=", url)
+
+    def test_options_cannot_point_private_at_the_public_domain(self):
+        from apps.core.storage import PrivateMediaStorage
+
+        with self.assertRaises(ImproperlyConfigured):
+            PrivateMediaStorage(custom_domain="media.example.com")
+        with self.assertRaises(ImproperlyConfigured):
+            PrivateMediaStorage(bucket_name="smerfume-public")

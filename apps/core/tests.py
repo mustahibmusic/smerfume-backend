@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from django.conf import settings
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase, TestCase, override_settings
 from redis.exceptions import RedisError
 from rest_framework.test import APIClient
 
@@ -84,13 +84,23 @@ class DeployedSettingsFailFastTests(SimpleTestCase):
 
     DEPLOYED = ("staging", "uat", "production")
     VALID = {"REDIS_URL": "redis://cache:6379/0", "NUM_PROXIES": "1"}
+    # Required everywhere deployed; tests about Redis/proxies get them for free.
+    BASELINE = {
+        "SECRET_KEY": "test-secret", "ALLOWED_HOSTS": "api.example.com",
+        "CSRF_TRUSTED_ORIGINS": "https://api.example.com",
+    }
+    MANAGED = (
+        "REDIS_URL", "NUM_PROXIES", "SECRET_KEY", "ALLOWED_HOSTS", "CSRF_TRUSTED_ORIGINS", "UAT_HOST",
+        "TRUST_PROXY_SSL_HEADER", "SECURE_HSTS_SECONDS", "DATABASE_URL", "CONN_MAX_AGE", "LOG_LEVEL",
+        "USE_S3",
+    )
 
     def _import(self, name, env):
         # base is re-executed too, so it reads the patched environment.
         module_name = f"config.settings.{name}"
         base = sys.modules["config.settings.base"]
-        clean = {k: v for k, v in os.environ.items() if k not in self.VALID}
-        with patch.dict("os.environ", {**clean, **env}, clear=True):
+        clean = {k: v for k, v in os.environ.items() if k not in self.MANAGED}
+        with patch.dict("os.environ", {**clean, **self.BASELINE, **env}, clear=True):
             sys.modules.pop(module_name, None)
             sys.modules.pop("config.settings.base", None)
             try:
@@ -133,6 +143,134 @@ class DeployedSettingsFailFastTests(SimpleTestCase):
                     "django.core.cache.backends.redis.RedisCache",
                 )
                 self.assertEqual(module.REST_FRAMEWORK["NUM_PROXIES"], 1)
+
+    # Secrets, hosts and origins -------------------------------------------
+
+    def test_secret_key_required(self):
+        for name in self.DEPLOYED:
+            with self.subTest(name), self.assertRaisesMessage(ImproperlyConfigured, "SECRET_KEY"):
+                self._import(name, {**self.VALID, "SECRET_KEY": ""})
+
+    def test_allowed_hosts_required_and_parsed(self):
+        for name in self.DEPLOYED:
+            with self.subTest(name), self.assertRaisesMessage(ImproperlyConfigured, "ALLOWED_HOSTS"):
+                self._import(name, {**self.VALID, "ALLOWED_HOSTS": " , "})
+            module = self._import(name, {**self.VALID, "ALLOWED_HOSTS": "api.example.com, admin.example.com"})
+            self.assertEqual(module.ALLOWED_HOSTS, ["api.example.com", "admin.example.com"])
+
+    def test_uat_keeps_uat_host_fallback(self):
+        module = self._import("uat", {**self.VALID, "ALLOWED_HOSTS": "", "UAT_HOST": "uat.example.com"})
+        self.assertEqual(module.ALLOWED_HOSTS, ["uat.example.com"])
+
+    def test_production_requires_csrf_trusted_origins(self):
+        with self.assertRaisesMessage(ImproperlyConfigured, "CSRF_TRUSTED_ORIGINS"):
+            self._import("production", {**self.VALID, "CSRF_TRUSTED_ORIGINS": ""})
+        module = self._import("production", self.VALID)
+        self.assertEqual(module.CSRF_TRUSTED_ORIGINS, ["https://api.example.com"])
+
+    # Proxy / HTTPS ---------------------------------------------------------
+
+    def test_proxy_ssl_header_only_when_explicitly_trusted(self):
+        for name in self.DEPLOYED:
+            with self.subTest(name):
+                self.assertIsNone(getattr(self._import(name, self.VALID), "SECURE_PROXY_SSL_HEADER", None))
+                module = self._import(name, {**self.VALID, "TRUST_PROXY_SSL_HEADER": "True"})
+                self.assertEqual(module.SECURE_PROXY_SSL_HEADER, ("HTTP_X_FORWARDED_PROTO", "https"))
+                other = self._import(name, {**self.VALID, "TRUST_PROXY_SSL_HEADER": "yes"})
+                self.assertIsNone(getattr(other, "SECURE_PROXY_SSL_HEADER", None))
+
+    def test_initial_hsts_is_short_without_subdomains_or_preload(self):
+        for name in ("staging", "production"):
+            with self.subTest(name):
+                module = self._import(name, self.VALID)
+                self.assertTrue(module.SECURE_SSL_REDIRECT)
+                self.assertEqual(module.SECURE_HSTS_SECONDS, 300)
+                self.assertFalse(module.SECURE_HSTS_INCLUDE_SUBDOMAINS)
+                self.assertFalse(getattr(module, "SECURE_HSTS_PRELOAD", False))
+                longer = self._import(name, {**self.VALID, "SECURE_HSTS_SECONDS": "86400"})
+                self.assertEqual(longer.SECURE_HSTS_SECONDS, 86400)
+                with self.assertRaisesMessage(ImproperlyConfigured, "SECURE_HSTS_SECONDS"):
+                    self._import(name, {**self.VALID, "SECURE_HSTS_SECONDS": "a year"})
+
+    def test_deployed_database_prefers_url_with_persistent_connections(self):
+        for name in self.DEPLOYED:
+            with self.subTest(name):
+                module = self._import(name, {**self.VALID, "DATABASE_URL": "postgres://u:p@db.example.com:5432/shop"})
+                db = module.DATABASES["default"]
+                self.assertEqual((db["HOST"], db["NAME"], db["CONN_MAX_AGE"]), ("db.example.com", "shop", 60))
+                self.assertTrue(db["CONN_HEALTH_CHECKS"])
+
+    def test_api_docs_not_public_when_deployed(self):
+        for name in self.DEPLOYED:
+            with self.subTest(name):
+                self.assertFalse(self._import(name, self.VALID).API_DOCS_PUBLIC)
+
+
+@override_settings(
+    SECURE_SSL_REDIRECT=True, SECURE_PROXY_SSL_HEADER=("HTTP_X_FORWARDED_PROTO", "https"),
+    ALLOWED_HOSTS=["api.example.com"],
+)
+class TrustedProxyRedirectTests(TestCase):
+    """Behind a TLS-terminating proxy the app sees plain HTTP; trusting the
+    proxy's X-Forwarded-Proto header is what prevents a redirect loop."""
+
+    URL = "/admin/login/"
+
+    def test_forwarded_https_is_served_not_redirected(self):
+        resp = self.client.get(self.URL, HTTP_HOST="api.example.com", HTTP_X_FORWARDED_PROTO="https")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_plain_http_is_redirected_once_to_https(self):
+        resp = self.client.get(self.URL, HTTP_HOST="api.example.com")
+        self.assertEqual(resp.status_code, 301)
+        self.assertEqual(resp["Location"], "https://api.example.com/admin/login/")
+
+    @override_settings(SECURE_PROXY_SSL_HEADER=None)
+    def test_untrusted_header_is_ignored(self):
+        resp = self.client.get(self.URL, HTTP_HOST="api.example.com", HTTP_X_FORWARDED_PROTO="https")
+        self.assertEqual(resp.status_code, 301)
+
+
+class ApiDocsAccessTests(TestCase):
+    """The OpenAPI schema and doc pages are staff-only outside local."""
+
+    URLS = ("/api/schema/", "/api/docs/", "/api/redoc/")
+
+    def setUp(self):
+        from django.contrib.auth import get_user_model
+        users = get_user_model()
+        self.staff = users.objects.create_user(
+            username="docstaff", email="docstaff@example.com", password="x", is_staff=True,
+        )
+        self.customer = users.objects.create_user(username="doccust", email="doccust@example.com", password="x")
+
+    def _statuses(self, user=None):
+        if user:
+            self.client.force_login(user)
+        else:
+            self.client.logout()
+        return [self.client.get(url).status_code for url in self.URLS]
+
+    @override_settings(API_DOCS_PUBLIC=False)
+    def test_staff_only_outside_local(self):
+        for status_code in self._statuses():
+            self.assertIn(status_code, (401, 403))
+        self.assertEqual(self._statuses(self.customer), [403, 403, 403])
+        self.assertEqual(self._statuses(self.staff), [200, 200, 200])
+
+    @override_settings(API_DOCS_PUBLIC=False)
+    def test_inactive_staff_refused(self):
+        self.staff.is_active = False
+        self.staff.save()
+        for status_code in self._statuses(self.staff):
+            self.assertIn(status_code, (401, 403))
+
+    @override_settings(API_DOCS_PUBLIC=True)
+    def test_open_in_local_development(self):
+        self.assertEqual(self._statuses(), [200, 200, 200])
+
+    def test_local_settings_keep_docs_open(self):
+        self.assertTrue(settings.API_DOCS_PUBLIC)
 
 
 def _broken_cache():

@@ -74,6 +74,38 @@ def require_env(name):
     return value
 
 
+def env_list(name):
+    """Comma-separated environment variable as a list, blanks dropped."""
+    return [item.strip() for item in os.getenv(name, "").split(",") if item.strip()]
+
+
+def require_env_list(name):
+    """A required comma-separated list (ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS)."""
+    values = env_list(name)
+    if not values:
+        raise ImproperlyConfigured(f"{name} must list at least one value in this environment.")
+    return values
+
+
+def env_int(name, default):
+    """Non-negative integer environment variable, or `default` when unset."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    if not raw.isdigit():
+        raise ImproperlyConfigured(f"{name} must be a non-negative integer.")
+    return int(raw)
+
+
+def trusted_proxy_ssl_header():
+    """The X-Forwarded-Proto header Django may trust for HTTPS detection,
+    only when TRUST_PROXY_SSL_HEADER=True: the proxy in front must always
+    set or overwrite it, otherwise a client could fake HTTPS."""
+    if os.getenv("TRUST_PROXY_SSL_HEADER", "").strip() == "True":
+        return ("HTTP_X_FORWARDED_PROTO", "https")
+    return None
+
+
 def parse_num_proxies(raw):
     """NUM_PROXIES must be a non-negative integer. The value itself is
     environment-specific and must match the real proxy topology."""
@@ -151,6 +183,9 @@ REST_FRAMEWORK = {
 }
 
 # Per-mobile OTP send limit (request + resend), enforced in PostgreSQL.
+# The internal API schema and doc pages are open only in local development.
+API_DOCS_PUBLIC = False
+
 OTP_MAX_SENDS_PER_MOBILE_PER_HOUR = int(os.getenv("OTP_MAX_SENDS_PER_MOBILE_PER_HOUR", "").strip() or "5")
 
 # ── API Documentation (drf-spectacular) ───────────────────────────────────────
@@ -166,6 +201,8 @@ SPECTACULAR_SETTINGS = {
     ),
     "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
+    # Schema, Swagger and ReDoc: staff only unless API_DOCS_PUBLIC (local).
+    "SERVE_PERMISSIONS": ["apps.core.permissions.ApiDocsPermission"],
     "COMPONENT_SPLIT_REQUEST": True,
     "TAGS": [
         {"name": "Auth", "description": "OTP-based passwordless authentication and token management"},

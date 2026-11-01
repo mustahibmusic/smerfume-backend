@@ -4,7 +4,18 @@ from .base import *
 
 DEBUG = False
 
-ALLOWED_HOSTS = [os.getenv("UAT_HOST", "uat.smerfume.com")]
+# ALLOWED_HOSTS is explicit; UAT_HOST (one host) is still accepted.
+ALLOWED_HOSTS = env_list("ALLOWED_HOSTS") or env_list("UAT_HOST")
+if not ALLOWED_HOSTS:
+    raise ImproperlyConfigured("ALLOWED_HOSTS must list at least one value in this environment.")
+CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS")
+
+# ── Deployment (provider-neutral) ─────────────────────────────────────────
+SECRET_KEY = require_env("SECRET_KEY")
+DATABASES = {"default": database_config(default_conn_max_age=60)}
+# Trust X-Forwarded-Proto only when the proxy in front always sets it;
+# without it, SECURE_SSL_REDIRECT behind a TLS-terminating proxy loops.
+SECURE_PROXY_SSL_HEADER = trusted_proxy_ssl_header()
 
 CORS_ALLOWED_ORIGINS = [
     origin.strip()

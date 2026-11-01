@@ -9,6 +9,8 @@ ADMIN_ENVIRONMENT = os.getenv("ADMIN_ENVIRONMENT", "LOCAL")
 
 CORS_ALLOW_ALL_ORIGINS = True
 
+API_DOCS_PUBLIC = True
+
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=60),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),

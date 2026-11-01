@@ -15,6 +15,8 @@ ENV/
 # No .env* files are committed — keys and values are both kept private.
 .env
 .env.*
+# Safe sample values only (no secrets): the deployment variable reference.
+!.env.example
 
 # ── Django ──────────────────────────────────────────────────────────────────────
 *.log

@@ -252,6 +252,7 @@ return endpoint stays blocked for in-store orders.
 
 ### Status
 **APPROVED** — implemented (in-store returns workflow pending, see above).
+Amended by DEC-012 (staff pricing on admin-created sales) and DEC-013 (customer payment ledger and split payments).
 
 ### Date
 2026-09-23
@@ -405,6 +406,79 @@ Staff need a payment entry flow close to Zoho Books (draft then post, an interna
 
 ### Related Documentation
 - DEC-001, DEC-010 (amended by this decision)
+
+---
+
+## DEC-012 — Staff Pricing on Admin-Created Sales
+
+### Original Product Bible Requirement
+DEC-008 fixed the unit price of an in-store sale to the variant's `selling_price`, allowed one order-level discount only, and stated that per-line price overrides are not supported.
+
+### Updated Decision
+1. **Scope.** Applies to sales created by staff in the Django admin (New in-store sale). The staff API (`POST /api/orders/in-store/`) stays catalogue-price only.
+2. **Rate override.** Staff with the new permission `change_sale_price` may change a line's rate from the catalogue price.
+3. **Discounts.** Staff with the new permission `apply_sale_discount` may apply a line discount and an order discount, each either a percentage (%) or a fixed amount (₹).
+4. **Snapshot.** Each order line records `catalog_unit_price` (the catalogue price at the time of sale) and `price_override_reason`.
+5. **Line merging.** Two rows for the same item merge into one line only when SKU, rate, `line_discount_type`, `line_discount_value` and `price_override_reason` are all identical. Otherwise they stay separate lines.
+6. **Order discount cap.** The order discount can never exceed the subtotal after line discounts. This is enforced in the sale service and covered by tests; it is not a database constraint.
+7. **Deferred.** Item-table section headers are deferred to the invoice, receipt and GST document design (the Zoho-style "Insert New Header" feature).
+8. **Unchanged.** Prices and totals are always recalculated on the server; the browser's figures are for display only. Website checkout continues to use backend/catalogue pricing.
+9. **No repricing.** A finalized, recorded order is never repriced in place. A later price correction needs a separate, controlled workflow.
+
+### Reason
+Counter sales need the price flexibility staff already use in practice (negotiated rates, per-item and whole-order discounts), recorded with an auditable reason and the catalogue price it departed from.
+
+### Impact
+- `apps/orders`: new `OrderItem` snapshot fields, pricing rules in `create_in_store_order`, line pricing on the New in-store sale page, new permissions `change_sale_price` and `apply_sale_discount`.
+- No change to online checkout prices or to the staff API.
+
+### Status
+**APPROVED** — not yet implemented (`feat/admin-sale-pricing`).
+
+### Date
+2026-11-02
+
+### Related Documentation
+- DEC-008 (amended by this decision)
+
+---
+
+## DEC-013 — Customer Order Payment Ledger and Split Payments
+
+### Original Product Bible Requirement
+DEC-008 records one payment method and one optional reference per in-store order (`Order.payment_method`, `Order.payment_reference`) and lists split payments as out of scope. Customers at the counter often pay one invoice in parts, for example ₹1,999 + ₹1,601 by UPI against a ₹3,600 sale, as in Zoho Books.
+
+### Updated Decision
+1. **Payment ledger.** One `Order` can have many `OrderPayment` rows. Payments belong to the Order, not to individual order lines.
+2. **Source of truth.** `OrderPayment` is authoritative for the paid amount, the balance due, the payment status and the payment-method breakdown. These are always derived from the payment rows, never stored on the Order.
+3. **Legacy fields.** `Order.payment_method` and `Order.payment_reference` remain as compatibility summaries only and are never used for financial calculations once `OrderPayment` exists. With one payment they mirror that payment. With several payments, `payment_method` is `split` and `payment_reference` is blank or a summary only.
+4. **Fields (v1).** Order, payment number, method, amount, reference, payment date, recorded by, and the time it was recorded (shown as Applied On).
+5. **Numbering.** Each payment gets an internal number `CPAY-` followed by at least six digits, from a PostgreSQL sequence. Gaps are acceptable: these are operational references, not statutory document numbers.
+6. **Exact total (in-store sale, v1).** For an in-store sale, the sum of OrderPayment rows must exactly equal the final server-calculated `Order.total`, after any DEC-012 rate overrides and discounts. Underpayment, overpayment, customer credit and partly paid counter sales are not supported in v1. Every amount must be greater than zero with at most two decimal places. This rule applies to in-store sales only: it does not require future online, COD or gateway orders to be fully paid when they are created.
+7. **References.** Cash: reference optional. UPI, card and netbanking: reference required. For card, the reference is the transaction or slip reference only; card numbers, CVV or any other sensitive card data are never stored. A reference that looks like a card number is refused as a safety check; this is not PCI protection.
+8. **Atomic sale.** The order, its lines, the stock reservation and consumption, all payment rows and the delivered status are saved in one transaction. Either everything is saved or nothing is.
+9. **Immutable payments.** Posted payment rows are never changed or deleted by normal application paths: business writes go only through the payment service, the admin is read-only, and there is no API to update or delete a payment. Direct privileged database or ORM maintenance is outside this business write contract.
+10. **Existing data.** An existing in-store order receives one payment row only when it is unambiguously a completed, paid counter sale: in-store channel, delivered, paid by cash, UPI, card or netbanking, total above zero, delivered time recorded, and no payment row yet. The row takes the order's method, total and reference and the date of delivery. A blank card or netbanking reference is accepted for these existing rows only. No payment history is created for online, COD or prepaid orders, or for orders not delivered.
+11. **Unchanged.** Online, COD and prepaid payment handling is unchanged in this phase. Reversing a customer payment is deferred to a later decision. Supplier payments remain the separate SPAY ledger (DEC-010, DEC-011); no shared payment model is introduced. Zoho Books remains the accounting source of truth (DEC-001).
+12. **Duplicate submission.** Protection against recording the same in-store sale twice (for example a double-click on Record sale) is delivered together with the split-payment form.
+
+### Reason
+Counter sales are routinely paid in more than one part. A single method and reference per order cannot record that, and the paid amount must come from a ledger of individual payments rather than from a summary field.
+
+### Impact
+- `apps/orders`: new `OrderPayment` model, CPAY sequence and a data migration for existing in-store orders; derived paid amount, balance due and payment status in the order admin; a Payments Received table on the order page (Date, Applied On, Payment #, Reference, Payment Mode, Amount) with Total paid, Balance due, Refunded and Payment status.
+- New in-store sale page and staff API accept several payment rows; `create_in_store_order` validates them against the final total.
+- No change to inventory, refunds, online checkout, supplier payments or the Zoho boundary.
+
+### Status
+**APPROVED** — not yet implemented (`feat/order-payments-ledger`, then `feat/in-store-split-payments`).
+
+### Date
+2026-11-02
+
+### Related Documentation
+- DEC-008 (amended by this decision: split payments are no longer out of scope)
+- DEC-001, DEC-006, DEC-010, DEC-011, DEC-012
 
 ---
 

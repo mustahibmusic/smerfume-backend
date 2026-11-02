@@ -32,11 +32,23 @@ class ResolveDjangoEnvTests(TestCase):
                 self.assertEqual(resolve_django_env(fail_closed=True), env)
 
 
+# Staging fails closed without these (require_env / require_env_list), so
+# the test supplies placeholder values instead of relying on the shell.
+_STAGING_ENV = {
+    "ALLOWED_HOSTS": "staging.example.com",
+    "SECRET_KEY": "test-only-staging-secret-key",
+    "DATABASE_URL": "postgres://staging@localhost:5432/smerfume_staging",
+    "REDIS_URL": "redis://localhost:6379/0",
+    "NUM_PROXIES": "1",
+}
+
+
 class StagingSettingsModuleTests(TestCase):
     def test_staging_settings_imports_base_and_disables_debug(self):
         import importlib
-        staging = importlib.import_module("config.settings.staging")
-        importlib.reload(staging)  # ensure a fresh import, not a cached empty module
+        with patch.dict(os.environ, _STAGING_ENV):
+            staging = importlib.import_module("config.settings.staging")
+            importlib.reload(staging)  # ensure a fresh import, not a cached empty module
         self.assertFalse(staging.DEBUG)
         self.assertTrue(hasattr(staging, "SECRET_KEY"))
         self.assertTrue(hasattr(staging, "DATABASES"))

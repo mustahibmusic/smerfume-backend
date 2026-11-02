@@ -1,6 +1,7 @@
 import re
 from decimal import Decimal
 
+from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
 from apps.catalog.models import ProductVariant
@@ -8,6 +9,10 @@ from apps.catalog.serializers import ProductVariantSerializer
 from apps.inventory.models import Warehouse
 
 from .models import Order, OrderItem, Return, ReturnItem, ShippingAddress
+
+# Free-text notes accepted from clients (checkout, returns, in-store sale).
+# The model fields are TextFields; existing longer rows are left as they are.
+NOTE_MAX_LENGTH = 1000
 
 
 def validate_mobile_number(value):
@@ -33,7 +38,9 @@ class ShippingAddressSerializer(serializers.ModelSerializer):
         )
 
     def validate_pincode(self, value):
-        if not value.isdigit() or len(value) != 6:
+        # ASCII digits only: str.isdigit() would also accept Devanagari,
+        # Arabic-Indic or full-width numerals.
+        if not re.fullmatch(r"[0-9]{6}", value):
             raise serializers.ValidationError("Enter a valid 6-digit pincode.")
         return value
 
@@ -77,8 +84,15 @@ class OrderSerializer(serializers.ModelSerializer):
 
 class CheckoutSerializer(serializers.Serializer):
     shipping_address = ShippingAddressSerializer()
-    customer_notes = serializers.CharField(allow_blank=True, required=False, default="")
+    customer_notes = serializers.CharField(
+        allow_blank=True, required=False, default="", max_length=NOTE_MAX_LENGTH,
+    )
     guest_email = serializers.EmailField(required=False, allow_null=True, default=None)
+
+    def validate_guest_email(self, value):
+        # Lower-case the domain only (Django's normalize_email); the local
+        # part is kept as typed.
+        return get_user_model().objects.normalize_email(value) if value else value
 
 
 class InStoreSaleItemSerializer(serializers.Serializer):
@@ -113,7 +127,7 @@ class InStoreSaleSerializer(serializers.Serializer):
         default=None,
         help_text="Public ID of the stock location. Defaults to the default warehouse.",
     )
-    notes = serializers.CharField(required=False, allow_blank=True, default="")
+    notes = serializers.CharField(required=False, allow_blank=True, default="", max_length=NOTE_MAX_LENGTH)
 
     def validate_customer_mobile(self, value):
         return validate_mobile_number(value)
@@ -164,7 +178,9 @@ class CreateReturnItemSerializer(serializers.Serializer):
     order_item = serializers.SlugRelatedField(slug_field="public_id", queryset=OrderItem.objects.all())
     reason = serializers.ChoiceField(choices=ReturnItem.REASON_CHOICES)
     requested_quantity = serializers.IntegerField(min_value=1)
-    reason_notes = serializers.CharField(required=False, allow_blank=True, default="")
+    reason_notes = serializers.CharField(
+        required=False, allow_blank=True, default="", max_length=NOTE_MAX_LENGTH,
+    )
 
     def validate_order_item(self, value):
         order = self.context["order"]

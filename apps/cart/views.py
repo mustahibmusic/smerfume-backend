@@ -9,10 +9,15 @@ Cart resolution rules:
 - Guest request without X-Cart-Token: new cart is created; cart_token is
                                       returned in the response body so the
                                       client can store and re-use it.
+- Guest request with a malformed X-Cart-Token (not 32 lowercase hex
+  characters, the generated format): 400, before any database lookup.
+
+Cart lines are addressed by CartItem.public_id; internal ids never appear.
 """
 
 import uuid
 
+from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
     OpenApiExample,
     OpenApiParameter,
@@ -26,6 +31,28 @@ from rest_framework.views import APIView
 
 from .models import Cart, CartItem
 from .serializers import AddToCartSerializer, CartSerializer, UpdateCartItemSerializer
+from .services import InvalidCartToken, is_valid_cart_token
+
+
+def _guest_cart_token(request):
+    """The X-Cart-Token header, or None when absent or empty. Raises
+    InvalidCartToken when it is not in the generated format."""
+    token = request.headers.get("X-Cart-Token")
+    if not token:
+        return None
+    if not is_valid_cart_token(token):
+        raise InvalidCartToken()
+    return token
+
+
+class _CartTokenErrorMixin:
+    """Answer a malformed X-Cart-Token with a 400 in the cart API's error
+    format instead of letting it reach the database."""
+
+    def handle_exception(self, exc):
+        if isinstance(exc, InvalidCartToken):
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return super().handle_exception(exc)
 
 
 def _resolve_cart(request):
@@ -41,7 +68,7 @@ def _resolve_cart(request):
         cart, _ = Cart.objects.get_or_create(user=request.user)
         return cart
 
-    cart_token = request.headers.get("X-Cart-Token")
+    cart_token = _guest_cart_token(request)
     if cart_token:
         cart, _ = Cart.objects.get_or_create(
             session_key=cart_token,
@@ -54,12 +81,12 @@ def _resolve_cart(request):
     return Cart.objects.create(session_key=new_token)
 
 
-def _get_cart_item(request, item_id):
+def _get_cart_item(request, item_public_id):
     """Fetch a CartItem belonging to the current request's cart.
 
     Args:
         request: DRF Request object.
-        item_id: Primary key of the CartItem.
+        item_public_id: public_id (UUID) of the CartItem.
 
     Returns:
         CartItem instance or None if not found.
@@ -67,13 +94,13 @@ def _get_cart_item(request, item_id):
     try:
         if request.user.is_authenticated:
             return CartItem.objects.select_related("cart").get(
-                id=item_id, cart__user=request.user
+                public_id=item_public_id, cart__user=request.user
             )
-        cart_token = request.headers.get("X-Cart-Token")
+        cart_token = _guest_cart_token(request)
         if not cart_token:
             return None
         return CartItem.objects.select_related("cart").get(
-            id=item_id,
+            public_id=item_public_id,
             cart__session_key=cart_token,
             cart__user__isnull=True,
         )
@@ -87,13 +114,14 @@ _CART_TOKEN_HEADER = OpenApiParameter(
     location=OpenApiParameter.HEADER,
     required=False,
     description=(
-        "Guest cart token. Returned as `cart_token` in the cart response. "
-        "Omit when sending a JWT — the cart is resolved from the authenticated user."
+        "Guest cart token: 32 lowercase hex characters, returned as `cart_token` "
+        "in the cart response. Any other value is a 400. Omit when sending a JWT — "
+        "the cart is resolved from the authenticated user and this header is ignored."
     ),
 )
 
 
-class CartDetailView(APIView):
+class CartDetailView(_CartTokenErrorMixin, APIView):
     permission_classes = [AllowAny]
 
     @extend_schema(
@@ -116,14 +144,15 @@ class CartDetailView(APIView):
         return Response(CartSerializer(cart).data)
 
 
-class CartAddItemView(APIView):
+class CartAddItemView(_CartTokenErrorMixin, APIView):
     permission_classes = [AllowAny]
 
     @extend_schema(
         tags=["Cart"],
         summary="Add item to cart",
         description=(
-            "Add a product variant to the cart. "
+            "Add a product variant to the cart by its `public_id` (`variant_id`). "
+            "The variant, its edition and its product must all be active. "
             "If the variant is already in the cart, quantities are combined "
             "(capped at 99 per line item).\n\n"
             "Supports both authenticated (JWT) and guest (`X-Cart-Token`) requests."
@@ -132,13 +161,15 @@ class CartAddItemView(APIView):
         request=AddToCartSerializer,
         responses={
             200: CartSerializer,
-            400: OpenApiResponse(description="Invalid variant or quantity."),
+            400: OpenApiResponse(
+                description="Unknown or unavailable variant, invalid quantity, or malformed X-Cart-Token."
+            ),
         },
         examples=[
             OpenApiExample(
                 "Add 2 units of a variant",
                 request_only=True,
-                value={"variant_id": 1, "quantity": 2},
+                value={"variant_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "quantity": 2},
             )
         ],
     )
@@ -163,7 +194,7 @@ class CartAddItemView(APIView):
         return Response(CartSerializer(cart).data, status=status.HTTP_200_OK)
 
 
-class CartItemView(APIView):
+class CartItemView(_CartTokenErrorMixin, APIView):
     permission_classes = [AllowAny]
 
     @extend_schema(
@@ -172,17 +203,20 @@ class CartItemView(APIView):
         description="Set a new quantity for a specific cart line item.",
         parameters=[
             _CART_TOKEN_HEADER,
-            OpenApiParameter("item_id", int, OpenApiParameter.PATH, description="Cart item ID"),
+            OpenApiParameter(
+                "item_public_id", OpenApiTypes.UUID, OpenApiParameter.PATH,
+                description="public_id of the cart line (from the cart response).",
+            ),
         ],
         request=UpdateCartItemSerializer,
         responses={
             200: CartSerializer,
-            400: OpenApiResponse(description="Invalid quantity."),
+            400: OpenApiResponse(description="Invalid quantity or malformed X-Cart-Token."),
             404: OpenApiResponse(description="Item not found in this cart."),
         },
     )
-    def patch(self, request, item_id):
-        item = _get_cart_item(request, item_id)
+    def patch(self, request, item_public_id):
+        item = _get_cart_item(request, item_public_id)
         if item is None:
             return Response({"error": "Item not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -199,15 +233,18 @@ class CartItemView(APIView):
         description="Remove a specific line item from the cart.",
         parameters=[
             _CART_TOKEN_HEADER,
-            OpenApiParameter("item_id", int, OpenApiParameter.PATH, description="Cart item ID"),
+            OpenApiParameter(
+                "item_public_id", OpenApiTypes.UUID, OpenApiParameter.PATH,
+                description="public_id of the cart line (from the cart response).",
+            ),
         ],
         responses={
             200: CartSerializer,
             404: OpenApiResponse(description="Item not found in this cart."),
         },
     )
-    def delete(self, request, item_id):
-        item = _get_cart_item(request, item_id)
+    def delete(self, request, item_public_id):
+        item = _get_cart_item(request, item_public_id)
         if item is None:
             return Response({"error": "Item not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -216,7 +253,7 @@ class CartItemView(APIView):
         return Response(CartSerializer(cart).data)
 
 
-class CartClearView(APIView):
+class CartClearView(_CartTokenErrorMixin, APIView):
     permission_classes = [AllowAny]
 
     @extend_schema(

@@ -15,7 +15,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Sum
 from django.utils import timezone
 
@@ -43,14 +43,23 @@ def generate_order_number():
     return f"SMR-{today}-{suffix}"
 
 
+def _email_available(email, user):
+    """True when no other account uses `email`, ignoring case."""
+    User = get_user_model()
+    return not User.objects.filter(email__iexact=email).exclude(pk=user.pk).exists()
+
+
 def resolve_customer_by_mobile(mobile, email=None, name=""):
     """Find or silently create the customer User for a mobile number.
 
     Used by guest checkout (DEC-004) and in-store sales (DEC-008). A newly
     created account has an unusable password so the customer can log in
-    via OTP at any time. For an existing account, email is set only when
-    it has none and the address is not already taken; nothing else on an
-    existing user is ever changed. `name` is applied to new accounts only.
+    via OTP at any time. An existing account is never changed: knowing a
+    mobile number must not let anyone set that account's email. `email`
+    and `name` apply to a newly created account only, and the email only
+    when no other account uses it (ignoring case); otherwise the new
+    account is left without one. The caller keeps the guest's address on
+    the Order (guest_email).
     """
     User = get_user_model()
     mobile_normalized = mobile.strip()
@@ -70,11 +79,16 @@ def resolve_customer_by_mobile(mobile, email=None, name=""):
         user.save(update_fields=["password"])
         logger.info("Created customer user (pk=%s) for mobile %s", user.pk, mobile_normalized)
 
-    if email and not user.email:
-        email_taken = User.objects.filter(email=email).exclude(pk=user.pk).exists()
-        if not email_taken:
-            user.email = email
-            user.save(update_fields=["email"])
+    if created and email and _email_available(email, user):
+        try:
+            # Savepoint: another account may take the address between the
+            # check and this save (unique constraint); checkout goes ahead
+            # without an email on the account.
+            with transaction.atomic():
+                user.email = email
+                user.save(update_fields=["email"])
+        except IntegrityError:
+            user.email = None
 
     return user
 

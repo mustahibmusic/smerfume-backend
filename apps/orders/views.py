@@ -30,6 +30,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.cart.models import Cart
+from apps.cart.services import InvalidCartToken, is_valid_cart_token
 from apps.core.permissions import IsStaffMember
 from apps.inventory.models import Warehouse
 from apps.inventory.services import reservation as reservation_service
@@ -63,6 +64,18 @@ _RETURN_PUBLIC_ID_PATH = OpenApiParameter(
 )
 
 
+class UnavailableItemsError(Exception):
+    """One or more cart lines are no longer purchasable (variant, edition or
+    product deactivated after they were added). Nothing is created."""
+
+    def __init__(self, variants):
+        items = ", ".join(f"{variant.sku} ({variant})" for variant in variants)
+        super().__init__(
+            f"Some items in your cart are no longer available: {items}. "
+            "Remove them from your cart to continue."
+        )
+
+
 class EmptyCartError(Exception):
     """Raised when a locked cart has no items — either it started empty,
     or a concurrent request already checked it out and cleared it."""
@@ -86,6 +99,8 @@ class CheckoutView(APIView):
             "mobile number if one does not already exist.\n"
             "- The guest can log in via OTP with their mobile number to view "
             "their order history.\n\n"
+            "Every item must still be purchasable (variant, edition and product "
+            "active); otherwise nothing is created and the cart is left unchanged.\n\n"
             "Cart items are cleared after the order is created."
         ),
         parameters=[_CART_TOKEN_HEADER],
@@ -94,14 +109,23 @@ class CheckoutView(APIView):
             201: OrderSerializer,
             400: OpenApiResponse(
                 description=(
-                    "Cart is empty, request data is invalid, or "
-                    "guest_email / X-Cart-Token missing for guest checkout."
+                    "Cart is empty, an item is no longer available, request data is "
+                    "invalid, or guest_email / X-Cart-Token missing or malformed for "
+                    "guest checkout."
                 ),
                 examples=[
                     OpenApiExample("Empty cart", value={"error": "Your cart is empty."}),
                     OpenApiExample(
                         "Missing guest_email",
                         value={"error": "guest_email is required for guest checkout."},
+                    ),
+                    OpenApiExample(
+                        "Item no longer available",
+                        value={"error": (
+                            "Some items in your cart are no longer available: "
+                            "AAM-AHL-EDP-60 (Afnan Ahlam EDP 60ml). "
+                            "Remove them from your cart to continue."
+                        )},
                     ),
                 ],
             ),
@@ -161,9 +185,16 @@ class CheckoutView(APIView):
         try:
             with transaction.atomic():
                 locked_cart = Cart.objects.select_for_update().get(pk=cart.pk)
-                cart_items = list(locked_cart.items.select_related("variant").all())
+                cart_items = list(
+                    locked_cart.items.select_related("variant__edition__product__brand").all()
+                )
                 if not cart_items:
                     raise EmptyCartError()
+                # Re-checked here, under the cart lock: an item may have been
+                # deactivated after it was added to the cart.
+                unavailable = [item.variant for item in cart_items if not item.variant.is_purchasable()]
+                if unavailable:
+                    raise UnavailableItemsError(unavailable)
                 order = self._create_order_with_reservations(
                     locked_cart, cart_items, user, guest_email, serializer
                 )
@@ -171,6 +202,8 @@ class CheckoutView(APIView):
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except EmptyCartError:
             return Response({"error": "Your cart is empty."}, status=status.HTTP_400_BAD_REQUEST)
+        except UnavailableItemsError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
 
@@ -266,6 +299,8 @@ class CheckoutView(APIView):
                 {"error": "X-Cart-Token header is required for guest checkout."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if not is_valid_cart_token(cart_token):
+            return Response({"error": InvalidCartToken.message}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             cart = Cart.objects.prefetch_related("items__variant").get(

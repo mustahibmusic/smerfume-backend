@@ -7,25 +7,24 @@ from apps.catalog.serializers import ProductVariantSerializer
 from .models import Cart, CartItem
 
 
-class CartItemSerializer(serializers.ModelSerializer):
-    variant = ProductVariantSerializer(read_only=True)
-    variant_id = serializers.PrimaryKeyRelatedField(
-        queryset=ProductVariant.objects.filter(is_active=True),
-        source="variant",
-        write_only=True,
+def purchasable_variants():
+    """Variants a customer can add: the variant, its edition and its product
+    are all active (ProductVariant.is_purchasable, as a filter)."""
+    return ProductVariant.objects.filter(
+        is_active=True, edition__is_active=True, edition__product__is_active=True,
     )
+
+
+class CartItemSerializer(serializers.ModelSerializer):
+    """Read-only cart line. public_id identifies the line in the cart item
+    URLs; the internal primary key is never exposed."""
+
+    variant = ProductVariantSerializer(read_only=True)
     line_total = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
 
     class Meta:
         model = CartItem
-        fields = ("id", "variant", "variant_id", "quantity", "line_total")
-
-    def validate_quantity(self, value):
-        if value < 1:
-            raise serializers.ValidationError("Quantity must be at least 1.")
-        if value > 99:
-            raise serializers.ValidationError("Cannot add more than 99 of the same item.")
-        return value
+        fields = ("public_id", "variant", "quantity", "line_total")
 
 
 class CartSerializer(serializers.ModelSerializer):
@@ -48,8 +47,13 @@ class CartSerializer(serializers.ModelSerializer):
 
 
 class AddToCartSerializer(serializers.Serializer):
-    variant_id = serializers.PrimaryKeyRelatedField(
-        queryset=ProductVariant.objects.filter(is_active=True),
+    # The variant's public_id (UUID) from the catalogue API, never the
+    # internal primary key.
+    variant_id = serializers.SlugRelatedField(
+        slug_field="public_id",
+        queryset=purchasable_variants(),
+        help_text="public_id of the product variant (from the catalogue API).",
+        error_messages={"does_not_exist": "This product variant is not available."},
     )
     quantity = serializers.IntegerField(min_value=1, max_value=99, default=1)
 

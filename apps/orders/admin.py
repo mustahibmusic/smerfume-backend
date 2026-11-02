@@ -31,7 +31,7 @@ from apps.inventory.services.reservation import InsufficientStockError
 
 from . import services as order_services
 from .models import Order, OrderItem, Refund, RefundAdjustment, Return, ReturnItem, ShippingAddress
-from .serializers import validate_mobile_number
+from .serializers import NOTE_MAX_LENGTH, validate_mobile_number
 
 
 # ── In-store sale form (DEC-008) ─────────────────────────────────────────────
@@ -106,7 +106,9 @@ class InStoreSaleForm(forms.Form):
         queryset=Warehouse.objects.order_by("name"), widget=UnfoldAdminSelectWidget,
         help_text="Stock location the items leave from.",
     )
-    notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget(attrs={"rows": 2}))
+    notes = forms.CharField(
+        required=False, max_length=NOTE_MAX_LENGTH, widget=UnfoldAdminTextareaWidget(attrs={"rows": 2}),
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

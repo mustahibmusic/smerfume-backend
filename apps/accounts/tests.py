@@ -441,6 +441,10 @@ class MeViewTests(TestCase):
 
 # ── Cart merge on OTP verify ─────────────────────────────────────────────────
 
+# A guest cart token in the generated format (32 lowercase hex characters).
+MERGE_CART_TOKEN = "0123456789abcdef0123456789abcdef"
+
+
 class CartMergeOnLoginTests(TestCase):
     """
     Verify that a guest cart is merged into the user's cart when
@@ -472,7 +476,7 @@ class CartMergeOnLoginTests(TestCase):
             sku="TEST-CARTMERGE-10ML",
         )
 
-        self.guest_cart = Cart.objects.create(session_key="mergetoken")
+        self.guest_cart = Cart.objects.create(session_key=MERGE_CART_TOKEN)
         CartItem.objects.create(cart=self.guest_cart, variant=self.variant, quantity=3)
 
     def _do_otp_verify(self, user, otp_code, cart_token=None):
@@ -496,7 +500,7 @@ class CartMergeOnLoginTests(TestCase):
         """Guest cart items are in user cart after OTP verify with X-Cart-Token."""
         from apps.cart.models import Cart
 
-        resp = self._do_otp_verify(self.user, "111111", cart_token="mergetoken")
+        resp = self._do_otp_verify(self.user, "111111", cart_token=MERGE_CART_TOKEN)
         self.assertEqual(resp.status_code, 200)
 
         user_cart = Cart.objects.get(user=self.user)
@@ -507,8 +511,8 @@ class CartMergeOnLoginTests(TestCase):
     def test_guest_cart_deleted_after_merge(self, _mock):
         from apps.cart.models import Cart
 
-        self._do_otp_verify(self.user, "222222", cart_token="mergetoken")
-        self.assertFalse(Cart.objects.filter(session_key="mergetoken").exists())
+        self._do_otp_verify(self.user, "222222", cart_token=MERGE_CART_TOKEN)
+        self.assertFalse(Cart.objects.filter(session_key=MERGE_CART_TOKEN).exists())
 
     @patch(_SMS_BACKEND_PATCH, side_effect=_mock_sms_backend)
     def test_verify_without_cart_token_succeeds_normally(self, _mock):

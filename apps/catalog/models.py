@@ -258,6 +258,11 @@ class ProductVariant(BaseModel):
             ),
         ]
 
+    def is_purchasable(self):
+        """Active variant of an active edition of an active product. Matches
+        the add-to-cart queryset filter in apps.cart.serializers."""
+        return self.is_active and self.edition.is_active and self.edition.product.is_active
+
     def display_name(self):
         brand = self.edition.product.brand.name
         product_and_edition = self.edition.display_name()

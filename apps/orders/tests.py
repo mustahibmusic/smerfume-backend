@@ -204,7 +204,8 @@ class GuestCheckoutTests(TestCase):
         self.client = APIClient()
         self.variant = _make_variant(size_ml=20)
 
-    def _make_guest_cart(self, token="guesttoken123"):
+    def _make_guest_cart(self, token=None):
+        token = token or uuid.uuid4().hex
         cart = Cart.objects.create(session_key=token)
         CartItem.objects.create(cart=cart, variant=self.variant, quantity=1)
         return token
@@ -227,23 +228,23 @@ class GuestCheckoutTests(TestCase):
         self.assertEqual(order.user.mobile_number, "9876543210")
 
     def test_guest_checkout_clears_guest_cart(self):
-        token = self._make_guest_cart(token="cleartoken")
+        token = self._make_guest_cart()
         self.client.post(
             CHECKOUT_URL,
             {"guest_email": "guest2@example.com", "shipping_address": _SHIPPING},
             format="json",
-            HTTP_X_CART_TOKEN="cleartoken",
+            HTTP_X_CART_TOKEN=token,
         )
-        cart = Cart.objects.get(session_key="cleartoken")
+        cart = Cart.objects.get(session_key=token)
         self.assertEqual(cart.items.count(), 0)
 
     def test_guest_checkout_missing_email_returns_400(self):
-        token = self._make_guest_cart(token="noemail")
+        token = self._make_guest_cart()
         resp = self.client.post(
             CHECKOUT_URL,
             {"shipping_address": _SHIPPING},
             format="json",
-            HTTP_X_CART_TOKEN="noemail",
+            HTTP_X_CART_TOKEN=token,
         )
         self.assertEqual(resp.status_code, 400)
         self.assertIn("guest_email", resp.data["error"])
@@ -267,36 +268,37 @@ class GuestCheckoutTests(TestCase):
         self.assertEqual(resp.status_code, 400)
 
     def test_guest_checkout_empty_cart_returns_400(self):
-        Cart.objects.create(session_key="emptyguest")
+        token = uuid.uuid4().hex
+        Cart.objects.create(session_key=token)
         resp = self.client.post(
             CHECKOUT_URL,
             {"guest_email": "g@example.com", "shipping_address": _SHIPPING},
             format="json",
-            HTTP_X_CART_TOKEN="emptyguest",
+            HTTP_X_CART_TOKEN=token,
         )
         self.assertEqual(resp.status_code, 400)
 
     def test_guest_checkout_links_to_existing_user_by_mobile(self):
         """If the mobile already has an account, the order links to it."""
         existing_user = _make_user(mobile="9876543210")
-        token = self._make_guest_cart(token="existingmobile")
+        token = self._make_guest_cart()
         resp = self.client.post(
             CHECKOUT_URL,
             {"guest_email": "new@example.com", "shipping_address": _SHIPPING},
             format="json",
-            HTTP_X_CART_TOKEN="existingmobile",
+            HTTP_X_CART_TOKEN=token,
         )
         self.assertEqual(resp.status_code, 201)
         order = Order.objects.get(order_number=resp.data["order_number"])
         self.assertEqual(order.user.pk, existing_user.pk)
 
     def test_guest_checkout_sets_email_on_new_user(self):
-        token = self._make_guest_cart(token="emailtoken")
+        token = self._make_guest_cart()
         self.client.post(
             CHECKOUT_URL,
             {"guest_email": "setme@example.com", "shipping_address": _SHIPPING},
             format="json",
-            HTTP_X_CART_TOKEN="emailtoken",
+            HTTP_X_CART_TOKEN=token,
         )
         user = User.objects.get(mobile_number="9876543210")
         self.assertEqual(user.email, "setme@example.com")
@@ -304,24 +306,24 @@ class GuestCheckoutTests(TestCase):
     def test_guest_checkout_does_not_overwrite_existing_email(self):
         """If the existing user already has an email, it is not overwritten."""
         _make_user(mobile="9876543210", email="original@example.com")
-        token = self._make_guest_cart(token="dontoverwrite")
+        token = self._make_guest_cart()
         self.client.post(
             CHECKOUT_URL,
             {"guest_email": "new@example.com", "shipping_address": _SHIPPING},
             format="json",
-            HTTP_X_CART_TOKEN="dontoverwrite",
+            HTTP_X_CART_TOKEN=token,
         )
         user = User.objects.get(mobile_number="9876543210")
         self.assertEqual(user.email, "original@example.com")
 
     def test_auto_created_user_can_see_order_after_login(self):
         """Guest user created at checkout appears in order list after OTP login."""
-        token = self._make_guest_cart(token="logincheck")
+        token = self._make_guest_cart()
         resp = self.client.post(
             CHECKOUT_URL,
             {"guest_email": "logincheck@example.com", "shipping_address": _SHIPPING},
             format="json",
-            HTTP_X_CART_TOKEN="logincheck",
+            HTTP_X_CART_TOKEN=token,
         )
         self.assertEqual(resp.status_code, 201)
 
@@ -332,6 +334,210 @@ class GuestCheckoutTests(TestCase):
         results = list_resp.data["results"]
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["order_number"], resp.data["order_number"])
+
+
+
+# ── Checkout integrity (fix/checkout-integrity: F4, F5, F9, F20, F21) ─────────
+
+class CheckoutPurchasabilityTests(TestCase):
+    """An item that is no longer purchasable (variant, edition or product
+    inactive) is refused at checkout, even if it was active when added to
+    the cart. Nothing is created and the cart is left as it was."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user()
+        self.client.credentials(**_auth_header(self.user))
+        self.variant = _make_variant()
+        self.cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=self.cart, variant=self.variant, quantity=1)
+
+    def _assert_refused(self):
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn(self.variant.sku, resp.data["error"])
+        self.assertFalse(Order.objects.exists())
+        self.assertFalse(StockReservation.objects.exists())
+        self.assertEqual(self.cart.items.count(), 1)
+
+    def test_inactive_variant_refused(self):
+        ProductVariant.objects.filter(pk=self.variant.pk).update(is_active=False)
+        self._assert_refused()
+
+    def test_inactive_edition_refused(self):
+        ProductEdition.objects.filter(pk=self.variant.edition_id).update(is_active=False)
+        self._assert_refused()
+
+    def test_inactive_product_refused(self):
+        Product.objects.filter(pk=self.variant.edition.product_id).update(is_active=False)
+        self._assert_refused()
+
+    def test_item_deactivated_after_add_to_cart_refused(self):
+        self.cart.items.all().delete()
+        add = self.client.post(
+            "/api/cart/add/", {"variant_id": str(self.variant.public_id), "quantity": 1}, format="json",
+        )
+        self.assertEqual(add.status_code, 200)
+        Product.objects.filter(pk=self.variant.edition.product_id).update(is_active=False)
+        self._assert_refused()
+
+    def test_one_inactive_line_refuses_whole_order(self):
+        other = _make_variant(size_ml=30)
+        CartItem.objects.create(cart=self.cart, variant=other, quantity=1)
+        ProductVariant.objects.filter(pk=self.variant.pk).update(is_active=False)
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(Order.objects.exists())
+        self.assertFalse(StockReservation.objects.exists())
+        self.assertEqual(self.cart.items.count(), 2)
+
+    def test_active_items_still_check_out(self):
+        resp = self.client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.assertEqual(resp.status_code, 201)
+
+
+class GuestCheckoutTokenTests(TestCase):
+    """A malformed X-Cart-Token is refused before any database lookup."""
+
+    def setUp(self):
+        self.client = APIClient()
+
+    def _checkout(self, token):
+        return self.client.post(
+            CHECKOUT_URL,
+            {"guest_email": "g@example.com", "shipping_address": _SHIPPING},
+            format="json",
+            HTTP_X_CART_TOKEN=token,
+        )
+
+    def test_malformed_tokens_return_400(self):
+        for token in ("x" * 500, "a" * 41, "A" * 32, "g" * 32, "a" * 31, "' OR 1=1 --"):
+            with self.subTest(token=token):
+                resp = self._checkout(token)
+                self.assertEqual(resp.status_code, 400)
+                self.assertIn("X-Cart-Token", resp.data["error"])
+
+    def test_well_formed_unknown_token_is_empty_cart(self):
+        resp = self._checkout(uuid.uuid4().hex)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["error"], "Your cart is empty.")
+
+
+class GuestCheckoutEmailTests(TestCase):
+    """Guest checkout keeps guest_email on the Order and never changes the
+    email of an account that already existed for the mobile number."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.variant = _make_variant(size_ml=20)
+
+    def _checkout(self, email):
+        token = uuid.uuid4().hex
+        cart = Cart.objects.create(session_key=token)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=1)
+        return self.client.post(
+            CHECKOUT_URL,
+            {"guest_email": email, "shipping_address": _SHIPPING},
+            format="json",
+            HTTP_X_CART_TOKEN=token,
+        )
+
+    def test_existing_user_without_email_is_not_changed(self):
+        existing = _make_user(mobile="9876543210")
+        resp = self._checkout("attacker@example.com")
+        self.assertEqual(resp.status_code, 201)
+        existing.refresh_from_db()
+        self.assertIsNone(existing.email)
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        self.assertEqual(order.user_id, existing.pk)
+        self.assertEqual(order.guest_email, "attacker@example.com")
+
+    def test_guest_email_domain_is_normalised(self):
+        resp = self._checkout("Guest.Name@Example.COM")
+        self.assertEqual(resp.status_code, 201)
+        order = Order.objects.get(order_number=resp.data["order_number"])
+        self.assertEqual(order.guest_email, "Guest.Name@example.com")
+        self.assertEqual(order.user.email, "Guest.Name@example.com")
+
+    def test_email_taken_in_other_case_is_not_given_to_new_user(self):
+        _make_user(mobile="+919000000001", email="taken@example.com", username="taken")
+        resp = self._checkout("TAKEN@example.com")
+        self.assertEqual(resp.status_code, 201)
+        new_user = User.objects.get(mobile_number="9876543210")
+        self.assertIsNone(new_user.email)
+
+    def test_email_race_does_not_cause_500(self):
+        # Another account takes the address between the check and the save.
+        _make_user(mobile="+919000000002", email="race@example.com", username="race")
+        with patch("apps.orders.services._email_available", return_value=True):
+            resp = self._checkout("race@example.com")
+        self.assertEqual(resp.status_code, 201)
+        new_user = User.objects.get(mobile_number="9876543210")
+        self.assertIsNone(new_user.email)
+
+
+class CheckoutInputLimitTests(TestCase):
+    """F20 note length limits and F21 ASCII pincode."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = _make_user()
+        self.client.credentials(**_auth_header(self.user))
+        self.variant = _make_variant()
+        cart = Cart.objects.create(user=self.user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=1)
+
+    def _checkout(self, address=None, **fields):
+        payload = {"shipping_address": {**_SHIPPING, **(address or {})}, **fields}
+        return self.client.post(CHECKOUT_URL, payload, format="json")
+
+    def test_customer_notes_over_1000_chars_refused(self):
+        resp = self._checkout(customer_notes="n" * 1001)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("customer_notes", resp.data)
+        self.assertFalse(Order.objects.exists())
+
+    def test_customer_notes_of_1000_chars_accepted(self):
+        resp = self._checkout(customer_notes="n" * 1000)
+        self.assertEqual(resp.status_code, 201)
+
+    def test_non_ascii_digit_pincodes_refused(self):
+        # Arabic-Indic, Devanagari, full-width and superscript digits all
+        # pass str.isdigit() but are not a valid Indian PIN code.
+        for pincode in ("٤٠٠٠٠١", "४००००१",
+                        "40000１", "40000¹", "40001", "4000011", "40 001"):
+            with self.subTest(pincode=pincode):
+                resp = self._checkout(address={"pincode": pincode})
+                self.assertEqual(resp.status_code, 400)
+                self.assertIn("pincode", resp.data["shipping_address"])
+        self.assertFalse(Order.objects.exists())
+
+    def test_mumbai_pincode_accepted(self):
+        resp = self._checkout(address={"pincode": "400001", "city": "Mumbai", "state": "MH"})
+        self.assertEqual(resp.status_code, 201)
+
+    def test_return_reason_notes_over_1000_chars_refused(self):
+        from apps.orders.serializers import CreateReturnSerializer
+
+        serializer = CreateReturnSerializer(
+            data={"items": [{
+                "order_item": str(uuid.uuid4()), "reason": ReturnItem.REASON_CHOICES[0][0],
+                "requested_quantity": 1, "reason_notes": "n" * 1001,
+            }]},
+            context={"order": None},
+        )
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("reason_notes", serializer.errors["items"][0])
+
+    def test_in_store_notes_over_1000_chars_refused(self):
+        from apps.orders.serializers import InStoreSaleSerializer
+
+        serializer = InStoreSaleSerializer(data={
+            "customer_mobile": "9876543210", "payment_method": "cash",
+            "items": [{"sku": self.variant.sku, "quantity": 1}], "notes": "n" * 1001,
+        })
+        self.assertFalse(serializer.is_valid())
+        self.assertEqual(list(serializer.errors), ["notes"])
 
 
 # ── Phase 3: inventory reservation integration ────────────────────────────────
@@ -2750,7 +2956,7 @@ class FullCustomerJourneyIntegrationTests(TestCase):
 
         # ── A. Cart via real HTTP ──
         add_resp = self.client.post("/api/cart/add/", {
-            "variant_id": self.variant.pk, "quantity": 2,
+            "variant_id": str(self.variant.public_id), "quantity": 2,
         }, format="json")
         self.assertEqual(add_resp.status_code, 200)
         self.assertEqual(add_resp.data["item_count"], 1)
@@ -4416,6 +4622,17 @@ class InStoreLineFormsetTests(TestCase):
 
     def _line_errors(self, resp, index):
         return resp.context["formset"].forms[index].errors
+
+    def test_notes_over_1000_chars_refused(self):
+        resp = self._post([(self.a.sku, 1, False)], notes="n" * 1001)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("notes", resp.context["form"].errors)
+        self.assertFalse(Order.objects.exists())
+
+    def test_notes_of_1000_chars_accepted(self):
+        resp = self._post([(self.a.sku, 1, False)], notes="n" * 1000)
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(Order.objects.get().customer_notes, "n" * 1000)
 
     def test_page_starts_with_one_row_and_an_empty_form_template(self):
         resp = self.client.get(ADMIN_IN_STORE_URL)

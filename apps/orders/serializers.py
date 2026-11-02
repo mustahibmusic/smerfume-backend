@@ -8,7 +8,8 @@ from apps.catalog.models import ProductVariant
 from apps.catalog.serializers import ProductVariantSerializer
 from apps.inventory.models import Warehouse
 
-from .models import Order, OrderItem, Return, ReturnItem, ShippingAddress
+from .models import Order, OrderItem, OrderPaymentError, Return, ReturnItem, ShippingAddress
+from .payments import validate_reference
 
 # Free-text notes accepted from clients (checkout, returns, in-store sale).
 # The model fields are TextFields; existing longer rows are left as they are.
@@ -136,6 +137,16 @@ class InStoreSaleSerializer(serializers.Serializer):
         if not value:
             raise serializers.ValidationError("At least one item is required.")
         return value
+
+    def validate(self, attrs):
+        # DEC-013 reference rule, shown under the field; the service checks it again.
+        try:
+            attrs["payment_reference"] = validate_reference(
+                attrs["payment_method"], attrs.get("payment_reference", ""),
+            )
+        except OrderPaymentError as exc:
+            raise serializers.ValidationError({"payment_reference": str(exc)}) from exc
+        return attrs
 
 
 # ── Returns (read) ──────────────────────────────────────────────────────────

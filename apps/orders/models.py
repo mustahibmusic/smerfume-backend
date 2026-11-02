@@ -485,3 +485,69 @@ class RefundAdjustment(BaseModel):
 
     def __str__(self):
         return f"RefundAdjustment({self.refund_id}, {self.adjustment_amount})"
+
+
+class OrderPaymentError(Exception):
+    """A customer payment cannot be recorded or changed (message is user-facing)."""
+
+
+class OrderPayment(BaseModel):
+    """DEC-013: one customer payment against an Order. The source of truth
+    for paid amount, balance due and payment status (derived in
+    apps.orders.payments); Order.payment_method / payment_reference are
+    compatibility summaries only. Rows are written only through
+    apps.orders.payments.record_order_payment and are never changed or
+    deleted by the application; direct privileged ORM/database maintenance
+    is outside that contract. Payments belong to the Order, not to a line.
+    Not an accounting record: Zoho Books is authoritative (DEC-001)."""
+
+    PAYMENT_NUMBER_PREFIX = "CPAY-"
+    METHOD_CHOICES = [
+        choice for choice in Order.PAYMENT_METHOD_CHOICES if choice[0] in Order.IN_STORE_PAYMENT_METHODS
+    ]
+    # UPI, card and netbanking need a reference (UTR, slip or transaction
+    # number); cash does not.
+    REFERENCE_REQUIRED_METHODS = (
+        Order.PAYMENT_METHOD_UPI, Order.PAYMENT_METHOD_CARD, Order.PAYMENT_METHOD_NETBANKING,
+    )
+
+    order = models.ForeignKey(Order, on_delete=models.PROTECT, related_name="payments")
+    payment_number = models.CharField(max_length=20, unique=True, editable=False)
+    method = models.CharField(max_length=10, choices=METHOD_CHOICES)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    reference = models.CharField(
+        max_length=100, blank=True,
+        help_text="Transaction/slip reference. Never enter a card number or CVV.",
+    )
+    payment_date = models.DateField(help_text="Date the money was received.")
+    recorded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+
+    class Meta:
+        db_table = "orders_orderpayment"
+        ordering = ["payment_date", "id"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(amount__gt=0), name="order_payment_amount_gt_0"),
+            models.CheckConstraint(
+                condition=models.Q(payment_number__regex=r"^CPAY-[0-9]{6,}$"),
+                name="order_payment_number_format",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(method__in=Order.IN_STORE_PAYMENT_METHODS),
+                name="order_payment_method_counter",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        # Defence in depth: business writes go through the payment service,
+        # which only ever inserts.
+        if not self._state.adding:
+            raise OrderPaymentError(f"{self.payment_number} is recorded and cannot be changed.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise OrderPaymentError(f"{self.payment_number} is recorded and cannot be deleted.")
+
+    def __str__(self):
+        return self.payment_number

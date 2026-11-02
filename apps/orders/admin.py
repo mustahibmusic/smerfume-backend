@@ -9,6 +9,7 @@ from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
+from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.http import require_GET
 from django.utils.html import format_html, format_html_join
@@ -29,8 +30,19 @@ from apps.inventory.models import StockMovement, StockReservationAllocation, War
 from apps.inventory.selectors import in_store_available
 from apps.inventory.services.reservation import InsufficientStockError
 
+from . import payments as order_payments
 from . import services as order_services
-from .models import Order, OrderItem, Refund, RefundAdjustment, Return, ReturnItem, ShippingAddress
+from .models import (
+    Order,
+    OrderItem,
+    OrderPayment,
+    OrderPaymentError,
+    Refund,
+    RefundAdjustment,
+    Return,
+    ReturnItem,
+    ShippingAddress,
+)
 from .serializers import NOTE_MAX_LENGTH, validate_mobile_number
 
 
@@ -95,7 +107,10 @@ class InStoreSaleForm(forms.Form):
     )
     payment_reference = forms.CharField(
         max_length=100, required=False, widget=UnfoldAdminTextInputWidget,
-        help_text="UPI/netbanking UTR or card slip number.",
+        help_text=(
+            "Required for UPI, card and netbanking: UTR or transaction/slip reference. "
+            "Never enter a card number or CVV."
+        ),
     )
     discount_amount = forms.DecimalField(
         max_digits=10, decimal_places=2, min_value=0, initial=0, required=False,
@@ -119,6 +134,19 @@ class InStoreSaleForm(forms.Form):
             return validate_mobile_number(self.cleaned_data["customer_mobile"])
         except drf_serializers.ValidationError as exc:
             raise forms.ValidationError([str(e) for e in exc.detail]) from exc
+
+    def clean(self):
+        # DEC-013 reference rule under the field; the service checks it again.
+        cleaned = super().clean()
+        method = cleaned.get("payment_method")
+        if method:
+            try:
+                cleaned["payment_reference"] = order_payments.validate_reference(
+                    method, cleaned.get("payment_reference", ""),
+                )
+            except OrderPaymentError as exc:
+                self.add_error("payment_reference", str(exc))
+        return cleaned
 
 
 class InStoreSaleLineForm(forms.Form):
@@ -346,13 +374,34 @@ class AwaitingIncomingFilter(admin.SimpleListFilter):
         return queryset
 
 
+class PaymentStatusFilter(admin.SimpleListFilter):
+    """DEC-013 payment status, derived from OrderPayment rows."""
+
+    title = "payment status"
+    parameter_name = "payment_status"
+
+    def lookups(self, request, model_admin):
+        return order_payments.STATUS_CHOICES
+
+    def queryset(self, request, queryset):
+        if self.value() in dict(order_payments.STATUS_CHOICES):
+            return queryset.filter(payment_status=self.value())
+        return queryset
+
+
+_PAYMENT_STATUS_LABELS = dict(order_payments.STATUS_CHOICES)
+
+
 @admin.register(Order)
 class OrderAdmin(StaffActionMixin, ModelAdmin):
     list_display = (
         "order_number", "user", "channel", "status", "payment_method", "total",
+        "total_paid_display", "balance_due_display", "payment_status_display",
         "is_guest_order_display", "guest_email", "awaiting_incoming_display", "created_at",
     )
-    list_filter = ("channel", "status", "payment_method", AwaitingIncomingFilter, "created_at")
+    list_filter = (
+        "channel", "status", "payment_method", PaymentStatusFilter, AwaitingIncomingFilter, "created_at",
+    )
     search_fields = (
         "order_number", "user__mobile_number", "user__email", "guest_email",
         "user__first_name", "user__last_name",
@@ -372,6 +421,7 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
         # reservations) that only the service functions below perform
         # correctly — never editable directly, use the actions instead.
         "status",
+        "payments_received",
         "allocation_breakdown",
         "business_events",
         "admin_history",
@@ -413,6 +463,13 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
         }),
         ("Payment", {
             "fields": ("payment_method", "payment_reference", "cod_verified_at", "cod_verified_by"),
+            "description": (
+                "Payment method and reference here are summaries kept for compatibility. "
+                "Amounts come from Payments received."
+            ),
+        }),
+        ("Payments", {
+            "fields": ("payments_received",),
         }),
         ("Status & Notes", {
             "fields": ("status", "customer_notes"),
@@ -441,7 +498,60 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
         return obj.is_guest_order
 
     def get_queryset(self, request):
-        return super().get_queryset(request).annotate(awaiting_incoming=_awaiting_incoming())
+        return order_payments.annotate_payment_summary(
+            super().get_queryset(request).annotate(awaiting_incoming=_awaiting_incoming())
+        )
+
+    @admin.display(description="Paid", ordering="total_paid")
+    def total_paid_display(self, obj):
+        return obj.total_paid
+
+    @admin.display(description="Balance due", ordering="balance_due")
+    def balance_due_display(self, obj):
+        return obj.balance_due
+
+    @admin.display(description="Payment status", ordering="payment_status")
+    def payment_status_display(self, obj):
+        return _PAYMENT_STATUS_LABELS.get(obj.payment_status, obj.payment_status)
+
+    @admin.display(description="Payments received")
+    def payments_received(self, obj):
+        """DEC-013 payment rows and the totals derived from them (read-only)."""
+        if obj is None or obj.pk is None:
+            return "—"
+        rows = [
+            (
+                payment.payment_date.strftime("%d/%m/%Y"),
+                timezone.localtime(payment.created_at).strftime("%d/%m/%Y"),
+                payment.payment_number,
+                payment.reference or "—",
+                payment.get_method_display(),
+                payment.amount,
+            )
+            for payment in obj.payments.all()
+        ]
+        summary = order_payments.payment_summary(obj)
+        cell = '<td class="px-3 py-2">{}</td>'
+        table = format_html(
+            '<table class="text-sm w-full"><thead><tr class="text-left">'
+            '<th class="px-3 py-2">Date</th><th class="px-3 py-2">Applied on</th>'
+            '<th class="px-3 py-2">Payment #</th><th class="px-3 py-2">Reference</th>'
+            '<th class="px-3 py-2">Payment mode</th><th class="px-3 py-2 text-right">Amount (₹)</th>'
+            "</tr></thead><tbody>{}</tbody></table>",
+            format_html_join(
+                "", "<tr>" + cell * 5 + '<td class="px-3 py-2 text-right">{}</td></tr>', rows,
+            ) if rows else format_html('<tr><td class="px-3 py-2" colspan="6">{}</td></tr>', "No payments recorded."),
+        )
+        totals = format_html_join(
+            "", '<div class="flex justify-between py-1"><dt>{}</dt><dd>{}</dd></div>',
+            (
+                ("Total paid", f"₹{summary['total_paid']}"),
+                ("Balance due", f"₹{summary['balance_due']}"),
+                ("Refunded", f"₹{summary['refunded']}"),
+                ("Payment status", _PAYMENT_STATUS_LABELS[summary["payment_status"]]),
+            ),
+        )
+        return format_html('{}<dl class="max-w-sm ml-auto mt-3 px-3 text-sm">{}</dl>', table, totals)
 
     @admin.display(description="Awaiting incoming", boolean=True, ordering="awaiting_incoming")
     def awaiting_incoming_display(self, obj):
@@ -839,6 +949,34 @@ class ReturnItemInline(admin.TabularInline):
         if obj is None or obj.status not in self.RECEIVED_QUANTITY_EDITABLE_STATUSES:
             readonly += ("received_quantity",)
         return readonly
+
+
+@admin.register(OrderPayment)
+class OrderPaymentAdmin(ModelAdmin):
+    """DEC-013 customer payments: view only, for everyone including
+    superusers. Rows are recorded by the sale flow, never here."""
+
+    list_display = (
+        "payment_number", "order", "payment_date", "method", "reference", "amount", "recorded_by", "created_at",
+    )
+    list_filter = ("method", "payment_date")
+    search_fields = ("payment_number", "order__order_number", "reference")
+    list_select_related = ("order", "recorded_by")
+    date_hierarchy = "payment_date"
+    readonly_fields = (
+        "payment_number", "order", "method", "amount", "reference", "payment_date", "recorded_by",
+        "created_at",
+    )
+    fields = readonly_fields
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(Return)

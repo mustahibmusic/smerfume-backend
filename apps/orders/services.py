@@ -380,11 +380,17 @@ def create_in_store_order(
     then delivered at the moment of sale. There is no ShippingAddress and
     no shipping charge.
 
+    DEC-013: the payment is recorded as one OrderPayment (CPAY) row for the
+    final total; a zero-total sale has none. Order.payment_method and
+    payment_reference stay as compatibility summaries of that row. UPI,
+    card and netbanking need a reference.
+
     Everything runs in one transaction: InStoreSaleError or
-    InsufficientStockError leaves no order, customer, reservation or stock
-    change behind.
+    InsufficientStockError leaves no order, customer, reservation, stock
+    change or payment behind.
     """
-    from .models import Order, OrderItem
+    from . import payments as order_payments
+    from .models import Order, OrderItem, OrderPaymentError
 
     if payment_method not in Order.IN_STORE_PAYMENT_METHODS:
         raise InStoreSaleError(
@@ -393,6 +399,10 @@ def create_in_store_order(
         )
     if not (customer_mobile or "").strip():
         raise InStoreSaleError("Customer mobile number is required.")
+    try:
+        payment_reference = order_payments.validate_reference(payment_method, payment_reference)
+    except OrderPaymentError as exc:
+        raise InStoreSaleError(str(exc)) from exc
 
     merged = {}
     for variant, quantity in lines:
@@ -447,6 +457,12 @@ def create_in_store_order(
 
     for reservation in reservations:
         reservation_service.consume_reservation(reservation, performed_by=staff_user)
+
+    if order.total > 0:
+        order_payments.record_order_payment(
+            order, method=payment_method, amount=order.total, reference=payment_reference,
+            recorded_by=staff_user,
+        )
 
     order.status = Order.STATUS_DELIVERED
     order.delivered_at = timezone.now()

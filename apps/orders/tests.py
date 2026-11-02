@@ -4823,3 +4823,449 @@ class InStoreSaleActionPermissionTests(TestCase):
         self.client.force_login(self._staff("isadder", "view_order", "add_order"))
         self.assertContains(self.client.get("/admin/orders/order/"), "in-store-sale")
         self.assertEqual(self.client.get(ADMIN_IN_STORE_URL).status_code, 200)
+
+
+# ── DEC-013: customer order payment ledger (feat/order-payments-ledger) ──────
+
+from django.db import IntegrityError, transaction  # noqa: E402
+
+from apps.orders import payments as order_payments  # noqa: E402
+from apps.orders.models import OrderPayment  # noqa: E402
+
+ORDER_PAYMENT_CHANGELIST = "/admin/orders/orderpayment/"
+
+
+def _payment_row(order, number, **fields):
+    """Insert a payment row directly (bypassing the service) for constraint tests."""
+    fields.setdefault("method", "cash")
+    fields.setdefault("amount", Decimal("100.00"))
+    fields.setdefault("payment_date", timezone.localdate())
+    return OrderPayment.objects.create(order=order, payment_number=number, **fields)
+
+
+class OrderPaymentModelTests(TestCase):
+    def setUp(self):
+        self.order = _plain_order(7001, Order.STATUS_DELIVERED)
+
+    def _refused(self, **fields):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            _payment_row(self.order, "CPAY-000001", **fields)
+
+    def test_zero_and_negative_amounts_refused(self):
+        self._refused(amount=Decimal("0.00"))
+        self._refused(amount=Decimal("-1.00"))
+
+    def test_non_counter_method_refused(self):
+        self._refused(method="cod")
+        self._refused(method="prepaid")
+
+    def test_payment_number_format_enforced(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            _payment_row(self.order, "PAY-1")
+
+    def test_payment_number_unique(self):
+        _payment_row(self.order, "CPAY-000001")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            _payment_row(self.order, "CPAY-000001")
+
+    def test_saved_row_cannot_be_changed(self):
+        payment = _payment_row(self.order, "CPAY-000001")
+        payment.amount = Decimal("999.00")
+        with self.assertRaises(order_payments.OrderPaymentError):
+            payment.save()
+        payment.refresh_from_db()
+        self.assertEqual(payment.amount, Decimal("100.00"))
+
+    def test_saved_row_cannot_be_deleted(self):
+        payment = _payment_row(self.order, "CPAY-000001")
+        with self.assertRaises(order_payments.OrderPaymentError):
+            payment.delete()
+        self.assertTrue(OrderPayment.objects.filter(pk=payment.pk).exists())
+
+    def test_order_with_payments_cannot_be_deleted(self):
+        from django.db.models import ProtectedError
+
+        _payment_row(self.order, "CPAY-000001")
+        with self.assertRaises(ProtectedError):
+            self.order.delete()
+
+
+class RecordOrderPaymentTests(TestCase):
+    def setUp(self):
+        self.staff = _make_staff()
+        self.order = _plain_order(7101, Order.STATUS_DELIVERED)
+
+    def _record(self, **kwargs):
+        kwargs.setdefault("method", "cash")
+        kwargs.setdefault("amount", Decimal("100.00"))
+        kwargs.setdefault("reference", "")
+        return order_payments.record_order_payment(self.order, recorded_by=self.staff, **kwargs)
+
+    def test_records_row_with_cpay_number(self):
+        payment = self._record(reference="  note  ")
+        self.assertRegex(payment.payment_number, r"^CPAY-\d{6,}$")
+        self.assertEqual(
+            (payment.order_id, payment.method, payment.amount, payment.reference, payment.recorded_by_id),
+            (self.order.pk, "cash", Decimal("100.00"), "note", self.staff.pk),
+        )
+        self.assertEqual(payment.payment_date, timezone.localdate())
+
+    def test_numbers_increase(self):
+        first = self._record()
+        second = self._record()
+        self.assertGreater(
+            int(second.payment_number.split("-")[1]), int(first.payment_number.split("-")[1]),
+        )
+
+    def test_reference_rules(self):
+        self._record(method="cash", reference="")
+        for method in ("upi", "card", "netbanking"):
+            with self.subTest(method=method), self.assertRaises(order_payments.OrderPaymentError):
+                self._record(method=method, reference="   ")
+        self._record(method="upi", reference="412345678901")
+        self._record(method="card", reference="SLIP-9")
+        self._record(method="card", reference="123456")
+        self._record(method="netbanking", reference="UTR123")
+
+    def test_card_number_refused_as_reference(self):
+        for reference in ("4111111111111111", "4111 1111 1111 1111", "4111-1111-1111-1111"):
+            with self.subTest(reference=reference), self.assertRaises(order_payments.OrderPaymentError):
+                self._record(method="card", reference=reference)
+
+    def test_reference_longer_than_100_chars_refused(self):
+        with self.assertRaises(order_payments.OrderPaymentError):
+            self._record(reference="r" * 101)
+
+    def test_invalid_amounts_refused(self):
+        for amount in (Decimal("0"), Decimal("-5.00"), Decimal("10.555"), 10.5, "10.00", None):
+            with self.subTest(amount=amount), self.assertRaises(order_payments.OrderPaymentError):
+                self._record(amount=amount)
+        self.assertFalse(OrderPayment.objects.exists())
+
+    def test_non_counter_method_refused(self):
+        with self.assertRaises(order_payments.OrderPaymentError):
+            self._record(method="cod")
+
+
+class OrderPaymentSummaryTests(TestCase):
+    def setUp(self):
+        self.staff = _make_staff()
+
+    def _order(self, number, total="500.00", **extra):
+        order = _plain_order(number, Order.STATUS_DELIVERED, **extra)
+        Order.objects.filter(pk=order.pk).update(total=Decimal(total), subtotal=Decimal(total))
+        order.refresh_from_db()
+        return order
+
+    def _pay(self, order, amount, method="cash", reference=""):
+        order_payments.record_order_payment(
+            order, method=method, amount=Decimal(amount), reference=reference, recorded_by=self.staff,
+        )
+
+    def _summary(self, order):
+        return order_payments.payment_summary(order)
+
+    def test_unpaid_partially_paid_and_paid(self):
+        order = self._order(7201, total="3600.00")
+        summary = self._summary(order)
+        self.assertEqual(
+            (summary["total_paid"], summary["balance_due"], summary["payment_status"]),
+            (Decimal("0.00"), Decimal("3600.00"), "unpaid"),
+        )
+        self._pay(order, "1999.00", "upi", "UTR1")
+        summary = self._summary(order)
+        self.assertEqual(
+            (summary["total_paid"], summary["balance_due"], summary["payment_status"]),
+            (Decimal("1999.00"), Decimal("1601.00"), "partially_paid"),
+        )
+        self._pay(order, "1601.00", "upi", "UTR2")
+        summary = self._summary(order)
+        self.assertEqual(
+            (summary["total_paid"], summary["balance_due"], summary["payment_status"]),
+            (Decimal("3600.00"), Decimal("0.00"), "paid"),
+        )
+
+    def test_overpaid(self):
+        order = self._order(7202, total="100.00")
+        self._pay(order, "150.00")
+        self.assertEqual(self._summary(order)["payment_status"], "overpaid")
+
+    def test_zero_total_with_no_payments_is_paid(self):
+        order = self._order(7203, total="0.00")
+        self.assertEqual(self._summary(order)["payment_status"], "paid")
+
+    def test_online_cod_order_is_unpaid(self):
+        order = self._order(7204, payment_method=Order.PAYMENT_METHOD_COD)
+        self.assertEqual(self._summary(order)["payment_status"], "unpaid")
+
+    def test_refunded_counts_completed_refunds_and_adjustments(self):
+        order = self._order(7205)
+        return_request = Return.objects.create(order=order)
+        Refund.objects.create(return_request=return_request, refund_amount=Decimal("200.00"))
+        completed = Refund.objects.create(
+            return_request=Return.objects.create(order=order), refund_amount=Decimal("120.00"),
+            refund_status=Refund.STATUS_COMPLETED,
+        )
+        RefundAdjustment.objects.create(
+            refund=completed, adjustment_amount=Decimal("-20.00"), reason="fix", approved_by=self.staff,
+        )
+        self.assertEqual(self._summary(order)["refunded"], Decimal("100.00"))
+
+    def test_queryset_annotation_matches_per_order_summary(self):
+        unpaid = self._order(7206)
+        partial = self._order(7207)
+        paid = self._order(7208)
+        self._pay(partial, "100.00")
+        self._pay(paid, "200.00")
+        self._pay(paid, "300.00")
+        rows = {
+            order.pk: (order.total_paid, order.balance_due, order.payment_status)
+            for order in order_payments.annotate_payment_summary(Order.objects.all())
+        }
+        self.assertEqual(rows[unpaid.pk], (Decimal("0.00"), Decimal("500.00"), "unpaid"))
+        self.assertEqual(rows[partial.pk], (Decimal("100.00"), Decimal("400.00"), "partially_paid"))
+        self.assertEqual(rows[paid.pk], (Decimal("500.00"), Decimal("0.00"), "paid"))
+
+
+class InStoreSalePaymentRowTests(TestCase):
+    """The current single-payment in-store sale writes exactly one CPAY row,
+    in the same transaction as the order and the stock movement."""
+
+    def setUp(self):
+        self.staff = _make_staff()
+        self.warehouse = Warehouse.objects.get(is_default=True)
+        self.variant = _make_variant(selling_price="1000.00")
+
+    def _sell(self, quantity=1, **kwargs):
+        kwargs.setdefault("customer_mobile", "9811100001")
+        kwargs.setdefault("payment_method", Order.PAYMENT_METHOD_CASH)
+        return order_services.create_in_store_order(
+            lines=[(self.variant, quantity)], staff_user=self.staff, **kwargs,
+        )
+
+    def test_sale_writes_one_payment_for_the_final_total(self):
+        order = self._sell(2, payment_method=Order.PAYMENT_METHOD_UPI, payment_reference=" UTR77 ",
+                           discount_amount=Decimal("150.00"))
+        payment = order.payments.get()
+        self.assertEqual(
+            (payment.method, payment.amount, payment.reference, payment.recorded_by_id, payment.payment_date),
+            ("upi", Decimal("1850.00"), "UTR77", self.staff.pk, timezone.localdate()),
+        )
+        self.assertEqual((order.payment_method, order.payment_reference), ("upi", "UTR77"))
+        self.assertEqual(order_payments.payment_summary(order)["payment_status"], "paid")
+
+    def test_fully_discounted_sale_has_no_payment_row(self):
+        order = self._sell(1, discount_amount=Decimal("1000.00"))
+        self.assertEqual(order.total, Decimal("0.00"))
+        self.assertFalse(order.payments.exists())
+        self.assertEqual(order_payments.payment_summary(order)["payment_status"], "paid")
+
+    def test_missing_reference_for_upi_creates_nothing(self):
+        stock_before = InventoryStock.objects.get(variant=self.variant, stock_type="retail").quantity
+        with self.assertRaises(order_services.InStoreSaleError):
+            self._sell(1, payment_method=Order.PAYMENT_METHOD_UPI, payment_reference="")
+        self.assertFalse(Order.objects.exists())
+        self.assertFalse(OrderPayment.objects.exists())
+        self.assertFalse(StockMovement.objects.exists())
+        self.assertEqual(
+            InventoryStock.objects.get(variant=self.variant, stock_type="retail").quantity, stock_before,
+        )
+
+    def test_insufficient_stock_creates_no_payment(self):
+        with self.assertRaises(reservation_service.InsufficientStockError):
+            self._sell(1000)
+        self.assertFalse(Order.objects.exists())
+        self.assertFalse(OrderPayment.objects.exists())
+
+    def test_payment_failure_rolls_back_order_and_stock(self):
+        with patch("apps.orders.payments.next_payment_number", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self._sell(1)
+        self.assertFalse(Order.objects.exists())
+        self.assertFalse(StockMovement.objects.exists())
+
+    def test_api_sale_writes_one_payment(self):
+        client = APIClient()
+        client.credentials(**_auth_header(self.staff))
+        resp = client.post(IN_STORE_URL, {
+            "customer_mobile": "9811100010", "items": [{"sku": self.variant.sku, "quantity": 1}],
+            "payment_method": "netbanking", "payment_reference": "UTR123",
+        }, format="json")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(Order.objects.get().payments.get().amount, Decimal("1000.00"))
+
+    def test_api_missing_reference_is_field_error(self):
+        client = APIClient()
+        client.credentials(**_auth_header(self.staff))
+        resp = client.post(IN_STORE_URL, {
+            "customer_mobile": "9811100010", "items": [{"sku": self.variant.sku, "quantity": 1}],
+            "payment_method": "card", "payment_reference": "",
+        }, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("payment_reference", resp.data)
+        self.assertFalse(Order.objects.exists())
+
+    def test_admin_missing_reference_is_field_error(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="payref", email="payref@example.com", password="testpass123",
+        ))
+        resp = self.client.post(ADMIN_IN_STORE_URL, {
+            "customer_mobile": "9811100020", "customer_name": "", "payment_method": "card",
+            "payment_reference": "", "discount_amount": "0", "warehouse": str(self.warehouse.pk),
+            "notes": "", "lines-TOTAL_FORMS": "1", "lines-INITIAL_FORMS": "0",
+            "lines-MIN_NUM_FORMS": "0", "lines-MAX_NUM_FORMS": "50",
+            "lines-0-sku": self.variant.sku, "lines-0-quantity": "1",
+        })
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("payment_reference", resp.context["form"].errors)
+        self.assertFalse(Order.objects.exists())
+
+
+class OrderPaymentAdminTests(AdminQueryCountMixin, TestCase):
+    def setUp(self):
+        self.staff = _make_staff()
+        self.superuser = User.objects.create_superuser(
+            username="payadmin", email="payadmin@example.com", password="testpass123",
+        )
+        self.client.force_login(self.superuser)
+        self.variant = _make_variant()
+
+    def _paid_order(self, i, amount="500.00"):
+        order = _plain_order(7300 + i, Order.STATUS_DELIVERED)
+        OrderItem.objects.create(
+            order=order, variant=self.variant, quantity=1, unit_price=Decimal("500.00"),
+            line_total=Decimal("500.00"),
+        )
+        order_payments.record_order_payment(
+            order, method="upi", amount=Decimal(amount), reference=f"UTR{i}", recorded_by=self.staff,
+        )
+        return order
+
+    def test_order_changelist_with_payments_is_flat(self):
+        self.assertChangelistQueriesFlat(ORDER_CHANGELIST, self._paid_order)
+
+    def test_payment_changelist_is_flat(self):
+        self.assertChangelistQueriesFlat(
+            ORDER_PAYMENT_CHANGELIST, lambda i: self._paid_order(i).payments.get(),
+        )
+
+    def test_order_list_shows_and_filters_payment_status(self):
+        paid = self._paid_order(1)
+        partial = self._paid_order(2, amount="100.00")
+        resp = self.client.get(ORDER_CHANGELIST, {"payment_status": "paid"})
+        self.assertContains(resp, paid.order_number)
+        self.assertNotContains(resp, partial.order_number)
+        resp = self.client.get(ORDER_CHANGELIST, {"payment_status": "partially_paid"})
+        self.assertContains(resp, partial.order_number)
+        self.assertNotContains(resp, paid.order_number)
+
+    def test_order_detail_shows_payments_received(self):
+        order = self._paid_order(3, amount="200.00")
+        order_payments.record_order_payment(
+            order, method="cash", amount=Decimal("300.00"), reference="", recorded_by=self.staff,
+        )
+        numbers = list(order.payments.values_list("payment_number", flat=True))
+        resp = self.client.get(f"/admin/orders/order/{order.pk}/change/")
+        self.assertContains(resp, "Payments received")
+        for header in ("Date", "Applied on", "Payment #", "Reference", "Payment mode", "Amount"):
+            self.assertContains(resp, header)
+        for number in numbers:
+            self.assertContains(resp, number)
+        self.assertContains(resp, "UTR3")
+        self.assertContains(resp, "Total paid")
+        self.assertContains(resp, "Balance due")
+        self.assertContains(resp, "Refunded")
+
+    def test_order_detail_without_payments(self):
+        order = _plain_order(7399, Order.STATUS_PENDING, payment_method=Order.PAYMENT_METHOD_COD)
+        resp = self.client.get(f"/admin/orders/order/{order.pk}/change/")
+        self.assertContains(resp, "No payments recorded.")
+        self.assertContains(resp, "Unpaid")
+
+    def test_payment_admin_is_read_only(self):
+        payment = self._paid_order(4).payments.get()
+        self.assertEqual(self.client.get(ORDER_PAYMENT_CHANGELIST).status_code, 200)
+        self.assertEqual(self.client.get(f"{ORDER_PAYMENT_CHANGELIST}add/").status_code, 403)
+        change_url = f"{ORDER_PAYMENT_CHANGELIST}{payment.pk}/change/"
+        self.assertEqual(self.client.get(change_url).status_code, 200)
+        self.client.post(change_url, {"amount": "1.00", "reference": "x"})
+        self.assertEqual(self.client.get(f"{ORDER_PAYMENT_CHANGELIST}{payment.pk}/delete/").status_code, 403)
+        payment.refresh_from_db()
+        self.assertEqual((payment.amount, payment.reference), (Decimal("500.00"), "UTR4"))
+
+
+class OrderPaymentBackfillMigrationTests(TransactionTestCase):
+    """0014 gives one CPAY row only to unambiguous, paid counter sales."""
+
+    migrate_from = [("orders", "0012_return_receive_permission")]
+    migrate_to = [("orders", "0014_order_payment_backfill")]
+
+    def setUp(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(self.migrate_from)
+        old = executor.loader.project_state(self.migrate_from).apps
+        OldOrder = old.get_model("orders", "Order")
+        self.staff = _make_staff()
+        now = timezone.now()
+
+        def make(number, **fields):
+            fields.setdefault("channel", "in_store")
+            fields.setdefault("status", "delivered")
+            fields.setdefault("payment_method", "cash")
+            fields.setdefault("total", Decimal("500.00"))
+            fields.setdefault("delivered_at", now)
+            return OldOrder.objects.create(
+                user_id=_make_user(mobile=f"+9196{number:08d}", username=f"mig{number}").pk,
+                order_number=f"SMR-MIG-{number:06d}", subtotal=fields["total"],
+                created_by_id=self.staff.pk, **fields,
+            ).pk
+
+        self.later_cash = make(1, delivered_at=now)
+        self.earlier_card = make(2, payment_method="card", payment_reference=" SLIP-1 ",
+                                 delivered_at=now - timedelta(days=2), total=Decimal("300.00"))
+        self.blank_netbanking = make(3, payment_method="netbanking", delivered_at=now - timedelta(days=1))
+        self.excluded = [
+            make(10, channel="online", payment_method="cod"),
+            make(11, channel="online", payment_method="prepaid"),
+            make(12, status="cancelled"),
+            make(13, total=Decimal("0.00")),
+            make(14, delivered_at=None),
+            make(15, payment_method="cod"),
+        ]
+
+    def tearDown(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        MigrationExecutor(connection).migrate(MigrationExecutor(connection).loader.graph.leaf_nodes())
+
+    def _migrate(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(self.migrate_to)
+
+    def test_backfill_only_qualifying_in_store_orders(self):
+        self._migrate()
+        rows = {p.order_id: p for p in OrderPayment.objects.all()}
+        self.assertEqual(set(rows), {self.later_cash, self.earlier_card, self.blank_netbanking})
+        for order_id in self.excluded:
+            self.assertNotIn(order_id, rows)
+
+        card = rows[self.earlier_card]
+        self.assertEqual(
+            (card.payment_number, card.method, card.amount, card.reference, card.recorded_by_id),
+            ("CPAY-000001", "card", Decimal("300.00"), "SLIP-1", self.staff.pk),
+        )
+        self.assertEqual(rows[self.blank_netbanking].payment_number, "CPAY-000002")
+        self.assertEqual(rows[self.blank_netbanking].reference, "")
+        cash = rows[self.later_cash]
+        self.assertEqual((cash.payment_number, cash.amount), ("CPAY-000003", Decimal("500.00")))
+        delivered_at = Order.objects.get(pk=self.later_cash).delivered_at
+        self.assertEqual(cash.payment_date, timezone.localtime(delivered_at).date())
+
+    def test_sequence_continues_after_backfill(self):
+        self._migrate()
+        self.assertEqual(order_payments.next_payment_number(), "CPAY-000004")

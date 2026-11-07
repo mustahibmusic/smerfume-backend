@@ -20,6 +20,7 @@ from unfold.widgets import (
     DATETIME_CLASSES,
     UnfoldAdminDateWidget,
     UnfoldAdminDecimalFieldWidget,
+    UnfoldAdminIntegerFieldWidget,
     UnfoldAdminSelect2Widget,
     UnfoldAdminSelectWidget,
     UnfoldAdminTextareaWidget,
@@ -174,23 +175,54 @@ class ClosePurchaseOrderForm(forms.Form):
     reason = forms.CharField(widget=UnfoldAdminTextareaWidget, label="Reason for closing")
 
 
-class ConfirmBookedQuantityForm(forms.Form):
-    line = forms.ModelChoiceField(queryset=PurchaseOrderLine.objects.none(), label="PO line")
-    quantity = forms.IntegerField(
-        min_value=0,
-        label="Vendor-confirmed total (cumulative)",
-        help_text=(
-            "Total units the vendor has confirmed for this line, including units already "
-            "received. Ordered 10, received 4, vendor confirms the other 6: enter 10."
-        ),
-    )
-    note = forms.CharField(widget=UnfoldAdminTextareaWidget, label="Vendor confirmation note")
+class ConfirmBookedLineForm(forms.Form):
+    """One PO line on the Confirm booked quantity page. original_total is
+    the value the page was loaded with, so a stale page is refused."""
 
-    def __init__(self, *args, po, **kwargs):
+    line = forms.IntegerField(widget=forms.HiddenInput)
+    original_total = forms.IntegerField(min_value=0, widget=forms.HiddenInput)
+    confirmed_total = forms.IntegerField(
+        min_value=0, label="New confirmed total",
+        widget=UnfoldAdminIntegerFieldWidget(attrs={"class": "max-w-24", "data-confirmed-total": ""}),
+    )
+
+
+class _BaseConfirmBookedFormSet(forms.BaseFormSet):
+    """Exactly one row per line of the purchase order, no more, no fewer."""
+
+    def __init__(self, *args, po_lines, **kwargs):
+        self.po_lines = {line.pk: line for line in po_lines}
         super().__init__(*args, **kwargs)
-        self.fields["line"].queryset = po.lines.select_related(
-            "variant__edition__product__brand"
-        )
+
+    def clean(self):
+        super().clean()
+        if any(self.errors):
+            return
+        submitted = [form.cleaned_data["line"] for form in self.forms]
+        if sorted(submitted) != sorted(self.po_lines):
+            raise forms.ValidationError(
+                "The lines on this page no longer match the purchase order. Reload the page."
+            )
+
+    def totals(self):
+        return {form.cleaned_data["line"]: form.cleaned_data["confirmed_total"] for form in self.forms}
+
+    def originals(self):
+        return {form.cleaned_data["line"]: form.cleaned_data["original_total"] for form in self.forms}
+
+
+ConfirmBookedFormSet = forms.formset_factory(
+    ConfirmBookedLineForm, formset=_BaseConfirmBookedFormSet, extra=0, max_num=1000,
+)
+
+
+class ConfirmBookedNoteForm(forms.Form):
+    # Required only when a total changes; the view and the service check that.
+    note = forms.CharField(
+        required=False, widget=UnfoldAdminTextareaWidget(attrs={"rows": 2}),
+        label="Vendor confirmation note",
+        help_text="One note for this save, e.g. who confirmed and how (mail, call, PI number).",
+    )
 
 
 class ReverseGoodsReceiptForm(forms.Form):
@@ -880,43 +912,84 @@ class PurchaseOrderAdmin(ModelAdmin):
         permissions=["confirm_booked"], icon="event_available",
     )
     def confirm_booked(self, request, object_id):
-        """GET shows each line's booking figures and a form; only POST
-        changes the vendor-confirmed total, through the service."""
+        """All lines of the PO in one table. GET changes nothing; POST saves
+        every changed line through one service call, all or nothing, with
+        one shared note. Errors re-render the page with what was typed."""
         po = get_object_or_404(PurchaseOrder, pk=object_id)
-        form = ConfirmBookedQuantityForm(request.POST or None, po=po)
-        if request.method == "POST" and form.is_valid():
-            try:
-                line, _ = po_services.set_confirmed_booked_quantity(
-                    form.cleaned_data["line"], form.cleaned_data["quantity"],
-                    request.user, form.cleaned_data["note"],
-                )
-            except po_services.BookedQuantityError as exc:
-                self.message_user(request, str(exc), level=messages.ERROR)
-            else:
-                self.message_user(
-                    request,
-                    f"{line.variant}: vendor-confirmed total is {line.confirmed_booked_quantity}. "
-                    f"Incoming available to sell: {selectors.format_units(selectors.incoming_sellable(line))}.",
-                    level=messages.SUCCESS,
-                )
-            return redirect(self._change_url(po))
-        lines = list(po.lines.select_related("variant__edition__product__brand"))
+        lines = list(po.lines.select_related("variant__edition__product__brand").order_by("pk"))
+        if request.method == "POST":
+            formset = ConfirmBookedFormSet(request.POST, prefix="lines", po_lines=lines)
+            note_form = ConfirmBookedNoteForm(request.POST)
+            if formset.is_valid() and note_form.is_valid():
+                totals, originals = formset.totals(), formset.originals()
+                changed = [line_id for line_id, total in totals.items() if total != originals[line_id]]
+                note = note_form.cleaned_data["note"].strip()
+                if not changed:
+                    self.message_user(request, "No confirmed totals changed.", level=messages.INFO)
+                    return redirect(self._change_url(po))
+                if not note:
+                    note_form.add_error("note", "A note about the vendor confirmation is required.")
+                else:
+                    try:
+                        changes = po_services.set_confirmed_booked_quantities(
+                            po, totals, request.user, note, expected=originals,
+                        )
+                    except po_services.BookedQuantityBatchError as exc:
+                        for form in formset.forms:
+                            message = exc.errors.get(form.cleaned_data["line"])
+                            if message:
+                                form.add_error("confirmed_total", message)
+                    except po_services.BookedQuantityError as exc:
+                        note_form.add_error(None, str(exc))
+                    else:
+                        self._report_booked_changes(request, po, changes)
+                        return redirect(self._change_url(po))
+        else:
+            formset = ConfirmBookedFormSet(
+                prefix="lines", po_lines=lines,
+                initial=[
+                    {"line": line.pk, "original_total": line.confirmed_booked_quantity,
+                     "confirmed_total": line.confirmed_booked_quantity}
+                    for line in lines
+                ],
+            )
+            note_form = ConfirmBookedNoteForm()
+
         figures = selectors.booking_figures(po, lines)
-        rows = [
-            f"{line.variant} — ordered {line.quantity_ordered}, vendor-confirmed total "
-            f"{line.confirmed_booked_quantity}, received (net retail) "
-            f"{figures[line.pk]['received']}, incoming available to sell "
-            f"{selectors.format_units(figures[line.pk]['incoming'])}"
-            for line in lines
-        ]
-        return self._action_page(
-            request, po, f"Confirm booked quantity for {po.po_number}", form,
-            "Enter the cumulative total the vendor has confirmed for one line, including "
-            "units already received. It is not the remaining quantity. Confirmed units "
-            "not yet received can be sold before they arrive once booked selling is "
-            "switched on. Physical stock is not changed.",
-            "Save confirmed total", "bg-primary-600", rows=rows,
-        )
+        by_id = {line.pk: line for line in lines}
+        rows = []
+        for form in formset.forms:
+            try:
+                line = by_id.get(int(form["line"].value()))
+            except (TypeError, ValueError):
+                line = None
+            figure = figures.get(line.pk) if line else None
+            # Lowest total a change may set: received (net retail) plus units held.
+            minimum = figure["received"] + figure["allocated"] if figure else None
+            rows.append({"form": form, "line": line, "figures": figure, "minimum": minimum})
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Confirm booked quantity for {po.po_number}",
+            "opts": self.model._meta,
+            "po": po,
+            "formset": formset,
+            "note_form": note_form,
+            "rows": rows,
+            "back_url": self._change_url(po),
+        }
+        return TemplateResponse(request, "admin/purchases/confirm_booked.html", context)
+
+    def _report_booked_changes(self, request, po, changes):
+        lines = {line.pk: line for line in po.lines.all()}
+        incoming = selectors.incoming_sellable_amounts([lines[c.purchase_order_line_id] for c in changes])
+        for change in changes:
+            line = lines[change.purchase_order_line_id]
+            self.message_user(
+                request,
+                f"{line.variant}: vendor-confirmed total {change.old_quantity} → {change.new_quantity}, "
+                f"incoming available to sell {selectors.format_units(incoming[line.pk])}.",
+                level=messages.SUCCESS,
+            )
 
     @action(description="Issue", url_path="issue", permissions=["issue"], icon="send")
     def issue_po(self, request, object_id):

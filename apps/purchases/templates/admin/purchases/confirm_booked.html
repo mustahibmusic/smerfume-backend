@@ -1,0 +1,160 @@
+{% extends "admin/base_site.html" %}
+
+{% block breadcrumbs %}{% endblock %}
+
+{% block content %}
+<div class="max-w-6xl">
+    <p class="mb-2 text-sm">
+        Enter the <strong>cumulative</strong> total the vendor has confirmed for each line,
+        including units already received. It is not the remaining quantity:
+        ordered 12, received 4, vendor confirms 6 more &rarr; enter 10, not 6.
+    </p>
+    <p class="mb-6 text-base-500 dark:text-base-400 text-sm">
+        Confirmed units not yet received can be sold before they arrive once booked selling is switched on.
+        Physical stock is not changed. Lines you leave unchanged are not saved. If any line is invalid,
+        nothing is saved.
+    </p>
+
+    <form method="post" id="confirm-booked" novalidate>
+        {% csrf_token %}
+        {{ formset.management_form }}
+
+        {% if formset.non_form_errors or note_form.non_field_errors %}
+            <div class="mb-4" role="alert">
+                {% include "unfold/helpers/form_errors.html" with errors=formset.non_form_errors %}
+                {% include "unfold/helpers/form_errors.html" with errors=note_form.non_field_errors %}
+            </div>
+        {% endif %}
+
+        <div class="flex flex-wrap gap-3 items-center mb-3">
+            <button type="button" data-confirm-all
+                    class="border border-base-200 cursor-pointer dark:border-base-700 focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium px-3 py-2 rounded-default text-sm">
+                Confirm all remaining
+            </button>
+            <button type="button" data-reset
+                    class="border border-base-200 cursor-pointer dark:border-base-700 focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium px-3 py-2 rounded-default text-sm">
+                Reset
+            </button>
+            <label class="flex gap-2 items-center text-sm">
+                <input type="checkbox" data-only-incomplete>
+                Show only incomplete lines
+            </label>
+            <span class="ml-auto text-sm" data-changed-count aria-live="polite">0 lines changed</span>
+        </div>
+
+        <div class="border border-base-200 dark:border-base-700 overflow-x-auto rounded-default">
+            <table class="text-sm w-full">
+                <thead>
+                    <tr class="border-b border-base-200 dark:border-base-700 text-left text-xs uppercase">
+                        <th class="font-semibold px-3 py-2">Item</th>
+                        <th class="font-semibold px-3 py-2 text-right">Ordered</th>
+                        <th class="font-semibold px-3 py-2 text-right">Received</th>
+                        <th class="font-semibold px-3 py-2 text-right">Held for customer orders</th>
+                        <th class="font-semibold px-3 py-2 text-right">Current confirmed</th>
+                        <th class="font-semibold px-3 py-2">New confirmed total</th>
+                        <th class="font-semibold px-3 py-2 text-right">Incoming available after save</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in rows %}
+                        {% with form=row.form line=row.line figures=row.figures %}
+                        <tr data-booked-row class="align-top border-b border-base-200 dark:border-base-700"
+                            {% if line %}data-ordered="{{ line.quantity_ordered }}"
+                            data-received="{{ figures.received }}"
+                            data-held="{{ figures.allocated|floatformat:"-2" }}"
+                            data-original="{{ line.confirmed_booked_quantity }}"{% endif %}>
+                            <td class="px-3 py-2">
+                                {{ form.line }}{{ form.original_total }}
+                                {% if line %}
+                                    <div class="font-medium">{{ line.variant }}</div>
+                                    <div class="text-base-500 dark:text-base-400 text-xs">{{ line.variant.sku }}</div>
+                                {% else %}
+                                    <div>Unknown line</div>
+                                {% endif %}
+                            </td>
+                            <td class="px-3 py-2 text-right">{{ line.quantity_ordered }}</td>
+                            <td class="px-3 py-2 text-right">{{ figures.received }}</td>
+                            <td class="px-3 py-2 text-right">{{ figures.allocated|floatformat:"-2" }}</td>
+                            <td class="px-3 py-2 text-right">{{ line.confirmed_booked_quantity }}</td>
+                            <td class="px-3 py-2">
+                                <label for="{{ form.confirmed_total.id_for_label }}"
+                                       style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap">
+                                    New confirmed total for {{ line.variant }}
+                                </label>
+                                {{ form.confirmed_total }}
+                                <div class="mt-1 text-base-500 dark:text-base-400 text-xs">
+                                    {% if line %}Allowed {{ row.minimum|floatformat:"-2" }} to {{ line.quantity_ordered }}{% endif %}
+                                    <span data-changed-label></span>
+                                </div>
+                                {% include "unfold/helpers/form_errors.html" with errors=form.confirmed_total.errors %}
+                            </td>
+                            <td class="px-3 py-2 text-right" data-incoming>{{ figures.incoming|floatformat:"-2" }}</td>
+                        </tr>
+                        {% endwith %}
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        <div class="max-w-2xl mt-6">
+            {% include "unfold/helpers/field.html" with field=note_form.note %}
+        </div>
+
+        <div class="flex gap-4 mt-4">
+            <button type="submit"
+                    class="bg-primary-600 border border-transparent cursor-pointer focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium hover:bg-primary-700 px-3 py-2 rounded-default text-sm text-white">
+                Save confirmed totals
+            </button>
+            <a href="{{ back_url }}"
+               class="border border-base-200 dark:border-base-700 focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium px-3 py-2 rounded-default text-sm">
+                Go back
+            </a>
+        </div>
+    </form>
+</div>
+
+<script>
+{# Display only: the server re-checks every total. Incoming after save = new total - received - held, never below 0. #}
+(function () {
+    const form = document.getElementById("confirm-booked");
+    const rows = Array.from(form.querySelectorAll("tr[data-booked-row][data-ordered]"));
+    const input = (row) => row.querySelector("[data-confirmed-total]");
+    const number = (value) => parseFloat(value) || 0;
+    const onlyIncomplete = form.querySelector("[data-only-incomplete]");
+
+    function update(row) {
+        const raw = input(row).value.trim();
+        const value = /^\d+$/.test(raw) ? parseInt(raw, 10) : null;
+        const inRange = value !== null && value <= parseInt(row.dataset.ordered, 10);
+        const incoming = !inRange ? null
+            : Math.max(value - number(row.dataset.received) - number(row.dataset.held), 0);
+        row.querySelector("[data-incoming]").textContent = incoming === null ? "—" : incoming;
+        const changed = value !== parseInt(row.dataset.original, 10);
+        row.dataset.changed = changed ? "1" : "";
+        row.style.fontWeight = changed ? "600" : "";
+        row.querySelector("[data-changed-label]").textContent = changed ? "· changed" : "";
+        const complete = !changed && parseInt(row.dataset.original, 10) >= parseInt(row.dataset.ordered, 10);
+        row.hidden = onlyIncomplete.checked && complete;
+    }
+
+    function updateAll() {
+        rows.forEach(update);
+        const count = rows.filter((row) => row.dataset.changed).length;
+        form.querySelector("[data-changed-count]").textContent =
+            `${count} ${count === 1 ? "line" : "lines"} changed`;
+    }
+
+    rows.forEach((row) => input(row).addEventListener("input", updateAll));
+    form.querySelector("[data-confirm-all]").addEventListener("click", () => {
+        rows.forEach((row) => { input(row).value = row.dataset.ordered; });
+        updateAll();
+    });
+    form.querySelector("[data-reset]").addEventListener("click", () => {
+        rows.forEach((row) => { input(row).value = row.dataset.original; });
+        updateAll();
+    });
+    onlyIncomplete.addEventListener("change", updateAll);
+    updateAll();
+})();
+</script>
+{% endblock %}

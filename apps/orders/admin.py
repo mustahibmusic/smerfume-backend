@@ -1,3 +1,5 @@
+import uuid
+
 from django import forms
 from django.contrib import admin
 from django.contrib import messages
@@ -37,7 +39,6 @@ from .models import (
     Order,
     OrderItem,
     OrderPayment,
-    OrderPaymentError,
     Refund,
     RefundAdjustment,
     Return,
@@ -102,16 +103,11 @@ class InStoreSaleForm(forms.Form):
         max_length=150, required=False, widget=UnfoldAdminTextInputWidget,
         help_text="Only used when a new customer is created.",
     )
-    payment_method = forms.ChoiceField(
-        choices=[c for c in Order.PAYMENT_METHOD_CHOICES if c[0] in Order.IN_STORE_PAYMENT_METHODS],
-        widget=UnfoldAdminSelectWidget,
-    )
-    payment_reference = forms.CharField(
-        max_length=100, required=False, widget=UnfoldAdminTextInputWidget,
-        help_text=(
-            "Required for UPI, card and netbanking: UTR or transaction/slip reference. "
-            "Never enter a card number or CVV."
-        ),
+    # One key per opened form: a double-click or resubmit of the same page
+    # returns the order already recorded instead of creating another.
+    submission_key = forms.UUIDField(
+        widget=forms.HiddenInput,
+        error_messages={"required": "This page is out of date. Reload it and enter the sale again."},
     )
     discount_amount = forms.DecimalField(
         max_digits=10, decimal_places=2, min_value=0, initial=0, required=False,
@@ -136,18 +132,6 @@ class InStoreSaleForm(forms.Form):
         except drf_serializers.ValidationError as exc:
             raise forms.ValidationError([str(e) for e in exc.detail]) from exc
 
-    def clean(self):
-        # DEC-013 reference rule under the field; the service checks it again.
-        cleaned = super().clean()
-        method = cleaned.get("payment_method")
-        if method:
-            try:
-                cleaned["payment_reference"] = order_payments.validate_reference(
-                    method, cleaned.get("payment_reference", ""),
-                )
-            except OrderPaymentError as exc:
-                self.add_error("payment_reference", str(exc))
-        return cleaned
 
 
 class InStoreSaleLineForm(forms.Form):
@@ -774,7 +758,9 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
     def new_in_store_sale(self, request):
         """Record a walk-in counter sale through
         order_services.create_in_store_order() — the same service the staff
-        API uses. Any failure re-renders the form and creates nothing."""
+        API uses. Any failure re-renders the form and creates nothing. The
+        sale records no payment (DEC-013): staff then use Record payment on
+        the order page this redirects to."""
         if request.method == "POST":
             form = InStoreSaleForm(request.POST)
             formset = InStoreSaleLineFormSet(request.POST, prefix="lines")
@@ -786,24 +772,27 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
                         customer_mobile=data["customer_mobile"],
                         customer_name=data["customer_name"],
                         lines=lines,
-                        payment_method=data["payment_method"],
-                        payment_reference=data["payment_reference"],
                         discount_amount=data["discount_amount"] or 0,
                         warehouse=data["warehouse"],
                         notes=data["notes"],
                         staff_user=request.user,
+                        submission_key=data["submission_key"],
                     )
+                except order_services.DuplicateInStoreSale as exc:
+                    self.message_user(request, str(exc), level=messages.INFO)
+                    return redirect(reverse("admin:orders_order_change", args=[exc.order.pk]))
                 except (order_services.InStoreSaleError, InsufficientStockError) as exc:
                     form.add_error(None, str(exc))
                 else:
                     self.message_user(
                         request,
-                        f"In-store sale {order.order_number} recorded (total {order.total}).",
+                        f"In-store sale {order.order_number} recorded (total {order.total}). "
+                        "Record the customer's payment with Record payment.",
                         level=messages.SUCCESS,
                     )
                     return redirect(reverse("admin:orders_order_change", args=[order.pk]))
         else:
-            form = InStoreSaleForm()
+            form = InStoreSaleForm(initial={"submission_key": uuid.uuid4()})
             formset = InStoreSaleLineFormSet(prefix="lines")
 
         formset.attach_item_labels()

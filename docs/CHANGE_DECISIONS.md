@@ -482,7 +482,7 @@ Counter sales are routinely paid in more than one part. A single method and refe
 - No change to inventory, refunds, online checkout, supplier payments or the Zoho boundary.
 
 ### Status
-**APPROVED** — payment ledger implemented (`feat/order-payments-ledger`, PR #16). Record Payment on `feat/order-payments-ledger`. Sale without payment not yet implemented.
+**APPROVED** — payment ledger implemented (`feat/order-payments-ledger`, PR #16). Record Payment on `feat/order-payments-ledger` (PR #18). Sale without payment, legacy payment summary and Record sale duplicate-submission protection on `feat/in-store-payment-separation`.
 
 **Amendment (2026-11-07, approved):** in-store sales no longer require exact payment at sale and no longer assume Cash. Payments are recorded separately against the Order with Record Payment. The historical backfill rule (item 10) is unchanged for now.
 

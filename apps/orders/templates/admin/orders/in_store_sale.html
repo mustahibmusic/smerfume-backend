@@ -12,11 +12,13 @@
     <p class="mb-6 text-sm">
         Record a walk-in sale made at the counter. Prices are the current selling prices.
         Stock is deducted immediately and the order is marked delivered.
+        No payment is taken here: record the customer's payment on the order page afterwards.
         In-store orders cannot be returned online.
     </p>
 
     <form method="post" id="in-store-sale" novalidate>
         {% csrf_token %}
+        {{ form.submission_key }}
 
         {% if form.non_field_errors %}
             <div class="mb-6" role="alert">
@@ -24,13 +26,11 @@
             </div>
         {% endif %}
 
-        <h2 class="font-semibold mb-4">Customer &amp; payment</h2>
+        <h2 class="font-semibold mb-4">Customer</h2>
         <div class="grid gap-4 grid-cols-1 md:grid-cols-3">
             <div>{% include "unfold/helpers/field.html" with field=form.customer_mobile %}</div>
             <div>{% include "unfold/helpers/field.html" with field=form.customer_name %}</div>
             <div>{% include "unfold/helpers/field.html" with field=form.warehouse %}</div>
-            <div>{% include "unfold/helpers/field.html" with field=form.payment_method %}</div>
-            <div>{% include "unfold/helpers/field.html" with field=form.payment_reference %}</div>
             <div>{% include "unfold/helpers/field.html" with field=form.discount_amount %}</div>
             <div class="md:col-span-3">{% include "unfold/helpers/field.html" with field=form.notes %}</div>
         </div>
@@ -82,7 +82,7 @@
         </div>
 
         <div class="flex gap-4 mt-6">
-            <button type="submit"
+            <button type="submit" data-record-sale
                     class="bg-primary-600 border border-transparent cursor-pointer focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium hover:bg-primary-700 px-3 py-2 rounded-default text-sm text-white">
                 Record sale
             </button>
@@ -285,5 +285,13 @@
     liveRows().forEach(initRow);
     refreshStock();
 })();
+</script>
+<script>
+{# Blocks a double-click; the submission key is what stops a second order on the server. #}
+document.getElementById("in-store-sale").addEventListener("submit", function (event) {
+    const button = event.target.querySelector("[data-record-sale]");
+    if (button.disabled) { event.preventDefault(); return; }
+    button.disabled = true;
+});
 </script>
 {% endblock %}

@@ -2060,11 +2060,29 @@ class SetConfirmedBookedQuantityTests(_BookingBase):
         self.assertEqual(StockMovement.objects.count(), movements)
 
 
+def _booked_post_data(lines, totals, note="Vendor confirmed by mail", originals=None):
+    """POST data for the multi-line Confirm booked quantity page."""
+    data = {
+        "lines-TOTAL_FORMS": str(len(lines)), "lines-INITIAL_FORMS": str(len(lines)),
+        "lines-MIN_NUM_FORMS": "0", "lines-MAX_NUM_FORMS": "1000", "note": note,
+    }
+    for index, line in enumerate(lines):
+        data[f"lines-{index}-line"] = str(line.pk)
+        data[f"lines-{index}-original_total"] = str((originals or {}).get(line.pk, line.confirmed_booked_quantity))
+        data[f"lines-{index}-confirmed_total"] = str(totals.get(line.pk, line.confirmed_booked_quantity))
+    return data
+
+
 class BookedQuantityAdminTests(_BookingBase):
     def setUp(self):
         super().setUp()
         self.client.force_login(self.user)
         self.url = reverse("admin:purchases_purchaseorder_confirm_booked", args=[self.po.pk])
+
+    def _post_booked(self, totals, **kwargs):
+        follow = kwargs.pop("follow", True)
+        lines = kwargs.pop("lines", None) or list(self.po.lines.order_by("pk"))
+        return self.client.post(self.url, _booked_post_data(lines, totals, **kwargs), follow=follow)
 
     def test_get_shows_cumulative_explanation_and_changes_nothing(self):
         response = self.client.get(self.url)
@@ -2077,19 +2095,13 @@ class BookedQuantityAdminTests(_BookingBase):
 
     def test_post_sets_quantity_and_reports_incoming_available(self):
         self._receive(retail=4)
-        response = self.client.post(
-            self.url,
-            {"line": self.po_line.pk, "quantity": 10, "note": "Vendor confirmed rest"},
-            follow=True,
-        )
+        response = self._post_booked({self.po_line.pk: 10}, note="Vendor confirmed rest")
         self.po_line.refresh_from_db()
         self.assertEqual(self.po_line.confirmed_booked_quantity, 10)
-        self.assertContains(response, "Incoming available to sell: 6")
+        self.assertContains(response, "incoming available to sell 6")
 
     def test_post_error_is_shown_and_nothing_changes(self):
-        response = self.client.post(
-            self.url, {"line": self.po_line.pk, "quantity": 11, "note": "x"}, follow=True,
-        )
+        response = self._post_booked({self.po_line.pk: 11}, note="x")
         self.assertContains(response, "between 0 and the ordered quantity")
         self.assertEqual(BookedQuantityChange.objects.count(), 0)
 
@@ -2097,7 +2109,7 @@ class BookedQuantityAdminTests(_BookingBase):
         staff = User.objects.create_user(username="nobook", password="x", is_staff=True)
         staff.user_permissions.add(Permission.objects.get(codename="view_purchaseorder"))
         self.client.force_login(staff)
-        self.client.post(self.url, {"line": self.po_line.pk, "quantity": 3, "note": "x"})
+        self._post_booked({self.po_line.pk: 3}, note="x", follow=False)
         self.po_line.refresh_from_db()
         self.assertEqual(self.po_line.confirmed_booked_quantity, 0)
 
@@ -2129,6 +2141,216 @@ class BookedQuantityAdminTests(_BookingBase):
             self.client.get(reverse("admin:purchases_bookedquantitychange_changelist")).status_code,
             200,
         )
+
+
+class _MultiLineBookingBase(_BookingBase):
+    """Issued PO with three lines: self.po_line (10 ordered) plus 12 and 5."""
+
+    def setUp(self):
+        super().setUp()
+        self.line_b = self._line(self.po, variant=_variant("SKU-PO-50ML"), quantity_ordered=12,
+                                 tax_rate=Decimal("18"))
+        self.line_c = self._line(self.po, variant=_variant("SKU-PO-30ML"), quantity_ordered=5,
+                                 tax_rate=Decimal("18"))
+
+
+class SetConfirmedBookedQuantitiesTests(_MultiLineBookingBase):
+    def _set(self, quantities, note="Vendor confirmed by mail", expected=None):
+        return services.set_confirmed_booked_quantities(
+            self.po, quantities, self.user, note, expected=expected,
+        )
+
+    def _totals(self):
+        return list(self.po.lines.order_by("pk").values_list("confirmed_booked_quantity", flat=True))
+
+    def test_saves_changed_lines_with_one_shared_note(self):
+        changes = self._set({self.po_line.pk: 6, self.line_b.pk: 12, self.line_c.pk: 0})
+        self.assertEqual(self._totals(), [6, 12, 0])
+        self.assertEqual(
+            sorted((c.purchase_order_line_id, c.old_quantity, c.new_quantity, c.note) for c in changes),
+            sorted([(self.po_line.pk, 0, 6, "Vendor confirmed by mail"),
+                    (self.line_b.pk, 0, 12, "Vendor confirmed by mail")]),
+        )
+        self.assertEqual(BookedQuantityChange.objects.count(), 2)
+
+    def test_nothing_changed_writes_nothing_and_needs_no_note(self):
+        self.assertEqual(self._set({self.po_line.pk: 0, self.line_b.pk: 0}, note=""), [])
+        self.assertEqual(BookedQuantityChange.objects.count(), 0)
+
+    def test_note_required_when_anything_changes(self):
+        with self.assertRaises(services.BookedQuantityError):
+            self._set({self.po_line.pk: 3}, note="  ")
+        self.assertEqual(self._totals(), [0, 0, 0])
+
+    def test_one_invalid_row_saves_none_and_reports_every_bad_row(self):
+        with self.assertRaises(services.BookedQuantityBatchError) as caught:
+            self._set({self.po_line.pk: 4, self.line_b.pk: 13, self.line_c.pk: -1})
+        self.assertEqual(set(caught.exception.errors), {self.line_b.pk, self.line_c.pk})
+        self.assertIn("between 0 and the ordered quantity (12)", caught.exception.errors[self.line_b.pk])
+        self.assertEqual(self._totals(), [0, 0, 0])
+        self.assertEqual(BookedQuantityChange.objects.count(), 0)
+
+    def test_changed_total_cannot_go_below_received(self):
+        self._receive(retail=4)
+        with self.assertRaises(services.BookedQuantityBatchError) as caught:
+            self._set({self.po_line.pk: 3})
+        self.assertIn("cannot go below 4", caught.exception.errors[self.po_line.pk])
+        self._set({self.po_line.pk: 4})
+        self.assertEqual(self._totals()[0], 4)
+
+    def test_unchanged_row_below_received_is_not_blocked(self):
+        # Received without ever being confirmed: confirmed 0 < received 4.
+        self._receive(retail=4)
+        self._set({self.po_line.pk: 0, self.line_b.pk: 5})
+        self.assertEqual(self._totals(), [0, 5, 0])
+
+    def test_damaged_units_do_not_raise_the_floor(self):
+        self._receive(retail=2, damaged=3)
+        self._set({self.po_line.pk: 2})
+        self.assertEqual(self._totals()[0], 2)
+
+    def test_cannot_go_below_received_plus_held_for_customers(self):
+        self._receive(retail=4)
+        self._set({self.po_line.pk: 10})
+        self._incoming_allocation(3)
+        with self.assertRaises(services.BookedQuantityBatchError):
+            self._set({self.po_line.pk: 6})
+        self._set({self.po_line.pk: 7})
+        self.assertEqual(self._totals()[0], 7)
+
+    def test_whole_numbers_only(self):
+        for value in (2.5, "3", True, None):
+            with self.subTest(value=value), self.assertRaises(services.BookedQuantityBatchError):
+                self._set({self.po_line.pk: value})
+
+    def test_line_from_another_po_refused(self):
+        other_po = self._po()
+        other_line = self._line(other_po)
+        services.issue_purchase_order(other_po, self.user)
+        with self.assertRaises(services.BookedQuantityError):
+            self._set({self.po_line.pk: 3, other_line.pk: 3})
+        self.assertEqual(BookedQuantityChange.objects.count(), 0)
+
+    def test_non_bookable_po_refused(self):
+        PurchaseOrder.objects.filter(pk=self.po.pk).update(status=PurchaseOrder.STATUS_CLOSED)
+        with self.assertRaises(services.BookedQuantityError):
+            self._set({self.po_line.pk: 3})
+
+    def test_changed_by_someone_else_refuses_whole_save(self):
+        self._book(5)  # another user saved 5 after this page loaded 0
+        with self.assertRaises(services.BookedQuantityError) as caught:
+            self._set({self.po_line.pk: 8, self.line_b.pk: 3},
+                      expected={self.po_line.pk: 0, self.line_b.pk: 0})
+        self.assertIn("changed", str(caught.exception))
+        self.assertEqual(self._totals(), [5, 0, 0])
+
+    def test_does_not_touch_inventory(self):
+        self._physical(2)
+        before = list(InventoryStock.objects.values_list("quantity", "quantity_reserved"))
+        movements = StockMovement.objects.count()
+        self._set({self.po_line.pk: 5, self.line_b.pk: 12})
+        self.assertEqual(list(InventoryStock.objects.values_list("quantity", "quantity_reserved")), before)
+        self.assertEqual(StockMovement.objects.count(), movements)
+
+    def test_single_line_service_applies_the_received_floor(self):
+        self._receive(retail=4)
+        with self.assertRaises(services.BookedQuantityError):
+            services.set_confirmed_booked_quantity(self.po_line, 3, self.user, "Vendor cut")
+
+
+class BookedQuantityMultiLineAdminTests(_MultiLineBookingBase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.user)
+        self.url = reverse("admin:purchases_purchaseorder_confirm_booked", args=[self.po.pk])
+        self.lines = list(self.po.lines.order_by("pk"))
+
+    def _post_booked(self, totals, **kwargs):
+        return self.client.post(self.url, _booked_post_data(self.lines, totals, **kwargs))
+
+    def test_get_shows_every_line_in_one_table(self):
+        self._receive(retail=4)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        for line in self.lines:
+            self.assertContains(response, line.variant.sku)
+        self.assertContains(response, 'name="lines-2-confirmed_total"')
+        self.assertNotContains(response, 'name="lines-3-confirmed_total"')
+        for text in ("Ordered", "Received", "Held for customer orders", "Current confirmed",
+                     "New confirmed total", "Incoming available after save",
+                     "Confirm all remaining", "Reset", "Show only incomplete lines",
+                     "enter 10, not 6"):
+            self.assertContains(response, text)
+
+    def test_post_saves_several_lines_at_once(self):
+        response = self._post_booked({self.lines[0].pk: 10, self.lines[1].pk: 6, self.lines[2].pk: 5},
+                              note="Mail from vendor 7 Nov")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            list(self.po.lines.order_by("pk").values_list("confirmed_booked_quantity", flat=True)),
+            [10, 6, 5],
+        )
+        self.assertEqual(
+            set(BookedQuantityChange.objects.values_list("note", flat=True)), {"Mail from vendor 7 Nov"},
+        )
+        self.assertEqual(BookedQuantityChange.objects.count(), 3)
+
+    def test_unchanged_rows_write_no_history(self):
+        self._post_booked({self.lines[1].pk: 6})
+        self.assertEqual(
+            list(BookedQuantityChange.objects.values_list("purchase_order_line_id", flat=True)),
+            [self.lines[1].pk],
+        )
+
+    def test_invalid_row_shows_error_under_row_keeps_values_saves_nothing(self):
+        response = self._post_booked({self.lines[0].pk: 7, self.lines[1].pk: 13})
+        self.assertEqual(response.status_code, 200)
+        formset = response.context["formset"]
+        self.assertFalse(formset.forms[0].errors)
+        self.assertIn("confirmed_total", formset.forms[1].errors)
+        self.assertContains(response, 'value="13"')
+        self.assertContains(response, 'value="7"')
+        self.assertEqual(BookedQuantityChange.objects.count(), 0)
+
+    def test_missing_note_is_a_field_error(self):
+        response = self._post_booked({self.lines[0].pk: 3}, note="")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("note", response.context["note_form"].errors)
+        self.assertEqual(BookedQuantityChange.objects.count(), 0)
+
+    def test_no_changes_saves_nothing(self):
+        response = self.client.post(self.url, _booked_post_data(self.lines, {}, note=""), follow=True)
+        self.assertContains(response, "No confirmed totals changed")
+        self.assertEqual(BookedQuantityChange.objects.count(), 0)
+
+    def test_tampered_line_set_refused(self):
+        other_po = self._po()
+        other_line = self._line(other_po)
+        data = _booked_post_data(self.lines[:2] + [other_line], {other_line.pk: 3})
+        response = self.client.post(self.url, data)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.context["formset"].non_form_errors())
+        self.assertEqual(BookedQuantityChange.objects.count(), 0)
+
+    def test_stale_page_refused(self):
+        self._book(4)
+        response = self._post_booked({self.lines[0].pk: 8}, originals={self.lines[0].pk: 0})
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "changed")
+        self.po_line.refresh_from_db()
+        self.assertEqual(self.po_line.confirmed_booked_quantity, 4)
+
+    def test_page_query_count_does_not_grow_with_lines(self):
+        def count():
+            with CaptureQueriesContext(connection) as ctx:
+                self.client.get(self.url)
+            return len(ctx.captured_queries)
+
+        before = count()
+        for index in range(4):
+            self._line(self.po, variant=_variant(f"SKU-PO-EXTRA-{index}"), quantity_ordered=3,
+                       tax_rate=Decimal("18"))
+        self.assertEqual(count(), before)
 
 
 class BookingQueryCountTests(_BookingBase):

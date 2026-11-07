@@ -650,56 +650,128 @@ class BookedQuantityError(Exception):
     """Raised when a booked quantity change is not allowed."""
 
 
-@transaction.atomic
-def set_confirmed_booked_quantity(line, quantity, performed_by, note):
-    """Set the cumulative vendor-confirmed total for a PO line and append
-    one BookedQuantityChange. The total includes units already received;
-    it is not the remaining quantity. Returns (line, change); change is
-    None when the value is unchanged.
+class BookedQuantityBatchError(BookedQuantityError):
+    """One or more lines of a batch are invalid. `errors` maps line id to
+    the message for that line; nothing was saved."""
 
-    Lowering is refused while the remaining booking would no longer cover
-    the active incoming allocations of customer orders: those must be
-    reallocated or released first."""
-    note = (note or "").strip()
+    def __init__(self, errors):
+        self.errors = errors
+        super().__init__(" ".join(errors.values()))
+
+
+def _booked_quantity_problem(line, quantity, received, held):
+    """Why `quantity` cannot become this line's vendor-confirmed total, or
+    None. received = net retail received; held = units held by active
+    incoming allocations (customer orders waiting for this line)."""
     if isinstance(quantity, bool) or not isinstance(quantity, int):
-        raise BookedQuantityError("Booked quantity must be a whole number.")
+        return "Booked quantity must be a whole number."
+    if quantity < 0 or quantity > line.quantity_ordered:
+        return f"Booked quantity must be between 0 and the ordered quantity ({line.quantity_ordered})."
+    if held and quantity - received < held:
+        return (
+            f"Customer orders are waiting for {selectors.format_units(held)} unit(s) of "
+            f"this line. With {received} already received, the confirmed total cannot go "
+            f"below {selectors.format_units(received + held)}. Reallocate or cancel "
+            "those orders first."
+        )
+    if quantity < received:
+        return (
+            f"{received} unit(s) of this line are already received, so the confirmed total "
+            f"cannot go below {received}."
+        )
+    return None
 
-    po = _lock(line.purchase_order)
-    line = PurchaseOrderLine.objects.select_for_update().get(pk=line.pk)
+
+@transaction.atomic
+def set_confirmed_booked_quantities(po, quantities, performed_by, note, expected=None):
+    """Set the cumulative vendor-confirmed totals of several lines of one PO
+    in one transaction, all or nothing. quantities: {line_id: total};
+    expected: optional {line_id: total the caller last saw}, so a page that
+    is out of date is refused instead of overwriting someone else's change.
+
+    A changed total must stay between what is already received (net retail)
+    plus what customer orders hold, and the ordered quantity. Unchanged lines
+    write nothing. Each changed line gets one BookedQuantityChange with the
+    shared note. Physical stock is never touched. Returns the changes.
+
+    Lock order: the PO, then its lines by id (as the rest of this module)."""
+    note = (note or "").strip()
+    po = _lock(po)
     if po.status not in PurchaseOrder.BOOKABLE_STATUSES:
         raise BookedQuantityError(
             f"{po.po_number} is {po.get_status_display()}. Booked quantities can be set "
             "only on issued or partially received purchase orders."
         )
-    if quantity < 0 or quantity > line.quantity_ordered:
+    line_ids = sorted(quantities)
+    lines = {
+        line.pk: line
+        for line in PurchaseOrderLine.objects.select_for_update(of=("self",))
+        .filter(purchase_order=po, pk__in=line_ids).order_by("pk")
+    }
+    if set(lines) != set(line_ids):
+        raise BookedQuantityError(f"Some lines do not belong to {po.po_number}.")
+    stale = [
+        line_id for line_id, seen in (expected or {}).items()
+        if line_id in lines and lines[line_id].confirmed_booked_quantity != seen
+    ]
+    if stale:
         raise BookedQuantityError(
-            f"Booked quantity must be between 0 and the ordered quantity ({line.quantity_ordered})."
+            "Vendor-confirmed totals were changed by someone else after this page was opened. "
+            "Reload the page and enter the totals again."
         )
-    if quantity == line.confirmed_booked_quantity:
-        return line, None
+
+    errors = {
+        line_id: "Booked quantity must be a whole number."
+        for line_id in line_ids
+        if isinstance(quantities[line_id], bool) or not isinstance(quantities[line_id], int)
+    }
+    if errors:
+        raise BookedQuantityBatchError(errors)
+    changed = [line_id for line_id in line_ids if quantities[line_id] != lines[line_id].confirmed_booked_quantity]
+    if not changed:
+        return []
     if not note:
         raise BookedQuantityError("A note about the vendor confirmation is required.")
 
-    received = selectors.received_quantities([line.pk], stock_type="retail").get(line.pk, 0)
-    allocated = selectors.active_incoming_allocated_quantities([line.pk]).get(line.pk, 0)
-    if max(quantity - received, 0) < allocated:
-        raise BookedQuantityError(
-            f"Customer orders are waiting for {selectors.format_units(allocated)} unit(s) of "
-            f"this line. With {received} already received, the confirmed total cannot go "
-            f"below {selectors.format_units(received + allocated)}. Reallocate or cancel "
-            "those orders first."
+    received = selectors.received_quantities(changed, stock_type="retail")
+    held = selectors.active_incoming_allocated_quantities(changed)
+    for line_id in changed:
+        problem = _booked_quantity_problem(
+            lines[line_id], quantities[line_id], received.get(line_id, 0), held.get(line_id, 0),
         )
+        if problem:
+            errors[line_id] = problem
+    if errors:
+        raise BookedQuantityBatchError(errors)
 
-    change = BookedQuantityChange.objects.create(
-        purchase_order_line=line,
-        old_quantity=line.confirmed_booked_quantity,
-        new_quantity=quantity,
-        note=note,
-        performed_by=performed_by,
-    )
-    line.confirmed_booked_quantity = quantity
-    line.save(update_fields=["confirmed_booked_quantity", "updated_at"])
-    return line, change
+    changes = []
+    for line_id in changed:
+        line = lines[line_id]
+        changes.append(BookedQuantityChange.objects.create(
+            purchase_order_line=line,
+            old_quantity=line.confirmed_booked_quantity,
+            new_quantity=quantities[line_id],
+            note=note,
+            performed_by=performed_by,
+        ))
+        line.confirmed_booked_quantity = quantities[line_id]
+        line.save(update_fields=["confirmed_booked_quantity", "updated_at"])
+    return changes
+
+
+def set_confirmed_booked_quantity(line, quantity, performed_by, note):
+    """Set the cumulative vendor-confirmed total for one PO line (see
+    set_confirmed_booked_quantities). The total includes units already
+    received; it is not the remaining quantity. Returns (line, change);
+    change is None when the value is unchanged."""
+    try:
+        changes = set_confirmed_booked_quantities(
+            line.purchase_order, {line.pk: quantity}, performed_by, note,
+        )
+    except BookedQuantityBatchError as exc:
+        raise BookedQuantityError(exc.errors[line.pk]) from exc
+    line.refresh_from_db()
+    return line, (changes[0] if changes else None)
 
 
 # --- DEC-010: purchase tax treatment classification and supplier payments ---

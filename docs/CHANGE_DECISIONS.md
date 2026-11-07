@@ -322,6 +322,14 @@ orders.
 ### Status
 **APPROVED** — design approved; implementation pending (P2A → P2B → P2C).
 
+### Amendment (2026-11-07, approved)
+Staff confirm booked quantities for all lines of a purchase order on one page, with one shared
+vendor confirmation note; all changed lines save together or none do, and each changed line
+keeps its own history entry. A **changed** confirmed total can no longer be set below the units
+already received for that line (net retail; damaged units do not count), in addition to the
+existing rule that it cannot drop below received plus units held for customer orders. Unchanged
+lines are never blocked, even if an older value is below what was received.
+
 ### Date
 2026-09-26
 

@@ -520,6 +520,7 @@ class OrderPayment(BaseModel):
         help_text="Transaction/slip reference. Never enter a card number or CVV.",
     )
     payment_date = models.DateField(help_text="Date the money was received.")
+    notes = models.TextField(max_length=1000, blank=True, default="")
     recorded_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
     )

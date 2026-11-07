@@ -23,6 +23,7 @@ __all__ = [
 
 ZERO = Decimal("0.00")
 REFERENCE_MAX_LENGTH = 100
+NOTES_MAX_LENGTH = 1000
 
 STATUS_UNPAID = "unpaid"
 STATUS_PARTIALLY_PAID = "partially_paid"
@@ -95,14 +96,30 @@ def next_payment_number():
 
 
 @transaction.atomic
-def record_order_payment(order, *, method, amount, reference, recorded_by, payment_date=None):
-    """Record one customer payment against `order`. Locks the order row so
-    payments for one order are serialised."""
+def record_order_payment(order, *, method, amount, reference, recorded_by, payment_date=None, notes=""):
+    """Record one customer payment against `order` (DEC-013 Record Payment).
+
+    The order row is locked, then the paid total is recalculated from the
+    payment rows: that locked balance is authoritative, so concurrent or
+    repeated submissions can never take the paid total above Order.total.
+    A cancelled order cannot receive a payment; the date cannot be in the
+    future. No draft payments: a row is either saved or nothing is."""
     amount, reference = validate_payment_input(method, amount, reference)
+    notes = (notes or "").strip()
+    if len(notes) > NOTES_MAX_LENGTH:
+        raise OrderPaymentError(f"Notes can be at most {NOTES_MAX_LENGTH} characters.")
     payment_date = payment_date or timezone.localdate()
     if payment_date > timezone.localdate():
         raise OrderPaymentError("The payment date cannot be in the future.")
     order = Order.objects.select_for_update().get(pk=order.pk)
+    if order.status == Order.STATUS_CANCELLED:
+        raise OrderPaymentError(f"{order.order_number} is cancelled and cannot receive payments.")
+    paid = order.payments.aggregate(total=Sum("amount"))["total"] or ZERO
+    balance_due = order.total - paid
+    if balance_due <= 0:
+        raise OrderPaymentError(f"{order.order_number} is fully paid: nothing left to pay.")
+    if amount > balance_due:
+        raise OrderPaymentError(f"The amount is more than the balance due (₹{balance_due}).")
     return OrderPayment.objects.create(
         order=order,
         payment_number=next_payment_number(),
@@ -110,6 +127,7 @@ def record_order_payment(order, *, method, amount, reference, recorded_by, payme
         amount=amount,
         reference=reference,
         payment_date=payment_date,
+        notes=notes,
         recorded_by=recorded_by,
     )
 

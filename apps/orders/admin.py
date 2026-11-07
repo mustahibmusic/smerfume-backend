@@ -18,6 +18,7 @@ from unfold.admin import ModelAdmin
 from unfold.decorators import action
 from unfold.widgets import (
     UnfoldAdminDecimalFieldWidget,
+    UnfoldAdminSingleDateWidget,
     UnfoldAdminIntegerFieldWidget,
     UnfoldAdminSelect2Widget,
     UnfoldAdminSelectWidget,
@@ -283,6 +284,59 @@ class StaffReturnForm(forms.Form):
         return cleaned
 
 
+class RecordPaymentForm(forms.Form):
+    """DEC-013 Record Payment. Field checks here are for clear messages; the
+    payment service re-checks everything with the order locked."""
+
+    amount = forms.DecimalField(
+        max_digits=10, decimal_places=2, label="Amount received (₹)",
+        widget=UnfoldAdminDecimalFieldWidget,
+        help_text="Defaults to the balance due. Enter less for a part payment.",
+    )
+    payment_date = forms.DateField(label="Payment date", widget=UnfoldAdminSingleDateWidget)
+    method = forms.ChoiceField(
+        label="Payment mode", choices=[("", "Choose payment mode")] + OrderPayment.METHOD_CHOICES,
+        widget=UnfoldAdminSelectWidget,
+    )
+    reference = forms.CharField(
+        required=False, max_length=order_payments.REFERENCE_MAX_LENGTH, label="Reference",
+        widget=UnfoldAdminTextInputWidget,
+        help_text=(
+            "Optional for cash. Required for UPI, card and net banking: UTR, slip or "
+            "transaction number. Never enter a card number or CVV."
+        ),
+    )
+    notes = forms.CharField(
+        required=False, max_length=order_payments.NOTES_MAX_LENGTH, label="Notes",
+        widget=UnfoldAdminTextareaWidget(attrs={"rows": 3}),
+    )
+    # Balance due when the page was opened: an out-of-date page is sent back
+    # for review. A convenience only; the locked recalculation decides.
+    expected_balance = forms.DecimalField(max_digits=12, decimal_places=2, widget=forms.HiddenInput)
+
+    def clean_amount(self):
+        amount = self.cleaned_data["amount"]
+        if amount <= 0:
+            raise forms.ValidationError("The amount must be greater than zero.")
+        return amount
+
+    def clean_payment_date(self):
+        payment_date = self.cleaned_data["payment_date"]
+        if payment_date > timezone.localdate():
+            raise forms.ValidationError("The payment date cannot be in the future.")
+        return payment_date
+
+    def clean(self):
+        cleaned = super().clean()
+        method = cleaned.get("method")
+        if method:
+            try:
+                cleaned["reference"] = order_payments.validate_reference(method, cleaned.get("reference"))
+            except order_payments.OrderPaymentError as exc:
+                self.add_error("reference", str(exc))
+        return cleaned
+
+
 class StaffActionMixin:
     """Shared helpers for state-changing admin actions: a confirmation step
     for bulk actions, the confirmed-action page for detail actions, and an
@@ -431,7 +485,7 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
     # tracking number per order, which a bulk action cannot.
     actions = ["verify_cod_orders", "pack_orders", "mark_delivered", "cancel_orders"]
     actions_list = ["new_in_store_sale"]
-    actions_detail = ["ship_order", "create_return"]
+    actions_detail = ["record_payment", "ship_order", "create_return"]
 
     def has_add_permission(self, request):
         # The generic add form would create an Order with no items,
@@ -522,29 +576,30 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
         rows = [
             (
                 payment.payment_date.strftime("%d/%m/%Y"),
-                timezone.localtime(payment.created_at).strftime("%d/%m/%Y"),
                 payment.payment_number,
-                payment.reference or "—",
                 payment.get_method_display(),
+                payment.reference or "—",
                 payment.amount,
+                payment.recorded_by or "—",
             )
-            for payment in obj.payments.all()
+            for payment in obj.payments.select_related("recorded_by")
         ]
         summary = order_payments.payment_summary(obj)
         cell = '<td class="px-3 py-2">{}</td>'
         table = format_html(
             '<table class="text-sm w-full"><thead><tr class="text-left">'
-            '<th class="px-3 py-2">Date</th><th class="px-3 py-2">Applied on</th>'
-            '<th class="px-3 py-2">Payment #</th><th class="px-3 py-2">Reference</th>'
-            '<th class="px-3 py-2">Payment mode</th><th class="px-3 py-2 text-right">Amount (₹)</th>'
+            '<th class="px-3 py-2">Date</th><th class="px-3 py-2">Payment #</th>'
+            '<th class="px-3 py-2">Payment mode</th><th class="px-3 py-2">Reference</th>'
+            '<th class="px-3 py-2 text-right">Amount (₹)</th><th class="px-3 py-2">Recorded by</th>'
             "</tr></thead><tbody>{}</tbody></table>",
             format_html_join(
-                "", "<tr>" + cell * 5 + '<td class="px-3 py-2 text-right">{}</td></tr>', rows,
+                "", "<tr>" + cell * 4 + '<td class="px-3 py-2 text-right">{}</td>' + cell + "</tr>", rows,
             ) if rows else format_html('<tr><td class="px-3 py-2" colspan="6">{}</td></tr>', "No payments recorded."),
         )
         totals = format_html_join(
             "", '<div class="flex justify-between py-1"><dt>{}</dt><dd>{}</dd></div>',
             (
+                ("Order total", f"₹{obj.total}"),
                 ("Total paid", f"₹{summary['total_paid']}"),
                 ("Balance due", f"₹{summary['balance_due']}"),
                 ("Refunded", f"₹{summary['refunded']}"),
@@ -780,6 +835,17 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
     def has_cancel_order_permission(self, request):
         return self._has_orders_perm(request, "cancel_order")
 
+    def has_record_payment_permission(self, request, object_id=None):
+        # Hidden when nothing is left to pay or the order is cancelled;
+        # record_order_payment() refuses both again under the order lock.
+        if not self._has_orders_perm(request, "add_orderpayment"):
+            return False
+        if object_id is None:
+            return True
+        return order_payments.annotate_payment_summary(
+            Order.objects.filter(pk=object_id).exclude(status=Order.STATUS_CANCELLED)
+        ).filter(balance_due__gt=0).exists()
+
     def has_ship_order_permission(self, request, object_id=None):
         if not self._has_orders_perm(request, "ship_order"):
             return False
@@ -906,6 +972,66 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
             "Create return", change_url,
         )
 
+    @action(
+        description="Record payment", url_path="record-payment", permissions=["record_payment"],
+        icon="payments",
+    )
+    def record_payment(self, request, object_id):
+        """DEC-013 Record Payment: one customer payment per save, through
+        order_payments.record_order_payment(). GET changes nothing."""
+        order = get_object_or_404(Order.objects.select_related("user"), pk=object_id)
+        change_url = reverse("admin:orders_order_change", args=[order.pk])
+        summary = order_payments.payment_summary(order)
+        if request.method == "POST":
+            form = RecordPaymentForm(request.POST)
+            if form.is_valid():
+                data = form.cleaned_data
+                if data["expected_balance"] != summary["balance_due"]:
+                    fresh = request.POST.copy()
+                    fresh["expected_balance"] = str(summary["balance_due"])
+                    form = RecordPaymentForm(fresh)
+                    form.is_valid()
+                    form.add_error(
+                        None,
+                        "Payments changed since this page was opened. Check the balance due "
+                        "and save again.",
+                    )
+                else:
+                    try:
+                        payment = order_payments.record_order_payment(
+                            order, method=data["method"], amount=data["amount"],
+                            reference=data["reference"], payment_date=data["payment_date"],
+                            notes=data["notes"], recorded_by=request.user,
+                        )
+                    except order_payments.OrderPaymentError as exc:
+                        form.add_error(None, str(exc))
+                    else:
+                        balance = order_payments.payment_summary(order)["balance_due"]
+                        self._record(request, order, f"Recorded payment {payment.payment_number} ({payment.amount}).")
+                        self.message_user(
+                            request,
+                            f"{payment.payment_number} recorded: ₹{payment.amount}. Balance due ₹{balance}.",
+                            level=messages.SUCCESS,
+                        )
+                        return redirect(change_url)
+        else:
+            form = RecordPaymentForm(initial={
+                "amount": summary["balance_due"],
+                "expected_balance": summary["balance_due"],
+                "payment_date": timezone.localdate(),
+            })
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Record payment for {order.order_number}",
+            "opts": self.model._meta,
+            "order": order,
+            "summary": summary,
+            "status_label": _PAYMENT_STATUS_LABELS[summary["payment_status"]],
+            "form": form,
+            "back_url": change_url,
+        }
+        return TemplateResponse(request, "admin/orders/record_payment.html", context)
+
     @action(description="Ship order", url_path="ship", permissions=["ship_order"], icon="local_shipping")
     def ship_order(self, request, object_id):
         """GET shows the tracking-number form; only a valid POST ships the
@@ -954,7 +1080,8 @@ class ReturnItemInline(admin.TabularInline):
 @admin.register(OrderPayment)
 class OrderPaymentAdmin(ModelAdmin):
     """DEC-013 customer payments: view only, for everyone including
-    superusers. Rows are recorded by the sale flow, never here."""
+    superusers. Rows are recorded by the sale flow or the order's Record
+    payment action, never here."""
 
     list_display = (
         "payment_number", "order", "payment_date", "method", "reference", "amount", "recorded_by", "created_at",
@@ -964,8 +1091,8 @@ class OrderPaymentAdmin(ModelAdmin):
     list_select_related = ("order", "recorded_by")
     date_hierarchy = "payment_date"
     readonly_fields = (
-        "payment_number", "order", "method", "amount", "reference", "payment_date", "recorded_by",
-        "created_at",
+        "payment_number", "order", "method", "amount", "reference", "payment_date", "notes",
+        "recorded_by", "created_at",
     )
     fields = readonly_fields
 

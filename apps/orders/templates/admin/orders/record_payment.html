@@ -1,0 +1,73 @@
+{% extends "admin/base_site.html" %}
+
+{% block breadcrumbs %}{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl">
+    <dl class="border border-base-200 dark:border-base-700 grid grid-cols-2 gap-4 mb-6 p-4 rounded-default text-sm md:grid-cols-5">
+        <div>
+            <dt class="text-base-500 dark:text-base-400 text-xs">Customer</dt>
+            <dd class="font-medium">{{ order.user|default:"—" }}</dd>
+        </div>
+        <div>
+            <dt class="text-base-500 dark:text-base-400 text-xs">Payment #</dt>
+            <dd class="font-medium">Assigned on save</dd>
+        </div>
+        <div>
+            <dt class="text-base-500 dark:text-base-400 text-xs">Order total</dt>
+            <dd class="font-medium">₹{{ order.total }}</dd>
+        </div>
+        <div>
+            <dt class="text-base-500 dark:text-base-400 text-xs">Total paid</dt>
+            <dd class="font-medium">₹{{ summary.total_paid }}</dd>
+        </div>
+        <div>
+            <dt class="text-base-500 dark:text-base-400 text-xs">Balance due</dt>
+            <dd class="font-medium">₹{{ summary.balance_due }} <span class="text-base-500 dark:text-base-400 text-xs">({{ status_label }})</span></dd>
+        </div>
+    </dl>
+
+    <form method="post" id="record-payment" novalidate>
+        {% csrf_token %}
+        {{ form.expected_balance }}
+
+        {% if form.non_field_errors %}
+            <div class="mb-4" role="alert">
+                {% include "unfold/helpers/form_errors.html" with errors=form.non_field_errors %}
+            </div>
+        {% endif %}
+
+        <div class="grid gap-x-8 md:grid-cols-2">
+            <div>
+                {% include "unfold/helpers/field.html" with field=form.amount %}
+                {% include "unfold/helpers/field.html" with field=form.payment_date %}
+                {% include "unfold/helpers/field.html" with field=form.reference %}
+            </div>
+            <div>
+                {% include "unfold/helpers/field.html" with field=form.method %}
+                {% include "unfold/helpers/field.html" with field=form.notes %}
+            </div>
+        </div>
+
+        <div class="flex gap-4 mt-4">
+            <button type="submit" data-save-payment
+                    class="bg-primary-600 border border-transparent cursor-pointer focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium hover:bg-primary-700 px-3 py-2 rounded-default text-sm text-white">
+                Save payment
+            </button>
+            <a href="{{ back_url }}"
+               class="border border-base-200 dark:border-base-700 focus:outline-2 focus:outline-offset-2 focus:outline-primary-600 font-medium px-3 py-2 rounded-default text-sm">
+                Cancel
+            </a>
+        </div>
+    </form>
+</div>
+
+<script>
+{# Stops a double-click sending two saves; the server lock is what prevents overpayment. #}
+document.getElementById("record-payment").addEventListener("submit", function (event) {
+    const button = event.target.querySelector("[data-save-payment]");
+    if (button.disabled) { event.preventDefault(); return; }
+    button.disabled = true;
+});
+</script>
+{% endblock %}

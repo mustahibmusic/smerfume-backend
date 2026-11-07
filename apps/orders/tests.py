@@ -4946,6 +4946,48 @@ class RecordOrderPaymentTests(TestCase):
         with self.assertRaises(order_payments.OrderPaymentError):
             self._record(method="cod")
 
+    def test_amount_up_to_balance_due(self):
+        self._record(amount=Decimal("300.00"))
+        with self.assertRaisesMessage(order_payments.OrderPaymentError, "balance due"):
+            self._record(amount=Decimal("200.01"))
+        self._record(amount=Decimal("200.00"))
+        self.assertEqual(order_payments.payment_summary(self.order)["payment_status"], "paid")
+
+    def test_no_payment_when_balance_due_is_zero(self):
+        self._record(amount=Decimal("500.00"))
+        with self.assertRaisesMessage(order_payments.OrderPaymentError, "nothing left to pay"):
+            self._record(amount=Decimal("0.01"))
+        self.assertEqual(self.order.payments.count(), 1)
+
+    def test_balance_is_read_under_lock_not_from_stale_order(self):
+        stale = Order.objects.get(pk=self.order.pk)
+        self._record(amount=Decimal("400.00"))
+        with self.assertRaises(order_payments.OrderPaymentError):
+            order_payments.record_order_payment(
+                stale, method="cash", amount=Decimal("200.00"), reference="", recorded_by=self.staff,
+            )
+        self.assertEqual(order_payments.payment_summary(self.order)["total_paid"], Decimal("400.00"))
+
+    def test_cancelled_order_refused(self):
+        Order.objects.filter(pk=self.order.pk).update(status=Order.STATUS_CANCELLED)
+        with self.assertRaisesMessage(order_payments.OrderPaymentError, "cancelled"):
+            self._record()
+        self.assertFalse(OrderPayment.objects.exists())
+
+    def test_future_date_refused_today_allowed(self):
+        today = timezone.localdate()
+        with self.assertRaises(order_payments.OrderPaymentError):
+            self._record(payment_date=today + timedelta(days=1))
+        self.assertEqual(self._record(payment_date=today).payment_date, today)
+        past = today - timedelta(days=3)
+        self.assertEqual(self._record(payment_date=past).payment_date, past)
+
+    def test_notes_stored_and_capped(self):
+        self.assertEqual(self._record(notes="  paid at counter  ").notes, "paid at counter")
+        self.assertEqual(self._record().notes, "")
+        with self.assertRaises(order_payments.OrderPaymentError):
+            self._record(notes="n" * 1001)
+
 
 class OrderPaymentSummaryTests(TestCase):
     def setUp(self):
@@ -4986,8 +5028,10 @@ class OrderPaymentSummaryTests(TestCase):
         )
 
     def test_overpaid(self):
+        # The service refuses overpayment; only rows written outside it
+        # (legacy maintenance) can produce this status.
         order = self._order(7202, total="100.00")
-        self._pay(order, "150.00")
+        _payment_row(order, "CPAY-990001", amount=Decimal("150.00"))
         self.assertEqual(self._summary(order)["payment_status"], "overpaid")
 
     def test_zero_total_with_no_payments_is_paid(self):
@@ -5167,8 +5211,10 @@ class OrderPaymentAdminTests(AdminQueryCountMixin, TestCase):
         numbers = list(order.payments.values_list("payment_number", flat=True))
         resp = self.client.get(f"/admin/orders/order/{order.pk}/change/")
         self.assertContains(resp, "Payments received")
-        for header in ("Date", "Applied on", "Payment #", "Reference", "Payment mode", "Amount"):
+        for header in ("Date", "Payment #", "Payment mode", "Reference", "Amount", "Recorded by"):
             self.assertContains(resp, header)
+        self.assertNotContains(resp, "Applied on")
+        self.assertContains(resp, "Order total")
         for number in numbers:
             self.assertContains(resp, number)
         self.assertContains(resp, "UTR3")
@@ -5192,6 +5238,115 @@ class OrderPaymentAdminTests(AdminQueryCountMixin, TestCase):
         self.assertEqual(self.client.get(f"{ORDER_PAYMENT_CHANGELIST}{payment.pk}/delete/").status_code, 403)
         payment.refresh_from_db()
         self.assertEqual((payment.amount, payment.reference), (Decimal("500.00"), "UTR4"))
+
+
+class RecordPaymentAdminTests(TestCase):
+    PERMS = ("view_order", "add_orderpayment")
+
+    def setUp(self):
+        self.staff = _admin_staff("cashier", *self.PERMS)
+        self.client.force_login(self.staff)
+        self.order = _plain_order(7501, Order.STATUS_DELIVERED, channel=Order.CHANNEL_IN_STORE)
+        self.url = reverse("admin:orders_order_record_payment", args=[self.order.pk])
+        self.change_url = reverse("admin:orders_order_change", args=[self.order.pk])
+
+    def _data(self, **overrides):
+        data = {
+            "amount": "500.00", "payment_date": timezone.localdate().isoformat(), "method": "cash",
+            "reference": "", "notes": "", "expected_balance": "500.00",
+        }
+        data.update(overrides)
+        return data
+
+    def _pay(self, amount):
+        order_payments.record_order_payment(
+            self.order, method="cash", amount=Decimal(amount), reference="", recorded_by=self.staff,
+        )
+
+    def test_change_page_shows_summary_and_action(self):
+        resp = self.client.get(self.change_url)
+        for text in ("Order total", "Total paid", "Balance due", "Payment status", "Unpaid"):
+            self.assertContains(resp, text)
+        self.assertContains(resp, self.url)
+
+    def test_get_defaults_amount_to_balance_due(self):
+        self._pay("120.00")
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, self.order.order_number)
+        self.assertContains(resp, "Assigned on save")
+        form = resp.context["form"]
+        self.assertEqual(form["amount"].value(), Decimal("380.00"))
+        self.assertEqual(form["expected_balance"].value(), Decimal("380.00"))
+        self.assertIn(form["method"].value(), (None, ""))
+        for hidden in ("TDS", "PAN", "Bank charges", "Payment Received On"):
+            self.assertNotContains(resp, hidden)
+
+    def test_post_records_payment(self):
+        resp = self.client.post(self.url, self._data(
+            amount="200.00", method="upi", reference="UTR77", notes="part payment",
+        ))
+        self.assertRedirects(resp, self.change_url, fetch_redirect_response=False)
+        payment = self.order.payments.get()
+        self.assertEqual(
+            (payment.amount, payment.method, payment.reference, payment.notes, payment.recorded_by),
+            (Decimal("200.00"), "upi", "UTR77", "part payment", self.staff),
+        )
+        summary = order_payments.payment_summary(self.order)
+        self.assertEqual((summary["balance_due"], summary["payment_status"]), (Decimal("300.00"), "partially_paid"))
+
+    def _refused(self, data, message):
+        resp = self.client.post(self.url, data)
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, message)
+        self.assertFalse(self.order.payments.exists())
+
+    def test_amount_above_balance_refused(self):
+        self._refused(self._data(amount="500.01"), "balance due")
+
+    def test_zero_amount_refused(self):
+        self._refused(self._data(amount="0"), "greater than zero")
+
+    def test_method_required_no_default(self):
+        self._refused(self._data(method=""), "This field is required")
+
+    def test_reference_required_for_upi(self):
+        self._refused(self._data(method="upi", reference=" "), "reference")
+
+    def test_card_number_refused(self):
+        self._refused(self._data(method="card", reference="4111111111111111"), "not the card number")
+
+    def test_future_date_refused(self):
+        tomorrow = (timezone.localdate() + timedelta(days=1)).isoformat()
+        self._refused(self._data(payment_date=tomorrow), "future")
+
+    def test_notes_over_1000_refused(self):
+        self._refused(self._data(notes="n" * 1001), "1000")
+
+    def test_stale_page_refused(self):
+        self._pay("100.00")
+        resp = self.client.post(self.url, self._data(amount="50.00"))
+        self.assertContains(resp, "Payments changed since this page was opened")
+        self.assertEqual(self.order.payments.count(), 1)
+
+    def test_paid_order_hides_and_refuses(self):
+        self._pay("500.00")
+        self.assertNotContains(self.client.get(self.change_url), self.url)
+        self.assertEqual(self.client.get(self.url).status_code, 403)
+        self.client.post(self.url, self._data(amount="1.00", expected_balance="0.00"))
+        self.assertEqual(self.order.payments.count(), 1)
+
+    def test_cancelled_order_hides_and_refuses(self):
+        Order.objects.filter(pk=self.order.pk).update(status=Order.STATUS_CANCELLED)
+        self.assertNotContains(self.client.get(self.change_url), self.url)
+        self.assertEqual(self.client.post(self.url, self._data()).status_code, 403)
+        self.assertFalse(self.order.payments.exists())
+
+    def test_requires_add_orderpayment_permission(self):
+        self.client.force_login(_admin_staff("viewer", "view_order"))
+        self.assertNotContains(self.client.get(self.change_url), self.url)
+        self.assertEqual(self.client.post(self.url, self._data()).status_code, 403)
+        self.assertFalse(self.order.payments.exists())
 
 
 class OrderPaymentBackfillMigrationTests(TransactionTestCase):
@@ -5246,10 +5401,13 @@ class OrderPaymentBackfillMigrationTests(TransactionTestCase):
         executor = MigrationExecutor(connection)
         executor.loader.build_graph()
         executor.migrate(self.migrate_to)
+        executor.loader.build_graph()
+        return executor.loader.project_state(self.migrate_to).apps
 
     def test_backfill_only_qualifying_in_store_orders(self):
-        self._migrate()
-        rows = {p.order_id: p for p in OrderPayment.objects.all()}
+        # Historical model: later migrations add columns that do not exist yet.
+        payment_model = self._migrate().get_model("orders", "OrderPayment")
+        rows = {p.order_id: p for p in payment_model.objects.all()}
         self.assertEqual(set(rows), {self.later_cash, self.earlier_card, self.blank_netbanking})
         for order_id in self.excluded:
             self.assertNotIn(order_id, rows)

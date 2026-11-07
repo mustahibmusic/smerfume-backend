@@ -5342,6 +5342,40 @@ class RecordPaymentAdminTests(TestCase):
         self.assertEqual(self.client.post(self.url, self._data()).status_code, 403)
         self.assertFalse(self.order.payments.exists())
 
+    def test_in_store_order_with_balance_allowed(self):
+        self.assertContains(self.client.get(self.change_url), self.url)
+        self.assertEqual(self.client.get(self.url).status_code, 200)
+
+    def _assert_refused(self, order):
+        url = reverse("admin:orders_order_record_payment", args=[order.pk])
+        change_url = reverse("admin:orders_order_change", args=[order.pk])
+        self.assertNotContains(self.client.get(change_url), url)
+        self.assertEqual(self.client.get(url).status_code, 403)
+        resp = self.client.post(url, self._data())
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(order.payments.exists())
+
+    def test_online_order_with_balance_refused(self):
+        self._assert_refused(_plain_order(
+            7502, Order.STATUS_DELIVERED, channel=Order.CHANNEL_ONLINE,
+            payment_method=Order.PAYMENT_METHOD_PREPAID,
+        ))
+
+    def test_cod_order_with_balance_refused(self):
+        self._assert_refused(_plain_order(
+            7503, Order.STATUS_DELIVERED, channel=Order.CHANNEL_ONLINE,
+            payment_method=Order.PAYMENT_METHOD_COD,
+        ))
+
+    def test_direct_url_bypass_refused_for_superuser_too(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="rpsuper", email="rpsuper@example.com", password="testpass123",
+        ))
+        self._assert_refused(_plain_order(
+            7504, Order.STATUS_PENDING, channel=Order.CHANNEL_ONLINE,
+            payment_method=Order.PAYMENT_METHOD_COD,
+        ))
+
     def test_requires_add_orderpayment_permission(self):
         self.client.force_login(_admin_staff("viewer", "view_order"))
         self.assertNotContains(self.client.get(self.change_url), self.url)

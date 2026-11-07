@@ -836,14 +836,18 @@ class OrderAdmin(StaffActionMixin, ModelAdmin):
         return self._has_orders_perm(request, "cancel_order")
 
     def has_record_payment_permission(self, request, object_id=None):
+        # Manual Record Payment is for in-store orders only (OrderPayment
+        # itself is channel-neutral; online gateway/COD capture is deferred).
         # Hidden when nothing is left to pay or the order is cancelled;
         # record_order_payment() refuses both again under the order lock.
+        # Unfold checks this on the button and on direct GET/POST access.
         if not self._has_orders_perm(request, "add_orderpayment"):
             return False
         if object_id is None:
             return True
         return order_payments.annotate_payment_summary(
-            Order.objects.filter(pk=object_id).exclude(status=Order.STATUS_CANCELLED)
+            Order.objects.filter(pk=object_id, channel=Order.CHANNEL_IN_STORE)
+            .exclude(status=Order.STATUS_CANCELLED)
         ).filter(balance_due__gt=0).exists()
 
     def has_ship_order_permission(self, request, object_id=None):

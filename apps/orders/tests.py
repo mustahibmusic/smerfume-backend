@@ -533,7 +533,7 @@ class CheckoutInputLimitTests(TestCase):
         from apps.orders.serializers import InStoreSaleSerializer
 
         serializer = InStoreSaleSerializer(data={
-            "customer_mobile": "9876543210", "payment_method": "cash",
+            "customer_mobile": "9876543210",
             "items": [{"sku": self.variant.sku, "quantity": 1}], "notes": "n" * 1001,
         })
         self.assertFalse(serializer.is_valid())
@@ -3167,19 +3167,17 @@ class InStoreSaleServiceTests(TestCase):
 
     def _sell(self, lines, **kwargs):
         kwargs.setdefault("customer_mobile", "9811100001")
-        kwargs.setdefault("payment_method", Order.PAYMENT_METHOD_CASH)
         return order_services.create_in_store_order(lines=lines, staff_user=self.staff, **kwargs)
 
     def test_creates_delivered_in_store_order_without_shipping(self):
-        order = self._sell([(self.variant, 2)], payment_method=Order.PAYMENT_METHOD_UPI,
-                           payment_reference=" 4123 ", notes="counter")
+        order = self._sell([(self.variant, 2)], notes="counter")
 
         order.refresh_from_db()
         self.assertEqual(order.channel, Order.CHANNEL_IN_STORE)
         self.assertEqual(order.status, Order.STATUS_DELIVERED)
         self.assertIsNotNone(order.delivered_at)
         self.assertEqual(order.created_by, self.staff)
-        self.assertEqual((order.payment_method, order.payment_reference), ("upi", "4123"))
+        self.assertEqual((order.payment_method, order.payment_reference), ("", ""))
         self.assertEqual(order.customer_notes, "counter")
         self.assertTrue(order.order_number.startswith("SMR-"))
         self.assertEqual((order.subtotal, order.total), (Decimal("2000.00"), Decimal("2000.00")))
@@ -3254,7 +3252,6 @@ class InStoreSaleServiceTests(TestCase):
         cases = [
             dict(lines=[(self.variant, 1)], discount_amount=Decimal("1000.01")),
             dict(lines=[(self.variant, 1)], discount_amount=Decimal("-1")),
-            dict(lines=[(self.variant, 1)], payment_method=Order.PAYMENT_METHOD_COD),
             dict(lines=[(self.variant, 0)]),
             dict(lines=[]),
             dict(lines=[(inactive, 1)]),
@@ -3300,8 +3297,6 @@ class InStoreSaleAPITests(TestCase):
             "customer_mobile": "9811100010",
             "customer_name": "Ravi",
             "items": [{"sku": self.variant.sku, "quantity": 2}],
-            "payment_method": "netbanking",
-            "payment_reference": "UTR123",
             "discount_amount": "100.00",
         }
 
@@ -3316,7 +3311,7 @@ class InStoreSaleAPITests(TestCase):
         self.assertEqual(resp.status_code, 201, resp.data)
         self.assertEqual(resp.data["channel"], "in_store")
         self.assertEqual(resp.data["status"], "delivered")
-        self.assertEqual(resp.data["payment_method"], "netbanking")
+        self.assertEqual(resp.data["payment_method"], "")
         self.assertEqual(resp.data["total"], "1900.00")
         self.assertIsNone(resp.data["shipping_address"])
         order = Order.objects.get(order_number=resp.data["order_number"])
@@ -3338,15 +3333,25 @@ class InStoreSaleAPITests(TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertIn("NOPE-1", str(resp.data))
 
-    def test_payment_method_validation(self):
-        for method in ("cod", "prepaid", "cheque"):
-            with self.subTest(method=method):
-                resp = self._post({**self.payload, "payment_method": method}, user=self.staff)
+    def test_payment_fields_refused(self):
+        # Payments are recorded separately against the order (DEC-013).
+        for extra in ({"payment_method": "cash"}, {"payment_reference": "UTR1"}):
+            with self.subTest(extra=extra):
+                resp = self._post({**self.payload, **extra}, user=self.staff)
                 self.assertEqual(resp.status_code, 400)
-        for method in ("cash", "upi", "card", "netbanking"):
-            with self.subTest(method=method):
-                resp = self._post({**self.payload, "payment_method": method}, user=self.staff)
-                self.assertEqual(resp.status_code, 201)
+                self.assertIn(next(iter(extra)), resp.data)
+        self.assertFalse(Order.objects.exists())
+
+    def test_same_submission_key_returns_existing_order(self):
+        payload = {**self.payload, "submission_key": str(uuid.uuid4())}
+        first = self._post(payload, user=self.staff)
+        self.assertEqual(first.status_code, 201, first.data)
+        stock = InventoryStock.objects.get(variant=self.variant, stock_type="retail").quantity
+        second = self._post(payload, user=self.staff)
+        self.assertEqual(second.status_code, 200, second.data)
+        self.assertEqual(second.data["order_number"], first.data["order_number"])
+        self.assertEqual(Order.objects.count(), 1)
+        self.assertEqual(InventoryStock.objects.get(variant=self.variant, stock_type="retail").quantity, stock)
 
     def test_invalid_mobile_and_empty_items_return_400(self):
         self.assertEqual(self._post({**self.payload, "customer_mobile": "12ab"}, user=self.staff).status_code, 400)
@@ -3402,8 +3407,7 @@ class InStoreSaleAdminTests(TestCase):
         data = {
             "customer_mobile": "9811100020",
             "customer_name": "",
-            "payment_method": "card",
-            "payment_reference": "SLIP-9",
+            "submission_key": str(uuid.uuid4()),
             "discount_amount": "0",
             "warehouse": str(self.warehouse.pk),
             "notes": "",
@@ -3438,7 +3442,8 @@ class InStoreSaleAdminTests(TestCase):
         order = Order.objects.get()
         self.assertRedirects(resp, f"/admin/orders/order/{order.pk}/change/", fetch_redirect_response=False)
         self.assertEqual((order.channel, order.status, order.payment_method, order.created_by),
-                         ("in_store", "delivered", "card", self.admin_user))
+                         ("in_store", "delivered", "", self.admin_user))
+        self.assertFalse(order.payments.exists())
         self.assertEqual(order.items.get().quantity, 2)
 
     def test_stock_error_rerenders_form_and_creates_nothing(self):
@@ -3639,7 +3644,7 @@ class CheckoutBookedIncomingTests(TestCase):
             with self.assertRaises(reservation_service.InsufficientStockError):
                 order_services.create_in_store_order(
                     lines=[(self.variant, 1)], staff_user=staff,
-                    customer_mobile="9811100099", payment_method=Order.PAYMENT_METHOD_CASH,
+                    customer_mobile="9811100099",
                 )
         self.assertFalse(self._incoming_rows().exists())
 
@@ -4403,7 +4408,6 @@ class InStoreAvailableTests(TestCase):
         source, decant = _make_decant_pair(source_size_ml=100, decant_volume_ml=10, source_retail_quantity=5)
         order_services.create_in_store_order(
             lines=[(decant, 2)], staff_user=self.staff, customer_mobile="9811100901",
-            payment_method=Order.PAYMENT_METHOD_CASH,
         )
         # 4 sealed bottles (400ml) + 80ml left in the opened one = 48 decants.
         self.assertEqual(in_store_available([decant.pk, source.pk], self.warehouse), {decant.pk: 48, source.pk: 4})
@@ -4415,11 +4419,9 @@ class InStoreAvailableTests(TestCase):
         with self.assertRaises(reservation_service.InsufficientStockError):
             order_services.create_in_store_order(
                 lines=[(decant, available + 1)], staff_user=self.staff, customer_mobile="9811100902",
-                payment_method=Order.PAYMENT_METHOD_CASH,
             )
         order_services.create_in_store_order(
             lines=[(decant, available)], staff_user=self.staff, customer_mobile="9811100903",
-            payment_method=Order.PAYMENT_METHOD_CASH,
         )
 
     def test_fixed_query_count(self):
@@ -4603,8 +4605,8 @@ class InStoreLineFormsetTests(TestCase):
     def _post(self, rows, **overrides):
         """rows: list of (sku, quantity, deleted)."""
         data = {
-            "customer_mobile": "9811100777", "customer_name": "", "payment_method": "cash",
-            "payment_reference": "", "discount_amount": "0", "warehouse": str(self.warehouse.pk), "notes": "",
+            "customer_mobile": "9811100777", "customer_name": "", "submission_key": str(uuid.uuid4()),
+            "discount_amount": "0", "warehouse": str(self.warehouse.pk), "notes": "",
             "lines-TOTAL_FORMS": str(len(rows)), "lines-INITIAL_FORMS": "0",
             "lines-MIN_NUM_FORMS": "0", "lines-MAX_NUM_FORMS": "50",
         }
@@ -5071,9 +5073,9 @@ class OrderPaymentSummaryTests(TestCase):
         self.assertEqual(rows[paid.pk], (Decimal("500.00"), Decimal("0.00"), "paid"))
 
 
-class InStoreSalePaymentRowTests(TestCase):
-    """The current single-payment in-store sale writes exactly one CPAY row,
-    in the same transaction as the order and the stock movement."""
+class InStoreSalePaymentSeparationTests(TestCase):
+    """DEC-013 amendment: a sale records no payment and assumes no method;
+    payments are recorded afterwards with Record payment."""
 
     def setUp(self):
         self.staff = _make_staff()
@@ -5082,86 +5084,137 @@ class InStoreSalePaymentRowTests(TestCase):
 
     def _sell(self, quantity=1, **kwargs):
         kwargs.setdefault("customer_mobile", "9811100001")
-        kwargs.setdefault("payment_method", Order.PAYMENT_METHOD_CASH)
         return order_services.create_in_store_order(
             lines=[(self.variant, quantity)], staff_user=self.staff, **kwargs,
         )
 
-    def test_sale_writes_one_payment_for_the_final_total(self):
-        order = self._sell(2, payment_method=Order.PAYMENT_METHOD_UPI, payment_reference=" UTR77 ",
-                           discount_amount=Decimal("150.00"))
-        payment = order.payments.get()
+    def _retail(self):
+        return InventoryStock.objects.get(variant=self.variant, stock_type="retail").quantity
+
+    def test_sale_creates_no_payment_and_is_unpaid(self):
+        order = self._sell(2, discount_amount=Decimal("150.00"))
+        order.refresh_from_db()
+        self.assertFalse(OrderPayment.objects.exists())
+        self.assertEqual((order.payment_method, order.payment_reference), ("", ""))
+        summary = order_payments.payment_summary(order)
         self.assertEqual(
-            (payment.method, payment.amount, payment.reference, payment.recorded_by_id, payment.payment_date),
-            ("upi", Decimal("1850.00"), "UTR77", self.staff.pk, timezone.localdate()),
+            (summary["total_paid"], summary["balance_due"], summary["payment_status"]),
+            (Decimal("0.00"), Decimal("1850.00"), "unpaid"),
         )
+        self.assertEqual(order.status, Order.STATUS_DELIVERED)
+
+    def test_payment_arguments_no_longer_accepted(self):
+        with self.assertRaises(TypeError):
+            self._sell(1, payment_method=Order.PAYMENT_METHOD_CASH)
+        self.assertFalse(Order.objects.exists())
+
+    def test_stock_consumed_once(self):
+        before = self._retail()
+        order = self._sell(2)
+        self.assertEqual(self._retail(), before - 2)
+        self.assertEqual(StockMovement.objects.filter(source_order_item__order=order).count(), 1)
+
+    def test_same_submission_key_creates_one_order_and_one_deduction(self):
+        key = uuid.uuid4()
+        before = self._retail()
+        order = self._sell(1, submission_key=key)
+        with self.assertRaises(order_services.DuplicateInStoreSale) as ctx:
+            self._sell(1, submission_key=key)
+        self.assertEqual(ctx.exception.order, order)
+        self.assertEqual(Order.objects.count(), 1)
+        self.assertEqual(self._retail(), before - 1)
+        self.assertEqual(StockMovement.objects.count(), 1)
+
+    def test_different_keys_are_separate_sales(self):
+        self._sell(1, submission_key=uuid.uuid4())
+        self._sell(1, submission_key=uuid.uuid4())
+        self.assertEqual(Order.objects.count(), 2)
+
+    def test_legacy_summary_mirrors_one_payment_then_split(self):
+        order = self._sell(2)
+        order_payments.record_order_payment(
+            order, method="upi", amount=Decimal("1500.00"), reference=" UTR77 ", recorded_by=self.staff,
+        )
+        order.refresh_from_db()
         self.assertEqual((order.payment_method, order.payment_reference), ("upi", "UTR77"))
-        self.assertEqual(order_payments.payment_summary(order)["payment_status"], "paid")
-
-    def test_fully_discounted_sale_has_no_payment_row(self):
-        order = self._sell(1, discount_amount=Decimal("1000.00"))
-        self.assertEqual(order.total, Decimal("0.00"))
-        self.assertFalse(order.payments.exists())
-        self.assertEqual(order_payments.payment_summary(order)["payment_status"], "paid")
-
-    def test_missing_reference_for_upi_creates_nothing(self):
-        stock_before = InventoryStock.objects.get(variant=self.variant, stock_type="retail").quantity
-        with self.assertRaises(order_services.InStoreSaleError):
-            self._sell(1, payment_method=Order.PAYMENT_METHOD_UPI, payment_reference="")
-        self.assertFalse(Order.objects.exists())
-        self.assertFalse(OrderPayment.objects.exists())
-        self.assertFalse(StockMovement.objects.exists())
-        self.assertEqual(
-            InventoryStock.objects.get(variant=self.variant, stock_type="retail").quantity, stock_before,
+        order_payments.record_order_payment(
+            order, method="cash", amount=Decimal("500.00"), reference="", recorded_by=self.staff,
         )
+        order.refresh_from_db()
+        self.assertEqual((order.payment_method, order.payment_reference), (Order.PAYMENT_METHOD_SPLIT, ""))
+        self.assertEqual(order_payments.payment_summary(order)["payment_status"], "paid")
 
-    def test_insufficient_stock_creates_no_payment(self):
-        with self.assertRaises(reservation_service.InsufficientStockError):
-            self._sell(1000)
-        self.assertFalse(Order.objects.exists())
-        self.assertFalse(OrderPayment.objects.exists())
+    def test_legacy_summary_not_touched_for_online_orders(self):
+        order = _plain_order(7601, Order.STATUS_DELIVERED, payment_method=Order.PAYMENT_METHOD_COD)
+        order_payments.record_order_payment(
+            order, method="cash", amount=Decimal("100.00"), reference="", recorded_by=self.staff,
+        )
+        order.refresh_from_db()
+        self.assertEqual(order.payment_method, Order.PAYMENT_METHOD_COD)
 
-    def test_payment_failure_rolls_back_order_and_stock(self):
-        with patch("apps.orders.payments.next_payment_number", side_effect=RuntimeError("boom")):
-            with self.assertRaises(RuntimeError):
-                self._sell(1)
-        self.assertFalse(Order.objects.exists())
-        self.assertFalse(StockMovement.objects.exists())
-
-    def test_api_sale_writes_one_payment(self):
-        client = APIClient()
-        client.credentials(**_auth_header(self.staff))
-        resp = client.post(IN_STORE_URL, {
-            "customer_mobile": "9811100010", "items": [{"sku": self.variant.sku, "quantity": 1}],
-            "payment_method": "netbanking", "payment_reference": "UTR123",
-        }, format="json")
-        self.assertEqual(resp.status_code, 201)
-        self.assertEqual(Order.objects.get().payments.get().amount, Decimal("1000.00"))
-
-    def test_api_missing_reference_is_field_error(self):
-        client = APIClient()
-        client.credentials(**_auth_header(self.staff))
-        resp = client.post(IN_STORE_URL, {
-            "customer_mobile": "9811100010", "items": [{"sku": self.variant.sku, "quantity": 1}],
-            "payment_method": "card", "payment_reference": "",
-        }, format="json")
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("payment_reference", resp.data)
-        self.assertFalse(Order.objects.exists())
-
-    def test_admin_missing_reference_is_field_error(self):
-        self.client.force_login(User.objects.create_superuser(
-            username="payref", email="payref@example.com", password="testpass123",
-        ))
+    def test_record_payment_after_admin_sale(self):
+        admin_user = User.objects.create_superuser(
+            username="sepadmin", email="sepadmin@example.com", password="testpass123",
+        )
+        self.client.force_login(admin_user)
         resp = self.client.post(ADMIN_IN_STORE_URL, {
-            "customer_mobile": "9811100020", "customer_name": "", "payment_method": "card",
-            "payment_reference": "", "discount_amount": "0", "warehouse": str(self.warehouse.pk),
-            "notes": "", "lines-TOTAL_FORMS": "1", "lines-INITIAL_FORMS": "0",
+            "customer_mobile": "9811100020", "customer_name": "", "submission_key": str(uuid.uuid4()),
+            "discount_amount": "0", "warehouse": str(self.warehouse.pk), "notes": "",
+            "lines-TOTAL_FORMS": "1", "lines-INITIAL_FORMS": "0",
             "lines-MIN_NUM_FORMS": "0", "lines-MAX_NUM_FORMS": "50",
             "lines-0-sku": self.variant.sku, "lines-0-quantity": "1",
         })
+        order = Order.objects.get()
+        self.assertRedirects(resp, f"/admin/orders/order/{order.pk}/change/", fetch_redirect_response=False)
+        record_url = reverse("admin:orders_order_record_payment", args=[order.pk])
+        self.assertContains(self.client.get(f"/admin/orders/order/{order.pk}/change/"), record_url)
+        resp = self.client.post(record_url, {
+            "amount": "1000.00", "payment_date": timezone.localdate().isoformat(), "method": "card",
+            "reference": "SLIP-9", "notes": "", "expected_balance": "1000.00",
+        })
+        self.assertEqual(resp.status_code, 302)
+        order.refresh_from_db()
+        self.assertEqual((order.payment_method, order.payment_reference), ("card", "SLIP-9"))
+        self.assertEqual(order_payments.payment_summary(order)["payment_status"], "paid")
+
+    def _admin_post(self, key):
+        return self.client.post(ADMIN_IN_STORE_URL, {
+            "customer_mobile": "9811100021", "customer_name": "", "submission_key": key,
+            "discount_amount": "0", "warehouse": str(self.warehouse.pk), "notes": "",
+            "lines-TOTAL_FORMS": "1", "lines-INITIAL_FORMS": "0",
+            "lines-MIN_NUM_FORMS": "0", "lines-MAX_NUM_FORMS": "50",
+            "lines-0-sku": self.variant.sku, "lines-0-quantity": "1",
+        })
+
+    def test_admin_double_submit_creates_one_order(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="dbl", email="dbl@example.com", password="testpass123",
+        ))
+        before = self._retail()
+        key = str(uuid.uuid4())
+        first = self._admin_post(key)
+        second = self._admin_post(key)
+        order = Order.objects.get()
+        change_url = f"/admin/orders/order/{order.pk}/change/"
+        self.assertRedirects(first, change_url, fetch_redirect_response=False)
+        self.assertRedirects(second, change_url, fetch_redirect_response=False)
+        self.assertEqual(self._retail(), before - 1)
+
+    def test_admin_form_has_no_payment_fields_and_a_key(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="nopay", email="nopay@example.com", password="testpass123",
+        ))
+        resp = self.client.get(ADMIN_IN_STORE_URL)
+        self.assertNotContains(resp, 'name="payment_method"')
+        self.assertNotContains(resp, 'name="payment_reference"')
+        self.assertContains(resp, 'name="submission_key"')
+
+    def test_admin_missing_key_is_refused(self):
+        self.client.force_login(User.objects.create_superuser(
+            username="nokey", email="nokey@example.com", password="testpass123",
+        ))
+        resp = self._admin_post("")
         self.assertEqual(resp.status_code, 200)
-        self.assertIn("payment_reference", resp.context["form"].errors)
         self.assertFalse(Order.objects.exists())
 
 
@@ -5440,7 +5493,8 @@ class OrderPaymentBackfillMigrationTests(TransactionTestCase):
 
     def test_backfill_only_qualifying_in_store_orders(self):
         # Historical model: later migrations add columns that do not exist yet.
-        payment_model = self._migrate().get_model("orders", "OrderPayment")
+        historical = self._migrate()
+        payment_model = historical.get_model("orders", "OrderPayment")
         rows = {p.order_id: p for p in payment_model.objects.all()}
         self.assertEqual(set(rows), {self.later_cash, self.earlier_card, self.blank_netbanking})
         for order_id in self.excluded:
@@ -5455,7 +5509,7 @@ class OrderPaymentBackfillMigrationTests(TransactionTestCase):
         self.assertEqual(rows[self.blank_netbanking].reference, "")
         cash = rows[self.later_cash]
         self.assertEqual((cash.payment_number, cash.amount), ("CPAY-000003", Decimal("500.00")))
-        delivered_at = Order.objects.get(pk=self.later_cash).delivered_at
+        delivered_at = historical.get_model("orders", "Order").objects.get(pk=self.later_cash).delivered_at
         self.assertEqual(cash.payment_date, timezone.localtime(delivered_at).date())
 
     def test_sequence_continues_after_backfill(self):

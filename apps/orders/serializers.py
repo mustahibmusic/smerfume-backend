@@ -8,8 +8,7 @@ from apps.catalog.models import ProductVariant
 from apps.catalog.serializers import ProductVariantSerializer
 from apps.inventory.models import Warehouse
 
-from .models import Order, OrderItem, OrderPaymentError, Return, ReturnItem, ShippingAddress
-from .payments import validate_reference
+from .models import Order, OrderItem, Return, ReturnItem, ShippingAddress
 
 # Free-text notes accepted from clients (checkout, returns, in-store sale).
 # The model fields are TextFields; existing longer rows are left as they are.
@@ -112,10 +111,13 @@ class InStoreSaleSerializer(serializers.Serializer):
     customer_mobile = serializers.CharField(max_length=15)
     customer_name = serializers.CharField(max_length=150, required=False, allow_blank=True, default="")
     items = InStoreSaleItemSerializer(many=True)
-    payment_method = serializers.ChoiceField(
-        choices=[c for c in Order.PAYMENT_METHOD_CHOICES if c[0] in Order.IN_STORE_PAYMENT_METHODS]
+    submission_key = serializers.UUIDField(
+        required=False, allow_null=True, default=None,
+        help_text=(
+            "Optional client-generated UUID, one per sale. Sending the same key again "
+            "returns the order already recorded instead of creating another."
+        ),
     )
-    payment_reference = serializers.CharField(max_length=100, required=False, allow_blank=True, default="")
     discount_amount = serializers.DecimalField(
         max_digits=10, decimal_places=2, min_value=Decimal("0.00"), required=False,
         default=Decimal("0.00"),
@@ -138,14 +140,17 @@ class InStoreSaleSerializer(serializers.Serializer):
             raise serializers.ValidationError("At least one item is required.")
         return value
 
+    # DEC-013: a sale records no payment. Refuse payment fields instead of
+    # silently ignoring them, so an old client does not believe it paid.
+    PAYMENT_FIELDS = ("payment_method", "payment_reference")
+
     def validate(self, attrs):
-        # DEC-013 reference rule, shown under the field; the service checks it again.
-        try:
-            attrs["payment_reference"] = validate_reference(
-                attrs["payment_method"], attrs.get("payment_reference", ""),
-            )
-        except OrderPaymentError as exc:
-            raise serializers.ValidationError({"payment_reference": str(exc)}) from exc
+        sent = [name for name in self.PAYMENT_FIELDS if name in self.initial_data]
+        if sent:
+            raise serializers.ValidationError({
+                name: "Payments are not taken with the sale. Record them on the order afterwards."
+                for name in sent
+            })
         return attrs
 
 

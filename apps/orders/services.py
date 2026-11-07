@@ -354,18 +354,26 @@ class _SaleLine:
         return self.unit_price * self.quantity
 
 
+class DuplicateInStoreSale(Exception):
+    """This submission_key already created an order; `order` is that order.
+    Nothing new was created."""
+
+    def __init__(self, order):
+        self.order = order
+        super().__init__(f"This sale was already recorded as {order.order_number}.")
+
+
 @transaction.atomic
 def create_in_store_order(
     *,
     customer_mobile,
     lines,
-    payment_method,
     staff_user,
     customer_name="",
-    payment_reference="",
     discount_amount=Decimal("0.00"),
     warehouse=None,
     notes="",
+    submission_key=None,
 ):
     """Record a walk-in (counter) sale as a delivered Order — DEC-008.
 
@@ -380,29 +388,27 @@ def create_in_store_order(
     then delivered at the moment of sale. There is no ShippingAddress and
     no shipping charge.
 
-    DEC-013: the payment is recorded as one OrderPayment (CPAY) row for the
-    final total; a zero-total sale has none. Order.payment_method and
-    payment_reference stay as compatibility summaries of that row. UPI,
-    card and netbanking need a reference.
+    DEC-013 (amended 2026-11-07): the sale records no payment and assumes
+    no payment method; Order.payment_method / payment_reference start
+    blank and the order starts Unpaid (or Paid when the total is zero).
+    Payments are recorded afterwards with payments.record_order_payment().
+
+    submission_key (optional UUID): a second call with the same key raises
+    DuplicateInStoreSale(existing order) and creates nothing; the unique
+    column also stops two concurrent calls.
 
     Everything runs in one transaction: InStoreSaleError or
-    InsufficientStockError leaves no order, customer, reservation, stock
-    change or payment behind.
+    InsufficientStockError leaves no order, customer, reservation or stock
+    change behind.
     """
-    from . import payments as order_payments
-    from .models import Order, OrderItem, OrderPaymentError
+    from .models import Order, OrderItem
 
-    if payment_method not in Order.IN_STORE_PAYMENT_METHODS:
-        raise InStoreSaleError(
-            f"Invalid payment method {payment_method!r}; use one of "
-            f"{', '.join(Order.IN_STORE_PAYMENT_METHODS)}."
-        )
+    if submission_key is not None:
+        existing = Order.objects.filter(submission_key=submission_key).first()
+        if existing is not None:
+            raise DuplicateInStoreSale(existing)
     if not (customer_mobile or "").strip():
         raise InStoreSaleError("Customer mobile number is required.")
-    try:
-        payment_reference = order_payments.validate_reference(payment_method, payment_reference)
-    except OrderPaymentError as exc:
-        raise InStoreSaleError(str(exc)) from exc
 
     merged = {}
     for variant, quantity in lines:
@@ -429,18 +435,30 @@ def create_in_store_order(
     customer = resolve_customer_by_mobile(customer_mobile, name=customer_name)
 
     allocations = allocate_discount(sale_lines, discount_amount)
-    order = Order.objects.create(
-        user=customer,
-        order_number=generate_order_number(),
-        channel=Order.CHANNEL_IN_STORE,
-        created_by=staff_user,
-        subtotal=subtotal,
-        discount_amount=discount_amount,
-        total=subtotal - discount_amount,
-        payment_method=payment_method,
-        payment_reference=(payment_reference or "").strip(),
-        customer_notes=notes or "",
-    )
+    try:
+        with transaction.atomic():
+            order = Order.objects.create(
+                user=customer,
+                order_number=generate_order_number(),
+                channel=Order.CHANNEL_IN_STORE,
+                created_by=staff_user,
+                subtotal=subtotal,
+                discount_amount=discount_amount,
+                total=subtotal - discount_amount,
+                payment_method="",
+                payment_reference="",
+                customer_notes=notes or "",
+                submission_key=submission_key,
+            )
+    except IntegrityError:
+        # A concurrent request with the same key committed first.
+        existing = (
+            Order.objects.filter(submission_key=submission_key).first()
+            if submission_key is not None else None
+        )
+        if existing is None:
+            raise
+        raise DuplicateInStoreSale(existing) from None
 
     reservations = []
     for line in sale_lines:
@@ -457,12 +475,6 @@ def create_in_store_order(
 
     for reservation in reservations:
         reservation_service.consume_reservation(reservation, performed_by=staff_user)
-
-    if order.total > 0:
-        order_payments.record_order_payment(
-            order, method=payment_method, amount=order.total, reference=payment_reference,
-            recorded_by=staff_user,
-        )
 
     order.status = Order.STATUS_DELIVERED
     order.delivered_at = timezone.now()

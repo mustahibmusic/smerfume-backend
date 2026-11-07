@@ -185,8 +185,11 @@ class CheckoutView(APIView):
         try:
             with transaction.atomic():
                 locked_cart = Cart.objects.select_for_update().get(pk=cart.pk)
+                # Ordered by pk (the order items were added) so order lines,
+                # discount allocation and reservations follow a stable order;
+                # without ORDER BY PostgreSQL may return rows in any order.
                 cart_items = list(
-                    locked_cart.items.select_related("variant__edition__product__brand").all()
+                    locked_cart.items.select_related("variant__edition__product__brand").order_by("pk")
                 )
                 if not cart_items:
                     raise EmptyCartError()
@@ -334,8 +337,13 @@ class InStoreSaleView(APIView):
             "variant's current selling price; repeated SKUs are merged.\n"
             "- `discount_amount` is an optional order-level discount, spread "
             "across lines proportionally. It cannot exceed the subtotal.\n"
-            "- `payment_method`: `cash`, `upi`, `card` or `netbanking`. "
-            "`payment_reference` holds the UTR or card slip number.\n"
+            "- No payment is taken with the sale (DEC-013): the order starts "
+            "Unpaid and `payment_method` is blank. `payment_method` and "
+            "`payment_reference` are refused (400). Staff record payments "
+            "afterwards with the order's Record payment action.\n"
+            "- `submission_key` (optional UUID, one per sale): sending the same "
+            "key again returns the order already recorded (200) and creates "
+            "nothing, so a retry never deducts stock twice.\n"
             "- `warehouse` is the public ID of the stock location; defaults to "
             "the default warehouse.\n\n"
             "Stock is deducted immediately and the order is returned with "
@@ -347,8 +355,15 @@ class InStoreSaleView(APIView):
         request=InStoreSaleSerializer,
         responses={
             201: OrderSerializer,
+            200: OpenApiResponse(
+                response=OrderSerializer,
+                description="Same submission_key already recorded: the existing order, nothing created.",
+            ),
             400: OpenApiResponse(
-                description="Invalid data, unknown/inactive SKU, bad discount, or insufficient stock.",
+                description=(
+                    "Invalid data, unknown/inactive SKU, bad discount, insufficient stock, "
+                    "or payment fields sent."
+                ),
                 examples=[
                     OpenApiExample(
                         "Insufficient stock",
@@ -365,7 +380,7 @@ class InStoreSaleView(APIView):
         },
         examples=[
             OpenApiExample(
-                "Counter sale paid by UPI",
+                "Counter sale",
                 request_only=True,
                 value={
                     "customer_mobile": "9876543210",
@@ -374,8 +389,7 @@ class InStoreSaleView(APIView):
                         {"sku": "AAM-AHL-EDP-60", "quantity": 1},
                         {"sku": "AAM-KAAF-DEC-10", "quantity": 2},
                     ],
-                    "payment_method": "upi",
-                    "payment_reference": "412345678901",
+                    "submission_key": "3f2b8c1e-5a7d-4e9f-9b1a-2c6d8e0f4a11",
                     "discount_amount": "200.00",
                     "notes": "Gift wrapped at counter.",
                 },
@@ -392,20 +406,22 @@ class InStoreSaleView(APIView):
                 customer_mobile=data["customer_mobile"],
                 customer_name=data.get("customer_name", ""),
                 lines=[(item["sku"], item["quantity"]) for item in data["items"]],
-                payment_method=data["payment_method"],
-                payment_reference=data.get("payment_reference", ""),
                 discount_amount=data.get("discount_amount", Decimal("0.00")),
                 warehouse=data.get("warehouse"),
                 notes=data.get("notes", ""),
                 staff_user=request.user,
+                submission_key=data.get("submission_key"),
             )
+            response_status = status.HTTP_201_CREATED
+        except order_services.DuplicateInStoreSale as exc:
+            order, response_status = exc.order, status.HTTP_200_OK
         except (order_services.InStoreSaleError, InsufficientStockError) as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         order = (
             Order.objects.prefetch_related("items__variant").get(pk=order.pk)
         )
-        return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
+        return Response(OrderSerializer(order).data, status=response_status)
 
 
 class OrderListView(generics.ListAPIView):

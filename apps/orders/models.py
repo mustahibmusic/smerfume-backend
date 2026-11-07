@@ -32,6 +32,9 @@ class Order(BaseModel):
     PAYMENT_METHOD_UPI = "upi"
     PAYMENT_METHOD_CARD = "card"
     PAYMENT_METHOD_NETBANKING = "netbanking"
+    # Legacy summary only (DEC-013): an in-store order with more than one
+    # OrderPayment row.
+    PAYMENT_METHOD_SPLIT = "split"
 
     PAYMENT_METHOD_CHOICES = [
         (PAYMENT_METHOD_COD, "Cash on Delivery"),
@@ -40,6 +43,7 @@ class Order(BaseModel):
         (PAYMENT_METHOD_UPI, "UPI"),
         (PAYMENT_METHOD_CARD, "Card"),
         (PAYMENT_METHOD_NETBANKING, "Net Banking"),
+        (PAYMENT_METHOD_SPLIT, "Split"),
     ]
     IN_STORE_PAYMENT_METHODS = (
         PAYMENT_METHOD_CASH,
@@ -92,12 +96,20 @@ class Order(BaseModel):
     )
 
     # ── Payment / COD verification ───────────────────────────────────────
+    # DEC-013: a compatibility summary only, never used for financial
+    # calculations. In-store orders: blank with no payment, the method of
+    # the single payment, or "split" with several (kept in step by
+    # apps.orders.payments). Online orders keep their checkout method.
     payment_method = models.CharField(
-        max_length=10, choices=PAYMENT_METHOD_CHOICES, default=PAYMENT_METHOD_COD
+        max_length=10, choices=PAYMENT_METHOD_CHOICES, default=PAYMENT_METHOD_COD, blank=True,
     )
     # UPI/netbanking UTR or card slip number for in-store payments. Entered
     # manually; there is no payment gateway integration (DEC-006).
     payment_reference = models.CharField(max_length=100, blank=True)
+    # In-store sale duplicate-submission key (one per sale form / API
+    # request). Unique, so a double-click or retry cannot create a second
+    # order or deduct stock twice.
+    submission_key = models.UUIDField(null=True, blank=True, unique=True, editable=False)
     cod_verified_at = models.DateTimeField(null=True, blank=True)
     cod_verified_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,

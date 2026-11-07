@@ -120,7 +120,7 @@ def record_order_payment(order, *, method, amount, reference, recorded_by, payme
         raise OrderPaymentError(f"{order.order_number} is fully paid: nothing left to pay.")
     if amount > balance_due:
         raise OrderPaymentError(f"The amount is more than the balance due (₹{balance_due}).")
-    return OrderPayment.objects.create(
+    payment = OrderPayment.objects.create(
         order=order,
         payment_number=next_payment_number(),
         method=method,
@@ -129,6 +129,28 @@ def record_order_payment(order, *, method, amount, reference, recorded_by, payme
         payment_date=payment_date,
         notes=notes,
         recorded_by=recorded_by,
+    )
+    refresh_legacy_payment_summary(order)
+    return payment
+
+
+def refresh_legacy_payment_summary(order):
+    """Keep Order.payment_method / payment_reference as a compatibility
+    summary of an in-store order's payment rows: blank with none, the single
+    payment's method and reference with one, "split" and a blank reference
+    with several. Display only; no calculation reads these fields. Online
+    orders keep their checkout method (COD logic depends on it)."""
+    if order.channel != Order.CHANNEL_IN_STORE:
+        return
+    rows = list(order.payments.order_by("payment_date", "id").values_list("method", "reference")[:2])
+    if not rows:
+        method, reference = "", ""
+    elif len(rows) == 1:
+        method, reference = rows[0]
+    else:
+        method, reference = Order.PAYMENT_METHOD_SPLIT, ""
+    Order.objects.filter(pk=order.pk).update(
+        payment_method=method, payment_reference=reference, updated_at=timezone.now(),
     )
 
 

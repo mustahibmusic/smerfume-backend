@@ -209,6 +209,25 @@ class OrderItem(BaseModel):
     tax_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     final_paid_line_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
 
+    # ── Customer-visible identity snapshot (DEC-018) ────────────────────
+    # Copied from the linked catalogue rows when the line is created (see
+    # identity_snapshot()) and never refreshed, so receipts and order
+    # history keep the name, SKU and size the customer bought even after
+    # the catalogue is renamed. For display only: navigation and stock
+    # still use the live `variant` FK. No tax/HSN identity yet (DEC-018:
+    # waits for the GST design).
+    product_name_snapshot = models.CharField(max_length=400, blank=True, default="", editable=False)
+    edition_name_snapshot = models.CharField(max_length=100, blank=True, default="", editable=False)
+    variant_name_snapshot = models.CharField(max_length=600, blank=True, default="", editable=False)
+    sku_snapshot = models.CharField(max_length=64, blank=True, default="", editable=False)
+    size_ml_snapshot = models.PositiveIntegerField(null=True, blank=True, editable=False)
+    is_decant_snapshot = models.BooleanField(null=True, blank=True, editable=False)
+    concentration_snapshot = models.CharField(max_length=50, blank=True, default="", editable=False)
+    # True when the snapshot was filled by migration 0017 from the catalogue
+    # as it was at migration time, not at sale time: the original display
+    # values were never stored for lines created before DEC-018.
+    identity_backfilled = models.BooleanField(default=False, editable=False)
+
     class Meta:
         db_table = "orders_orderitem"
         constraints = [
@@ -219,10 +238,31 @@ class OrderItem(BaseModel):
 
     def save(self, *args, **kwargs):
         self.line_total = self.unit_price * self.quantity
+        # Snapshot identity once, on creation only; later saves never
+        # refresh it from the (possibly renamed) catalogue.
+        if self._state.adding and not self.sku_snapshot:
+            for field, value in identity_snapshot(self.variant).items():
+                setattr(self, field, value)
         super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.quantity}× {self.variant} @ ₹{self.unit_price}"
+
+
+def identity_snapshot(variant):
+    """DEC-018: the customer-visible identity of a variant at sale time, as
+    OrderItem snapshot field values. Uses the catalogue display_name()
+    methods so receipts read the same as the catalogue did at sale time."""
+    edition = variant.edition
+    return {
+        "product_name_snapshot": edition.product.display_name() or "",
+        "edition_name_snapshot": edition.name or "",
+        "variant_name_snapshot": variant.display_name(),
+        "sku_snapshot": variant.sku,
+        "size_ml_snapshot": variant.size_ml,
+        "is_decant_snapshot": variant.is_decant,
+        "concentration_snapshot": edition.get_concentration_display(),
+    }
 
 
 class ShippingAddress(BaseModel):

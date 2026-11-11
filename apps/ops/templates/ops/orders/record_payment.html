@@ -1,0 +1,37 @@
+{% extends "ops/base.html" %}
+{% block title %}Record payment · {{ order.order_number }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:order_detail' order.order_number %}">{% include "ops/_icon.html" with name="back" %}{{ order.order_number }}</a>{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Record payment</h1>
+    <p class="muted">{{ order.order_number }} · {{ order.get_channel_display }}</p>
+    <div class="badges"><span class="badge badge--{{ payment_status_tone }}">{{ payment_status_label }}</span></div>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat"><span class="stat__label">Order total</span><span class="stat__value">₹{{ order.total|floatformat:"2g" }}</span></div>
+  <div class="stat"><span class="stat__label">Paid</span><span class="stat__value">₹{{ summary.total_paid|floatformat:"2g" }}</span></div>
+  <div class="stat"><span class="stat__label">Balance due</span><span class="stat__value">₹{{ summary.balance_due|floatformat:"2g" }}</span></div>
+</div>
+
+<section class="card">
+  <form method="post" class="stack" novalidate>
+    {% csrf_token %}
+    {{ form.expected_balance }}
+    {% include "ops/_form_errors.html" %}
+    <div class="form-grid">
+      {% include "ops/_field.html" with field=form.amount %}
+      {% include "ops/_field.html" with field=form.payment_date %}
+      {% include "ops/_field.html" with field=form.method %}
+      {% include "ops/_field.html" with field=form.reference %}
+    </div>
+    {% include "ops/_field.html" with field=form.notes %}
+    <div class="form-actions">
+      <a class="button button--ghost" href="{% url 'ops:order_detail' order.order_number %}">Cancel</a>
+      <button type="submit" class="button button--primary" data-once>Save payment</button>
+    </div>
+  </form>
+</section>
+{% endblock %}

@@ -23,9 +23,15 @@
           <ul class="nav">
             {% for item in group.items %}
               <li>
-                <a class="nav__link{% if item.active %} is-active{% endif %}" href="{{ item.url }}"{% if item.active %} aria-current="page"{% endif %}>
-                  {% include "ops/_icon.html" with name=item.icon %}<span>{{ item.label }}</span>
-                </a>
+                {% if item.implemented %}
+                  <a class="nav__link{% if item.active %} is-active{% endif %}" href="{{ item.url }}"{% if item.active %} aria-current="page"{% endif %}>
+                    {% include "ops/_icon.html" with name=item.icon %}<span>{{ item.label }}</span>
+                  </a>
+                {% else %}
+                  <span class="nav__link is-disabled" aria-disabled="true" data-coming-soon="{{ item.key }}">
+                    {% include "ops/_icon.html" with name=item.icon %}<span class="nav__text"><span>{{ item.label }}</span><small class="soon">Coming soon</small></span>
+                  </span>
+                {% endif %}
               </li>
             {% endfor %}
           </ul>

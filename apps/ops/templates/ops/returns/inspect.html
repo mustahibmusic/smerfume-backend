@@ -1,0 +1,29 @@
+{% extends "ops/base.html" %}
+{% block title %}Inspect item{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:return_detail' return.public_id %}">{% include "ops/_icon.html" with name="back" %}Return</a>{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Inspect returned item</h1>
+    <p class="muted">{{ item.order_item.variant }} · {{ return.order.order_number }} · approved {{ item.approved_quantity|default_if_none:"—" }}</p>
+  </div>
+</div>
+<section class="card">
+  {% if item.disposition %}
+    <p>This item is already inspected: {{ item.get_disposition_display }}, {{ item.get_resolution_display }}.</p>
+  {% else %}
+    <p class="muted">Saving records the result and moves the stock in one step. It cannot be changed afterwards.</p>
+    <form method="post" class="stack" novalidate>
+      {% csrf_token %}
+      {% include "ops/_form_errors.html" %}
+      <div class="form-grid">
+        {% for field in form %}{% include "ops/_field.html" with field=field %}{% endfor %}
+      </div>
+      <div class="form-actions">
+        <a class="button button--ghost" href="{% url 'ops:return_detail' return.public_id %}">Cancel</a>
+        <button type="submit" class="button button--primary" data-once>Finalize inspection</button>
+      </div>
+    </form>
+  {% endif %}
+</section>
+{% endblock %}

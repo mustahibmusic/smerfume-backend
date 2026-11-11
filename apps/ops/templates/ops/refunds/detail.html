@@ -1,0 +1,102 @@
+{% extends "ops/base.html" %}
+{% block title %}Refund · {{ order.order_number }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:refund_list' %}">{% include "ops/_icon.html" with name="back" %}Refunds</a>{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Refund ₹{{ refund.refund_amount|floatformat:"2g" }}</h1>
+    <p class="muted">
+      {{ order.order_number }} · <a href="{% url 'ops:order_detail' order.order_number %}">Open order</a>
+      {% if can_view_return %} · <a href="{% url 'ops:return_detail' refund.return_request.public_id %}">Open return</a>{% endif %}
+    </p>
+    <div class="badges"><span class="badge badge--info">{{ refund.get_refund_status_display }}</span></div>
+  </div>
+</div>
+
+<section class="card">
+  <h2>Details</h2>
+  <dl class="dl">
+    <dt>Amount</dt><dd>₹{{ refund.refund_amount|floatformat:"2g" }}</dd>
+    <dt>Method</dt><dd>{{ refund.get_refund_method_display|default:"Not chosen" }}</dd>
+    <dt>Reference</dt><dd>{{ refund.refund_reference|default:"—" }}</dd>
+    {% if refund.failure_reason %}<dt>Failure reason</dt><dd class="prewrap">{{ refund.failure_reason }}</dd>{% endif %}
+    <dt>Approved by</dt><dd>{{ refund.approved_by.full_name|default:refund.approved_by.email|default:"—" }}</dd>
+    <dt>Processed</dt><dd>{% if refund.processed_at %}{{ refund.processed_at|date:"d M Y, H:i" }} by {{ refund.processed_by.full_name|default:refund.processed_by.email|default:"—" }}{% else %}—{% endif %}</dd>
+    {% if refund.notes %}<dt>Notes</dt><dd class="prewrap">{{ refund.notes }}</dd>{% endif %}
+  </dl>
+</section>
+
+{% if method_form or can_mark_processing %}
+<section class="card">
+  <h2>Prepare refund</h2>
+  <div class="action-row">
+    {% if method_form %}
+    <form method="post" action="{% url 'ops:refund_method' refund.public_id %}" class="inline-form">
+      {% csrf_token %}
+      {% include "ops/_field.html" with field=method_form.refund_method %}
+      <button type="submit" class="button" data-once>Save method</button>
+    </form>
+    {% endif %}
+    {% if can_mark_processing %}
+    <form method="post" action="{% url 'ops:refund_processing' refund.public_id %}" data-confirm="Mark this refund as processing? The refund method can no longer be changed.">
+      {% csrf_token %}
+      <button type="submit" class="button button--primary" data-once>Mark processing</button>
+    </form>
+    {% endif %}
+  </div>
+</section>
+{% endif %}
+
+{% if complete_form %}
+<div class="grid">
+  <section class="card">
+    <h2>Complete refund</h2>
+    <p class="muted">Confirm that ₹{{ refund.refund_amount|floatformat:"2g" }} has been paid. A completed refund cannot be changed; later corrections need an adjustment.</p>
+    <form method="post" action="{% url 'ops:refund_complete' refund.public_id %}" class="stack" data-confirm="Mark this refund as completed?">
+      {% csrf_token %}
+      {% for field in complete_form %}{% include "ops/_field.html" with field=field %}{% endfor %}
+      <div class="form-actions"><button type="submit" class="button button--primary" data-once>Complete refund</button></div>
+    </form>
+  </section>
+  <section class="card">
+    <h2>Mark failed</h2>
+    <p class="muted">Record why the payment failed. The amount becomes claimable again by a later refund.</p>
+    <form method="post" action="{% url 'ops:refund_fail' refund.public_id %}" class="stack" data-confirm="Mark this refund as failed?">
+      {% csrf_token %}
+      {% for field in fail_form %}{% include "ops/_field.html" with field=field %}{% endfor %}
+      <div class="form-actions"><button type="submit" class="button button--danger" data-once>Mark failed</button></div>
+    </form>
+  </section>
+</div>
+{% endif %}
+
+<section class="card card--flush">
+  <h2 class="card__title">Adjustments</h2>
+  {% if adjustments %}
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Date</th><th scope="col">Reason</th><th scope="col">Approved by</th><th scope="col" class="num">Amount</th></tr></thead>
+    <tbody>
+      {% for adjustment in adjustments %}
+      <tr>
+        <td data-label="Date">{{ adjustment.created_at|date:"d M Y" }}</td>
+        <td data-label="Reason">{{ adjustment.reason }}</td>
+        <td data-label="Approved by">{{ adjustment.approved_by.full_name|default:adjustment.approved_by.email }}</td>
+        <td data-label="Amount" class="num">₹{{ adjustment.adjustment_amount|floatformat:"2g" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="card__body muted">No adjustments.</p>
+  {% endif %}
+  {% if adjustment_form %}
+  <form method="post" action="{% url 'ops:refund_adjustment' refund.public_id %}" class="card__body stack" data-confirm="Record this adjustment? Adjustments cannot be edited or removed.">
+    {% csrf_token %}
+    <div class="form-grid">
+      {% for field in adjustment_form %}{% include "ops/_field.html" with field=field %}{% endfor %}
+    </div>
+    <div class="form-actions"><button type="submit" class="button" data-once>Record adjustment</button></div>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}

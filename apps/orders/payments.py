@@ -205,3 +205,14 @@ def annotate_payment_summary(queryset):
             output_field=CharField(),
         ),
     )
+
+
+def orders_open_for_manual_payment(queryset=None):
+    """Orders that may take a manual Record Payment (DEC-013): in-store,
+    not cancelled, balance due above zero. Shared by Django Admin and the
+    Smerfume Panel to decide whether to offer the action;
+    record_order_payment() re-checks cancelled and balance under the lock."""
+    queryset = Order.objects.all() if queryset is None else queryset
+    return annotate_payment_summary(
+        queryset.filter(channel=Order.CHANNEL_IN_STORE).exclude(status=Order.STATUS_CANCELLED)
+    ).filter(balance_due__gt=0)

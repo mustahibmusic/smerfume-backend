@@ -1,0 +1,80 @@
+{% extends "ops/base.html" %}
+{% block title %}Return · {{ return.order.order_number }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:return_list' %}">{% include "ops/_icon.html" with name="back" %}Returns</a>{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Return for {{ return.order.order_number }}</h1>
+    <p class="muted">Requested {{ return.created_at|date:"d M Y, H:i" }} · <a href="{% url 'ops:order_detail' return.order.order_number %}">Open order</a></p>
+    <div class="badges"><span class="badge badge--info">{{ return.get_status_display }}</span></div>
+  </div>
+  {% if actions %}
+    <div class="page-actions">
+      {% for action in actions %}
+        <form method="post" action="{% url 'ops:return_action' return.public_id action.key %}"{% if action.confirm %} data-confirm="{{ action.confirm }}"{% endif %}>
+          {% csrf_token %}
+          <button type="submit" class="button{% if forloop.first %} button--primary{% endif %}" data-once>{{ action.label }}</button>
+        </form>
+      {% endfor %}
+    </div>
+  {% endif %}
+</div>
+
+<section class="card card--flush">
+  <h2 class="card__title">Items</h2>
+  <table class="table table--responsive">
+    <thead>
+      <tr>
+        <th scope="col">Item</th><th scope="col">Reason</th>
+        <th scope="col" class="num">Requested</th><th scope="col" class="num">Approved</th><th scope="col" class="num">Received</th>
+        <th scope="col">Disposition</th><th scope="col">Resolution</th><th scope="col"><span class="visually-hidden">Inspect</span></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td data-label="Item">{{ item.order_item.variant }}<br><code>{{ item.order_item.variant.sku }}</code></td>
+        <td data-label="Reason">{{ item.get_reason_display }}{% if item.reason_notes %}<br><small class="muted">{{ item.reason_notes }}</small>{% endif %}</td>
+        <td data-label="Requested" class="num">{{ item.requested_quantity }}</td>
+        <td data-label="Approved" class="num">{{ item.approved_quantity|default_if_none:"—" }}</td>
+        <td data-label="Received" class="num">{{ item.received_quantity|default_if_none:"—" }}</td>
+        <td data-label="Disposition">{{ item.get_disposition_display|default:"—" }}</td>
+        <td data-label="Resolution">{{ item.get_resolution_display|default:"—" }}</td>
+        <td data-label="">{% if can_inspect and item.disposition is None %}<a class="button" href="{% url 'ops:return_item_inspect' return.public_id item.public_id %}">Inspect</a>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+{% if received_form %}
+<section class="card">
+  <h2>Received quantities</h2>
+  <p class="muted">Record what arrived for each line before marking the return received.</p>
+  <form method="post" action="{% url 'ops:return_received_quantities' return.public_id %}" class="stack">
+    {% csrf_token %}
+    <div class="form-grid">
+      {% for field in received_form %}{% include "ops/_field.html" with field=field %}{% endfor %}
+    </div>
+    <div class="form-actions"><button type="submit" class="button button--primary" data-once>Save received quantities</button></div>
+  </form>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>Refund</h2>
+  <dl class="dl">
+    <dt>Base shipping refund</dt><dd>₹{{ return.base_shipping_refund_amount|floatformat:"2g" }}</dd>
+    <dt>Shipping refund override</dt><dd>{% if return.base_shipping_refund_override is None %}Not set (standard rule){% elif return.base_shipping_refund_override %}Refund shipping{% else %}Do not refund shipping{% endif %}</dd>
+  </dl>
+  {% if refunds %}
+    <ul class="plain-list">
+      {% for refund in refunds %}
+        <li>{% if can_view_refunds %}<a href="{% url 'ops:refund_detail' refund.public_id %}">₹{{ refund.refund_amount|floatformat:"2g" }}</a>{% else %}₹{{ refund.refund_amount|floatformat:"2g" }}{% endif %} · {{ refund.get_refund_status_display }}{% if refund.refund_method %} · {{ refund.get_refund_method_display }}{% endif %}</li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted">No refund yet. A refund can be created once the return is completed.</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,37 @@
+{% extends "ops/base.html" %}
+{% block title %}Confirm booked quantity · {{ po.po_number }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:po_detail' po.po_number %}">{% include "ops/_icon.html" with name="back" %}{{ po.po_number }}</a>{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Confirm booked quantity</h1>
+  <p class="muted">Vendor-confirmed totals for {{ po.po_number }}. All changed lines are saved together with one note. A total cannot go below what is received plus what customer orders already hold.</p>
+</div></div>
+<form method="post" class="stack" novalidate>
+  {% csrf_token %}
+  {{ formset.management_form }}
+  {% if formset.non_form_errors %}<div class="alert alert--danger">{% for e in formset.non_form_errors %}<p>{{ e }}</p>{% endfor %}</div>{% endif %}
+  {% include "ops/_form_errors.html" with form=note_form %}
+  <section class="card card--flush">
+    <table class="table table--responsive">
+      <thead><tr><th scope="col">Item</th><th scope="col" class="num">Ordered</th><th scope="col" class="num">Received</th><th scope="col" class="num">Held by orders</th><th scope="col" class="num">Minimum</th><th scope="col">New confirmed total</th></tr></thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td data-label="Item">{{ row.line.variant }}<br><code>{{ row.line.variant.sku }}</code>{{ row.form.line }}{{ row.form.original_total }}</td>
+          <td data-label="Ordered" class="num">{{ row.line.quantity_ordered }}</td>
+          <td data-label="Received" class="num">{{ row.figures.received }}</td>
+          <td data-label="Held by orders" class="num">{{ row.figures.allocated|floatformat:"-2" }}</td>
+          <td data-label="Minimum" class="num">{{ row.minimum|floatformat:"-2" }}</td>
+          <td data-label="New confirmed total"><div class="field"><input type="number" min="0" name="{{ row.form.confirmed_total.html_name }}" value="{{ row.form.confirmed_total.value|default_if_none:'' }}">{% for e in row.form.confirmed_total.errors %}<p class="field__error">{{ e }}</p>{% endfor %}</div></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  <section class="card">{% include "ops/_field.html" with field=note_form.note %}</section>
+  <div class="form-actions">
+    <a class="button button--ghost" href="{% url 'ops:po_detail' po.po_number %}">Back</a>
+    <button type="submit" class="button button--primary" data-once>Save confirmed totals</button>
+  </div>
+</form>
+{% endblock %}

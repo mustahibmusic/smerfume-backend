@@ -1,0 +1,71 @@
+{% extends "ops/base.html" %}
+{% load ops_tags %}
+{% block title %}{% if entry %}{{ entry.payment_number|default:"Draft payment" }}{% else %}Record payment{% endif %} · {{ po.po_number }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:po_detail' po.po_number %}">{% include "ops/_icon.html" with name="back" %}{{ po.po_number }}</a>{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>{% if not entry %}Record payment{% elif is_draft %}Draft payment{% else %}{{ entry.payment_number|default:entry.get_entry_type_display }}{% endif %}</h1>
+  <p class="muted">{{ po.po_number }} · {{ po.supplier }}</p>
+  {% if entry %}<div class="badges"><span class="badge{% if is_draft %} badge--warn{% endif %}">{{ entry.get_status_display }}</span><span class="badge">{{ entry.get_entry_type_display }}</span></div>{% endif %}
+</div></div>
+
+<div class="stats">
+  <div class="stat"><span class="stat__label">Payment status</span><span class="stat__value stat__value--text"><span class="badge">{{ summary.status }}</span></span></div>
+  <div class="stat"><span class="stat__label">Ordered gross total</span><span class="stat__value">{% if summary.ordered is not None %}₹{{ summary.ordered|floatformat:"2g" }}{% else %}—{% endif %}</span></div>
+  <div class="stat"><span class="stat__label">Net paid (posted)</span><span class="stat__value">₹{{ summary.net_paid|floatformat:"2g" }}</span></div>
+  <div class="stat"><span class="stat__label">Remaining against PO</span><span class="stat__value">{% if summary.remaining is not None %}₹{{ summary.remaining|floatformat:"2g" }}{% else %}—{% endif %}</span></div>
+</div>
+<p class="muted">Drafts (not counted): {{ summary.draft_count }} totalling ₹{{ summary.draft_total|floatformat:"2g" }}. Operational tracking only; Zoho Books is authoritative.</p>
+
+{% if entry and not editable %}
+<section class="card">
+  <h2>Entry</h2>
+  <dl class="dl">
+    <dt>Amount</dt><dd>₹{{ entry.amount|floatformat:"2g" }}</dd>
+    <dt>Date</dt><dd>{{ entry.entry_date|date:"d M Y" }}</dd>
+    <dt>Mode</dt><dd>{{ entry.get_method_display }}</dd>
+    <dt>Paid through</dt><dd>{{ entry.paid_through|default:"—" }}</dd>
+    <dt>Reference</dt><dd>{{ entry.reference|default:"—" }}</dd>
+    {% if entry.notes %}<dt>Notes</dt><dd class="prewrap">{{ entry.notes }}</dd>{% endif %}
+    <dt>Posted</dt><dd>{{ entry.posted_at|date:"d M Y, H:i"|default:"—" }} by {{ entry.posted_by|person }}</dd>
+  </dl>
+</section>
+{% endif %}
+
+{% if attachments %}
+<section class="card">
+  <h2>Proof</h2>
+  <ul class="plain-list">
+    {% for attachment in attachments %}
+    <li>
+      <a href="{% url 'ops:payment_attachment' attachment.public_id %}">{{ attachment.original_name }}</a>
+      {% if is_draft and can_draft %}
+      <form method="post" class="inline" data-confirm="Remove this attachment?">{% csrf_token %}<button type="submit" name="_remove_attachment" value="{{ attachment.public_id }}" class="button button--ghost">Remove</button></form>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if editable or can_add_proof %}
+<section class="card">
+  {% if files_lost %}<p class="alert alert--danger">Select the attachment files again before saving.</p>{% endif %}
+  <form method="post" enctype="multipart/form-data" class="stack" novalidate>
+    {% csrf_token %}
+    {% include "ops/_form_errors.html" %}
+    <div class="form-grid">{% for field in form %}{% include "ops/_field.html" with field=field %}{% endfor %}</div>
+    <div class="form-actions">
+      <a class="button button--ghost" href="{% url 'ops:po_detail' po.po_number %}">Back</a>
+      {% if editable %}
+        {% if is_draft and can_draft %}<button type="submit" name="_delete" value="1" class="button button--danger" formnovalidate data-confirm-button="Delete this draft payment?">Delete draft</button>{% endif %}
+        {% if can_draft %}<button type="submit" name="_draft" value="1" class="button">Save as draft</button>{% endif %}
+        {% if can_post %}<button type="submit" name="_post" value="1" class="button button--primary">Save as paid</button>{% endif %}
+      {% else %}
+        <button type="submit" class="button button--primary" data-once>Add proof</button>
+      {% endif %}
+    </div>
+  </form>
+</section>
+{% endif %}
+{% endblock %}

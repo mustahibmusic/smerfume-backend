@@ -1,0 +1,44 @@
+{% extends "ops/base.html" %}
+{% block title %}Goods receipts{% endblock %}
+{% block page_title %}Goods receipts{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Goods receipts</h1>
+  <p class="muted">{{ paginator.count }} receipt{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %} · receive goods from a purchase order</p>
+</div>
+{% if can_create_opening %}<a class="button" href="{% url 'ops:opening_new' %}">New opening stock receipt</a>{% endif %}
+</div>
+<form method="get" class="filters filters--three" role="search">
+  {% include "ops/_field.html" with field=filter_form.q %}
+  {% include "ops/_field.html" with field=filter_form.status %}
+  {% include "ops/_field.html" with field=filter_form.receipt_type %}
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:grn_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+{% if object_list %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">GRN</th><th scope="col">Received</th><th scope="col">Type</th><th scope="col">PO</th><th scope="col">Vendor</th><th scope="col">Warehouse</th><th scope="col">Status</th><th scope="col" class="num">Units</th></tr></thead>
+    <tbody>
+      {% for receipt in object_list %}
+      <tr>
+        <td data-label="GRN" class="nowrap"><a class="link-strong" href="{% url 'ops:grn_detail' receipt.grn_number %}">{{ receipt.grn_number }}</a></td>
+        <td data-label="Received" class="nowrap">{{ receipt.received_date|date:"d M Y" }}</td>
+        <td data-label="Type">{{ receipt.get_receipt_type_display }}</td>
+        <td data-label="PO" class="nowrap">{{ receipt.purchase_order.po_number|default:"—" }}</td>
+        <td data-label="Vendor">{{ receipt.supplier|default:"—" }}</td>
+        <td data-label="Warehouse">{{ receipt.warehouse }}</td>
+        <td data-label="Status"><span class="badge">{{ receipt.get_status_display }}</span></td>
+        <td data-label="Units" class="num">{{ receipt.total_units|default:0 }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% include "ops/_pagination.html" %}
+{% else %}
+<section class="empty card"><h2>No goods receipts found</h2></section>
+{% endif %}
+{% endblock %}

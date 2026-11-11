@@ -1,0 +1,40 @@
+{% extends "ops/base.html" %}
+{% load ops_tags %}
+{% block title %}Booked quantity history{% endblock %}
+{% block page_title %}Booked quantity history{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Booked quantity history</h1>
+  <p class="muted">{{ paginator.count }} change{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %} · read-only record of vendor-confirmed totals</p>
+</div></div>
+<form method="get" class="filters filters--two" role="search">
+  {% include "ops/_field.html" with field=filter_form.q %}
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:booked_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+{% if object_list %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">When</th><th scope="col">PO</th><th scope="col">Item</th><th scope="col" class="num">From</th><th scope="col" class="num">To</th><th scope="col">Note</th><th scope="col">By</th></tr></thead>
+    <tbody>
+      {% for change in object_list %}
+      <tr>
+        <td data-label="When" class="nowrap">{{ change.created_at|date:"d M Y, H:i" }}</td>
+        <td data-label="PO" class="nowrap"><a href="{% url 'ops:po_detail' change.purchase_order_line.purchase_order.po_number %}">{{ change.purchase_order_line.purchase_order.po_number }}</a></td>
+        <td data-label="Item">{{ change.purchase_order_line.variant }}<br><code>{{ change.purchase_order_line.variant.sku }}</code></td>
+        <td data-label="From" class="num">{{ change.old_quantity }}</td>
+        <td data-label="To" class="num">{{ change.new_quantity }}</td>
+        <td data-label="Note">{{ change.note }}</td>
+        <td data-label="By">{{ change.performed_by|person }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% include "ops/_pagination.html" %}
+{% else %}
+<section class="empty card"><h2>No changes recorded</h2></section>
+{% endif %}
+{% endblock %}

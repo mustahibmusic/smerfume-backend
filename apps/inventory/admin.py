@@ -1,17 +1,11 @@
 from django import forms
 from django.contrib import admin, messages
 from django.core.exceptions import PermissionDenied
-from django.db.models import F
 from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from unfold.admin import ModelAdmin
 from unfold.decorators import action
-from unfold.widgets import (
-    UnfoldAdminIntegerFieldWidget,
-    UnfoldAdminSelectWidget,
-    UnfoldAdminTextareaWidget,
-)
 
 from .models import (
     DecantSource,
@@ -24,6 +18,8 @@ from .models import (
     Supplier,
     Warehouse,
 )
+from . import selectors as inventory_selectors
+from .forms import MANUAL_ADJUSTMENT_REASONS, StockTypeTransferForm
 from .services import adjustment as adjustment_services
 from .services import reservation as reservation_services
 
@@ -61,14 +57,6 @@ class SupplierAdmin(ModelAdmin):
         return False
 
 
-# Reasons a manual adjustment may record. Purchases come only from goods
-# receipts and opening stock only from opening receipts.
-MANUAL_ADJUSTMENT_REASONS = [
-    choice for choice in StockMovement.REASON_CHOICES
-    if choice[0] not in (StockMovement.REASON_PURCHASE, StockMovement.REASON_OPENING_STOCK)
-]
-
-
 class InventoryStockAdjustmentForm(forms.ModelForm):
     """InventoryStockAdmin makes `quantity` read-only and routes any change
     through these extra fields instead; save_model() never calls a raw
@@ -100,10 +88,7 @@ class LowStockFilter(admin.SimpleListFilter):
 
     def queryset(self, request, queryset):
         if self.value() == "yes":
-            return queryset.filter(
-                reorder_level__isnull=False,
-                quantity__lte=F("quantity_reserved") + F("reorder_level"),
-            )
+            return inventory_selectors.low_stock(queryset)
         return queryset
 
 
@@ -116,35 +101,8 @@ class ActiveReservationFilter(admin.SimpleListFilter):
 
     def queryset(self, request, queryset):
         if self.value() == "yes":
-            return queryset.filter(
-                status__in=[StockReservation.STATUS_HELD, StockReservation.STATUS_CONFIRMED]
-            )
+            return inventory_selectors.active_reservations(queryset)
         return queryset
-
-
-TRANSFER_REASONS = (
-    StockMovement.REASON_MARKETING_USE,
-    StockMovement.REASON_DAMAGED_GOODS,
-    StockMovement.REASON_STOCKTAKING_RESULTS,
-    StockMovement.REASON_STOCK_WRITTEN_OFF,
-)
-
-
-class StockTypeTransferForm(forms.Form):
-    to_type = forms.ChoiceField(label="Move to", widget=UnfoldAdminSelectWidget)
-    quantity = forms.IntegerField(min_value=1, widget=UnfoldAdminIntegerFieldWidget)
-    reason = forms.ChoiceField(
-        choices=[c for c in StockMovement.REASON_CHOICES if c[0] in TRANSFER_REASONS],
-        widget=UnfoldAdminSelectWidget,
-    )
-    notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget)
-
-    def __init__(self, *args, stock, **kwargs):
-        super().__init__(*args, **kwargs)
-        allowed = adjustment_services.ALLOWED_STOCK_TYPE_TRANSFERS.get(stock.stock_type, set())
-        self.fields["to_type"].choices = [
-            c for c in InventoryStock.STOCK_TYPE_CHOICES if c[0] in allowed
-        ]
 
 
 @admin.register(InventoryStock)
@@ -239,8 +197,12 @@ class InventoryStockAdmin(ModelAdmin):
         # changes only through adjust_inventory_stock() below.
         reorder_level = form.cleaned_data.get("reorder_level")
         if reorder_level != InventoryStock.objects.get(pk=obj.pk).reorder_level:
-            InventoryStock.objects.filter(pk=obj.pk).update(reorder_level=reorder_level)
-            self.message_user(request, "Reorder level updated.", level=messages.SUCCESS)
+            try:
+                adjustment_services.set_reorder_level(obj, reorder_level)
+            except adjustment_services.InventoryAdjustmentError as exc:
+                self.message_user(request, str(exc), level=messages.ERROR)
+            else:
+                self.message_user(request, "Reorder level updated.", level=messages.SUCCESS)
         delta = form.cleaned_data.get("quantity_delta")
         if not delta:
             self.message_user(request, "No quantity_delta given — quantity unchanged.", level=messages.INFO)

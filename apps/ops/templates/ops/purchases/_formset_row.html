@@ -1,0 +1,6 @@
+<tr class="{% if form.errors %}row--error{% endif %}">
+  {% for field in form %}{% if field.name != "DELETE" %}
+  <td data-label="{{ field.label }}"><div class="field">{{ field }}{% for e in field.errors %}<p class="field__error">{{ e }}</p>{% endfor %}</div></td>
+  {% endif %}{% endfor %}
+  <td data-label="Remove">{% if form.DELETE %}{{ form.DELETE }}{% endif %}</td>
+</tr>

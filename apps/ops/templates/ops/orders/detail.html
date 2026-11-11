@@ -1,4 +1,5 @@
 {% extends "ops/base.html" %}
+{% load ops_tags %}
 {% block title %}{{ order.order_number }}{% endblock %}
 {% block page_title %}<a class="crumb" href="{% url 'ops:order_list' %}">{% include "ops/_icon.html" with name="back" %}Orders</a>{% endblock %}
 {% block content %}
@@ -42,7 +43,7 @@
       <dt>Name</dt><dd>{{ customer }}</dd>
       {% if contact %}<dt>Contact</dt><dd>{{ contact }}</dd>{% endif %}
       {% if order.guest_email %}<dt>Guest email</dt><dd>{{ order.guest_email }}</dd>{% endif %}
-      {% if order.created_by %}<dt>Recorded by</dt><dd>{{ order.created_by.full_name|default:order.created_by.email }}</dd>{% endif %}
+      {% if order.created_by %}<dt>Recorded by</dt><dd>{{ order.created_by|person }}</dd>{% endif %}
     </dl>
   </section>
   <section class="card">
@@ -106,7 +107,7 @@
         <td data-label="Date">{{ payment.payment_date|date:"d M Y" }}</td>
         <td data-label="Method">{{ payment.get_method_display }}</td>
         <td data-label="Reference">{{ payment.reference|default:"—" }}</td>
-        <td data-label="Recorded by">{{ payment.recorded_by.full_name|default:payment.recorded_by.email|default:"—" }}</td>
+        <td data-label="Recorded by">{{ payment.recorded_by|person }}</td>
         <td data-label="Amount" class="num">₹{{ payment.amount|floatformat:"2g" }}</td>
       </tr>
       {% endfor %}

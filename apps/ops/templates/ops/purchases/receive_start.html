@@ -1,0 +1,20 @@
+{% extends "ops/base.html" %}
+{% block title %}Receive goods · {{ po.po_number }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:po_detail' po.po_number %}">{% include "ops/_icon.html" with name="back" %}{{ po.po_number }}</a>{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Receive goods for {{ po.po_number }}</h1>
+  <p class="muted">Starts a draft goods receipt from {{ po.supplier }}. Nothing is received until you enter quantities and post it.</p>
+</div></div>
+<section class="card">
+  <form method="post" class="stack" novalidate>
+    {% csrf_token %}
+    {% include "ops/_form_errors.html" %}
+    <div class="form-grid">{% for field in form %}{% include "ops/_field.html" with field=field %}{% endfor %}</div>
+    <div class="form-actions">
+      <a class="button button--ghost" href="{% url 'ops:po_detail' po.po_number %}">Back</a>
+      <button type="submit" class="button button--primary" data-once>Start goods receipt</button>
+    </div>
+  </form>
+</section>
+{% endblock %}

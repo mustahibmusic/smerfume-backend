@@ -1,0 +1,29 @@
+{% extends "ops/base.html" %}
+{% block title %}Edit {{ receipt.grn_number }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:grn_detail' receipt.grn_number %}">{% include "ops/_icon.html" with name="back" %}{{ receipt.grn_number }}</a>{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Opening stock lines · {{ receipt.grn_number }}</h1>
+  <p class="muted">{{ receipt.warehouse }}. Stock on hand at cutover with its unit cost (ex tax). Stock is added when the receipt is posted; posted opening receipts cannot be reversed.</p>
+</div></div>
+<form method="post" class="stack" novalidate data-items-url="{% url 'ops:purchase_items' %}">
+  {% csrf_token %}
+  {% include "ops/_form_errors.html" with form=header %}
+  <section class="card">
+    <h2>Count</h2>
+    <div class="form-grid">
+      {% include "ops/_field.html" with field=header.received_date %}
+      {% include "ops/_field.html" with field=header.notes %}
+    </div>
+  </section>
+  <section>
+    <h2 class="section-title">Lines</h2>
+    {% include "ops/purchases/_formset_table.html" with formset=lines %}
+  </section>
+  <datalist id="sku-options"></datalist>
+  <div class="form-actions">
+    <a class="button button--ghost" href="{% url 'ops:grn_detail' receipt.grn_number %}">Cancel</a>
+    <button type="submit" class="button button--primary" data-once>Save draft receipt</button>
+  </div>
+</form>
+{% endblock %}

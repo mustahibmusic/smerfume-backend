@@ -61,24 +61,55 @@ NAV_GROUPS = (
         NavItem("perfume_notes", "Perfume Notes", "catalog.view_perfumenote"),
     )),
     NavGroup("inventory", "Inventory", (
-        NavItem("stock", "Stock", "inventory.view_inventorystock"),
-        NavItem("partial_bottles", "Partial Bottles", "inventory.view_partialbottlelot"),
-        NavItem("stock_movements", "Stock Movements", "inventory.view_stockmovement"),
-        NavItem("reservations", "Reservations", "inventory.view_stockreservation"),
-        NavItem("warehouses", "Warehouses", "inventory.view_warehouse"),
-    )),
-    NavGroup("purchases", "Purchases", (
-        NavItem("vendors", "Vendors", "inventory.view_supplier"),
-        NavItem("purchase_orders", "Purchase Orders", "purchases.view_purchaseorder"),
-        NavItem("goods_receipts", "Goods Receipts", "purchases.view_goodsreceipt"),
-        NavItem("supplier_payments", "Supplier Payments", "purchases.view_purchaseorderpayment"),
-        NavItem("paid_through", "Paid Through Accounts", "purchases.view_paymentaccount"),
         NavItem(
-            "receipt_discrepancies", "Receipt Discrepancies", "purchases.view_receiptdiscrepancy",
+            "stock", "Stock", "inventory.view_inventorystock", "ops:stock_list", icon="stock",
+            description="Stock by item, type and warehouse; adjust and transfer.",
         ),
         NavItem(
-            "booked_quantity_history", "Booked Quantity History",
-            "purchases.view_bookedquantitychange",
+            "partial_bottles", "Partial Bottles", "inventory.view_partialbottlelot", "ops:partial_lot_list",
+            icon="bottle", description="Open bottles used for decants.",
+        ),
+        NavItem(
+            "stock_movements", "Stock Movements", "inventory.view_stockmovement", "ops:movement_list",
+            icon="movements", description="Every stock change, newest first.",
+        ),
+        NavItem(
+            "reservations", "Reservations", "inventory.view_stockreservation", "ops:reservation_list",
+            icon="reservations", description="Stock held for orders.",
+        ),
+        NavItem(
+            "warehouses", "Warehouses", "inventory.view_warehouse", "ops:warehouse_list", icon="warehouse",
+            description="Stock locations (read-only).",
+        ),
+    )),
+    NavGroup("purchases", "Purchases", (
+        NavItem(
+            "vendors", "Vendors", "inventory.view_supplier", "ops:vendor_list", icon="vendor",
+            description="Supplier details and their purchase orders.",
+        ),
+        NavItem(
+            "purchase_orders", "Purchase Orders", "purchases.view_purchaseorder", "ops:po_list", icon="po",
+            description="Issue, confirm bookings, close and pay purchase orders.",
+        ),
+        NavItem(
+            "goods_receipts", "Goods Receipts", "purchases.view_goodsreceipt", "ops:grn_list", icon="receipt",
+            description="Post, cancel and reverse goods receipts.",
+        ),
+        NavItem(
+            "supplier_payments", "Supplier Payments", "purchases.view_purchaseorderpayment", "ops:payment_list",
+            icon="refunds", description="Payment ledger with drafts and proof.",
+        ),
+        NavItem(
+            "paid_through", "Paid Through Accounts", "purchases.view_paymentaccount", "ops:account_list",
+            icon="wallet", description="Accounts payments are made from (read-only).",
+        ),
+        NavItem(
+            "receipt_discrepancies", "Receipt Discrepancies", "purchases.view_receiptdiscrepancy",
+            "ops:discrepancy_list", icon="alert", description="Delivery problems to resolve.",
+        ),
+        NavItem(
+            "booked_quantity_history", "Booked Quantity History", "purchases.view_bookedquantitychange",
+            "ops:booked_list", icon="history", description="Vendor-confirmed quantity changes.",
         ),
     )),
     NavGroup("customers", "Customers", (

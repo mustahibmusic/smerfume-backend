@@ -2,7 +2,7 @@ from django import forms
 from django.utils import timezone
 
 from apps.catalog.models import ProductVariant
-from apps.inventory.models import Warehouse
+from apps.inventory.models import InventoryStock, StockMovement, StockReservation, Supplier, Warehouse
 from apps.orders import payments as order_payments
 from apps.orders.forms import (
     BaseInStoreLineFormSet,
@@ -11,6 +11,14 @@ from apps.orders.forms import (
     RecordPaymentForm,
 )
 from apps.orders.models import Order, Refund, Return
+from apps.purchases.models import (
+    PAYMENT_STATUS_CHOICES,
+    GoodsReceipt,
+    PaymentAccount,
+    PurchaseOrder,
+    PurchaseOrderPayment,
+    ReceiptDiscrepancy,
+)
 
 
 def _with_all(choices):
@@ -108,3 +116,110 @@ class OpsRecordPaymentForm(RecordPaymentForm):
         self.fields["method"].widget = forms.Select(choices=self.fields["method"].choices)
         self.fields["reference"].widget = forms.TextInput(attrs={"maxlength": 100, "autocomplete": "off"})
         self.fields["notes"].widget = forms.Textarea(attrs={"rows": 3})
+
+
+# ── Inventory filters ───────────────────────────────────────────────────────
+# Warehouses are chosen by public id, never by database id.
+
+
+def _warehouse_filter():
+    return forms.ModelChoiceField(
+        queryset=Warehouse.objects.order_by("name"), to_field_name="public_id",
+        required=False, empty_label="All",
+    )
+
+
+class StockFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="Search")
+    stock_type = forms.ChoiceField(
+        required=False, choices=_with_all(InventoryStock.STOCK_TYPE_CHOICES), label="Stock type",
+    )
+    warehouse = _warehouse_filter()
+    low_stock = forms.BooleanField(required=False, label="At or below reorder level")
+
+
+class PartialLotFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="SKU")
+    warehouse = _warehouse_filter()
+    state = forms.ChoiceField(
+        required=False, label="State",
+        choices=[("", "All"), ("open", "Open"), ("depleted", "Depleted")],
+    )
+
+
+class MovementFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="SKU or notes")
+    movement_type = forms.ChoiceField(
+        required=False, choices=_with_all(StockMovement.MOVEMENT_TYPE_CHOICES), label="Movement",
+    )
+    reason = forms.ChoiceField(required=False, choices=_with_all(StockMovement.REASON_CHOICES))
+    warehouse = _warehouse_filter()
+
+
+class ReservationFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="Order number or SKU")
+    status = forms.ChoiceField(
+        required=False, label="Status",
+        choices=[("", "All"), ("active", "Active (held or confirmed)")] + list(StockReservation.STATUS_CHOICES),
+    )
+    purpose = forms.ChoiceField(required=False, choices=_with_all(StockReservation.PURPOSE_CHOICES))
+    warehouse = _warehouse_filter()
+
+
+# ── Purchases filters ───────────────────────────────────────────────────────
+# Vendors and accounts are chosen by business code / public id.
+
+
+class VendorFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="Search")
+    state = forms.ChoiceField(
+        required=False, label="State", choices=[("", "All"), ("active", "Active"), ("inactive", "Inactive")],
+    )
+
+
+class PurchaseOrderFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="PO, vendor or SKU")
+    status = forms.ChoiceField(required=False, choices=_with_all(PurchaseOrder.STATUS_CHOICES))
+    vendor = forms.ModelChoiceField(
+        queryset=Supplier.objects.order_by("name"), to_field_name="vendor_code", required=False,
+        empty_label="All",
+    )
+    payment_status = forms.ChoiceField(
+        required=False, choices=_with_all(PAYMENT_STATUS_CHOICES), label="Payment",
+    )
+    overdue = forms.BooleanField(required=False, label="Overdue only")
+
+
+class GoodsReceiptFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="GRN, PO or vendor")
+    status = forms.ChoiceField(required=False, choices=_with_all(GoodsReceipt.STATUS_CHOICES))
+    receipt_type = forms.ChoiceField(
+        required=False, choices=_with_all(GoodsReceipt.TYPE_CHOICES), label="Type",
+    )
+
+
+class PaymentLedgerFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="Payment #, PO, vendor or reference")
+    status = forms.ChoiceField(required=False, choices=_with_all(PurchaseOrderPayment.STATUS_CHOICES))
+    entry_type = forms.ChoiceField(
+        required=False, choices=_with_all(PurchaseOrderPayment.TYPE_CHOICES), label="Entry",
+    )
+    method = forms.ChoiceField(
+        required=False, choices=_with_all(PurchaseOrderPayment.METHOD_CHOICES), label="Mode",
+    )
+    paid_through = forms.ModelChoiceField(
+        queryset=PaymentAccount.objects.order_by("name"), to_field_name="public_id", required=False,
+        empty_label="All", label="Paid through",
+    )
+
+
+class DiscrepancyFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="GRN, PO or SKU")
+    status = forms.ChoiceField(required=False, choices=_with_all(ReceiptDiscrepancy.STATUS_CHOICES))
+    discrepancy_type = forms.ChoiceField(
+        required=False, choices=_with_all(ReceiptDiscrepancy.TYPE_CHOICES), label="Type",
+    )
+
+
+class BookedChangeFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="PO, SKU or note")

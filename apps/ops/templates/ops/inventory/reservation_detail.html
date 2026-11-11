@@ -1,0 +1,52 @@
+{% extends "ops/base.html" %}
+{% block title %}Reservation · {{ reservation.order_item.order.order_number }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:reservation_list' %}">{% include "ops/_icon.html" with name="back" %}Reservations</a>{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ reservation.variant }}</h1>
+    <p class="muted">
+      <code>{{ reservation.variant.sku }}</code> · {{ reservation.warehouse }} ·
+      {% if can_view_order %}<a href="{% url 'ops:order_detail' reservation.order_item.order.order_number %}">{{ reservation.order_item.order.order_number }}</a>{% else %}{{ reservation.order_item.order.order_number }}{% endif %}
+    </p>
+    <div class="badges"><span class="badge badge--info">{{ reservation.get_status_display }}</span><span class="badge">{{ reservation.get_purpose_display }}</span></div>
+  </div>
+</div>
+
+<section class="card">
+  <dl class="dl">
+    <dt>Quantity</dt><dd>{{ reservation.quantity|floatformat:"-2" }}</dd>
+    <dt>Created</dt><dd>{{ reservation.created_at|date:"d M Y, H:i" }}</dd>
+    <dt>Resolved</dt><dd>{{ reservation.resolved_at|date:"d M Y, H:i"|default:"—" }}</dd>
+  </dl>
+</section>
+
+<section class="card card--flush">
+  <h2 class="card__title">Allocations</h2>
+  {% if allocations %}
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Source</th><th scope="col" class="num">Units</th><th scope="col" class="num">ml</th><th scope="col">Incoming</th><th scope="col"><span class="visually-hidden">Action</span></th></tr></thead>
+    <tbody>
+      {% for allocation in allocations %}
+      <tr>
+        <td data-label="Source">{{ allocation.get_allocation_type_display }}{% if allocation.purchase_order_line %}<br><small class="muted">{{ allocation.purchase_order_line.purchase_order.po_number }}</small>{% endif %}</td>
+        <td data-label="Units" class="num">{{ allocation.units|floatformat:"-2"|default:"—" }}</td>
+        <td data-label="ml" class="num">{{ allocation.ml_amount|floatformat:"-2"|default:"—" }}</td>
+        <td data-label="Incoming">{{ allocation.get_incoming_status_display|default:"—" }}</td>
+        <td data-label="">
+          {% if allocation.can_reallocate %}
+          <form method="post" action="{% url 'ops:allocation_reallocate' allocation.public_id %}" data-confirm="Move these units off the purchase order? Free stock is used first, then other confirmed incoming stock. If the full quantity cannot be covered, nothing changes.">
+            {% csrf_token %}
+            <button type="submit" class="button" data-once>Reallocate</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="card__body muted">No allocations.</p>
+  {% endif %}
+</section>
+{% endblock %}

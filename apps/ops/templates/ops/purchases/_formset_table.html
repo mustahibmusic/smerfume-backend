@@ -1,0 +1,15 @@
+{% comment %}A formset as an editable table. Needs: formset, columns (field names). Rows are added from the empty form; rows are removed with their Remove box.{% endcomment %}
+<div class="formset" data-formset data-prefix="{{ formset.prefix }}">
+  {{ formset.management_form }}
+  {% if formset.non_form_errors %}<div class="alert alert--danger">{% for e in formset.non_form_errors %}<p>{{ e }}</p>{% endfor %}</div>{% endif %}
+  <div class="card card--flush">
+    <table class="table table--responsive formset__table">
+      <thead><tr>{% for field in formset.empty_form %}{% if field.name != "DELETE" %}<th scope="col">{{ field.label }}</th>{% endif %}{% endfor %}<th scope="col">Remove</th></tr></thead>
+      <tbody data-formset-body>
+        {% for form in formset %}{% include "ops/purchases/_formset_row.html" with form=form %}{% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <template data-formset-empty>{% include "ops/purchases/_formset_row.html" with form=formset.empty_form %}</template>
+  <button type="button" class="button" data-formset-add>+ Add row</button>
+</div>

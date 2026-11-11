@@ -1,0 +1,31 @@
+{% extends "ops/base.html" %}
+{% block title %}Paid Through accounts{% endblock %}
+{% block page_title %}Paid Through accounts{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Paid Through accounts</h1>
+  <p class="muted">Accounts supplier payments are made from, named as in Zoho Books. No balances or bank details.</p>
+</div>
+{% if can_add_account %}<a class="button button--primary" href="{% url 'ops:account_new' %}">New account</a>{% endif %}
+</div>
+{% if object_list %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Account</th><th scope="col">Kind</th><th scope="col">Status</th><th scope="col" class="num">Posted payments</th>{% if can_change_account %}<th scope="col"><span class="visually-hidden">Edit</span></th>{% endif %}</tr></thead>
+    <tbody>
+      {% for account in object_list %}
+      <tr>
+        <td data-label="Account"><strong>{{ account.name }}</strong></td>
+        <td data-label="Kind">{{ account.get_kind_display }}</td>
+        <td data-label="Status">{% if account.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}</td>
+        <td data-label="Posted payments" class="num">{{ account.posted_count }}</td>
+        {% if can_change_account %}<td data-label=""><a href="{% url 'ops:account_edit' account.public_id %}">Edit</a></td>{% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<section class="empty card"><h2>No accounts yet</h2></section>
+{% endif %}
+{% endblock %}

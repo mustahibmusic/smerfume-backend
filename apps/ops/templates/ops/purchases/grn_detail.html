@@ -1,0 +1,89 @@
+{% extends "ops/base.html" %}
+{% load ops_tags %}
+{% block title %}{{ receipt.grn_number }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:grn_list' %}">{% include "ops/_icon.html" with name="back" %}Goods receipts</a>{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ receipt.grn_number }}</h1>
+    <p class="muted">
+      {{ receipt.get_receipt_type_display }} · {{ receipt.warehouse }} · received {{ receipt.received_date|date:"d M Y" }}
+      {% if receipt.purchase_order %} · <a href="{% url 'ops:po_detail' receipt.purchase_order.po_number %}">{{ receipt.purchase_order.po_number }}</a>{% endif %}
+      {% if receipt.supplier %} · {{ receipt.supplier }}{% endif %}
+    </p>
+    <div class="badges"><span class="badge badge--info">{{ receipt.get_status_display }}</span></div>
+  </div>
+  <div class="page-actions">
+    {% if can_edit %}<a class="button" href="{% url 'ops:grn_edit' receipt.grn_number %}">{% if receipt.receipt_type == "opening" %}Edit lines{% else %}Enter received goods{% endif %}</a>{% endif %}
+    {% if can_post %}
+    <form method="post" action="{% url 'ops:grn_post' receipt.grn_number %}" data-confirm="Post {{ receipt.grn_number }}? Stock increases now and the receipt can no longer be changed.">
+      {% csrf_token %}<button type="submit" class="button button--primary" data-once>Post receipt</button>
+    </form>
+    {% endif %}
+    {% if can_reverse %}<a class="button button--ghost" href="{% url 'ops:grn_reverse' receipt.grn_number %}">Reverse receipt</a>{% endif %}
+  </div>
+</div>
+
+<section class="card card--flush">
+  <h2 class="card__title">Lines</h2>
+  {% if lines %}
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Item</th><th scope="col">Stock type</th><th scope="col" class="num">Quantity</th><th scope="col" class="num">Unit cost</th><th scope="col" class="num">Tax %</th></tr></thead>
+    <tbody>
+      {% for line in lines %}
+      <tr>
+        <td data-label="Item">{{ line.variant }}<br><code>{{ line.variant.sku }}</code></td>
+        <td data-label="Stock type">{{ line.get_stock_type_display }}</td>
+        <td data-label="Quantity" class="num">{{ line.quantity }}</td>
+        <td data-label="Unit cost" class="num">{% if line.unit_cost is not None %}₹{{ line.unit_cost|floatformat:"2g" }}{% else %}—{% endif %}</td>
+        <td data-label="Tax %" class="num">{{ line.tax_rate|floatformat:"-2"|default:"—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="card__body muted">No lines yet.</p>{% endif %}
+</section>
+
+{% if discrepancies %}
+<section class="card card--flush">
+  <h2 class="card__title">Discrepancies</h2>
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Type</th><th scope="col">Item</th><th scope="col" class="num">Quantity</th><th scope="col">Status</th></tr></thead>
+    <tbody>
+      {% for d in discrepancies %}
+      <tr>
+        <td data-label="Type">{% if receipt.status == "posted" %}<a href="{% url 'ops:discrepancy_detail' d.public_id %}">{{ d.get_discrepancy_type_display }}</a>{% else %}{{ d.get_discrepancy_type_display }}{% endif %}</td>
+        <td data-label="Item">{{ d.item_label }}</td>
+        <td data-label="Quantity" class="num">{{ d.quantity }}</td>
+        <td data-label="Status"><span class="badge">{{ d.get_status_display }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>Details</h2>
+  <dl class="dl">
+    <dt>Challan / invoice</dt><dd>{{ receipt.vendor_document_reference|default:"—" }}</dd>
+    {% if receipt.posted_at %}<dt>Posted</dt><dd>{{ receipt.posted_at|date:"d M Y, H:i" }} by {{ receipt.posted_by|person }}</dd>{% endif %}
+    {% if receipt.reverses %}<dt>Reverses</dt><dd><a href="{% url 'ops:grn_detail' receipt.reverses.grn_number %}">{{ receipt.reverses.grn_number }}</a> · {{ receipt.reversal_reason }}</dd>{% endif %}
+    {% if reversals %}<dt>Reversed by</dt><dd>{% for r in reversals %}<a href="{% url 'ops:grn_detail' r.grn_number %}">{{ r.grn_number }}</a>{% if not forloop.last %}, {% endif %}{% endfor %}</dd>{% endif %}
+    {% if receipt.cancel_reason %}<dt>Cancelled</dt><dd>{{ receipt.cancel_reason }}</dd>{% endif %}
+    {% if receipt.notes %}<dt>Notes</dt><dd class="prewrap">{{ receipt.notes }}</dd>{% endif %}
+  </dl>
+</section>
+
+{% if cancel_form %}
+<section class="card">
+  <h2>Cancel draft receipt</h2>
+  <p class="muted">No stock is affected.</p>
+  <form method="post" action="{% url 'ops:grn_cancel' receipt.grn_number %}" class="stack" data-confirm="Cancel this draft receipt?">
+    {% csrf_token %}
+    {% include "ops/_field.html" with field=cancel_form.reason %}
+    <div class="form-actions"><button type="submit" class="button button--danger" data-once>Cancel receipt</button></div>
+  </form>
+</section>
+{% endif %}
+{% endblock %}

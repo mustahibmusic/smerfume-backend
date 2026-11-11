@@ -1,0 +1,22 @@
+{% load ops_tags %}<section class="card card--flush">
+  <h2 class="card__title">Recent movements</h2>
+  {% if movements %}
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">When</th><th scope="col">Movement</th><th scope="col">Reason</th><th scope="col">By</th><th scope="col">Notes</th><th scope="col" class="num">Change</th></tr></thead>
+    <tbody>
+      {% for movement in movements %}
+      <tr>
+        <td data-label="When" class="nowrap">{{ movement.created_at|date:"d M Y, H:i" }}</td>
+        <td data-label="Movement">{{ movement.get_movement_type_display }}</td>
+        <td data-label="Reason">{{ movement.get_reason_display }}</td>
+        <td data-label="By">{{ movement.performed_by|person }}</td>
+        <td data-label="Notes">{{ movement.notes|default:"—" }}</td>
+        <td data-label="Change" class="num">{% if movement.quantity_delta > 0 %}+{% endif %}{{ movement.quantity_delta|floatformat:"-2" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="card__body muted">No movements yet.</p>
+  {% endif %}
+</section>

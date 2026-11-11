@@ -11,8 +11,15 @@
       return;
     }
     function setOpen(open) {
+      var wasOpen = shell.classList.contains("is-nav-open");
       shell.classList.toggle("is-nav-open", open);
       toggle.setAttribute("aria-expanded", open ? "true" : "false");
+      if (open) {
+        var target = document.querySelector("#ops-sidebar .nav__link.is-active") || document.querySelector("#ops-sidebar a");
+        if (target) { target.focus(); }
+      } else if (wasOpen) {
+        toggle.focus();
+      }
     }
     toggle.addEventListener("click", function () {
       setOpen(!shell.classList.contains("is-nav-open"));
@@ -21,7 +28,194 @@
       el.addEventListener("click", function () { setOpen(false); });
     });
     document.addEventListener("keydown", function (event) {
-      if (event.key === "Escape") { setOpen(false); }
+      if (event.key === "Escape" && shell.classList.contains("is-nav-open")) { setOpen(false); }
+    });
+  }
+
+  // Theme: Light / Dark / System. Saved per browser in localStorage
+  // ("ops-theme"); System (the default) removes data-theme so the CSS
+  // follows prefers-color-scheme. base.html applies it before first paint.
+  var THEME_KEY = "ops-theme";
+
+  function readTheme() {
+    try {
+      var value = window.localStorage.getItem(THEME_KEY);
+      return value === "light" || value === "dark" ? value : "system";
+    } catch (e) {
+      return "system";
+    }
+  }
+
+  function applyTheme(theme) {
+    if (theme === "light" || theme === "dark") {
+      document.documentElement.setAttribute("data-theme", theme);
+    } else {
+      document.documentElement.removeAttribute("data-theme");
+    }
+    document.querySelectorAll("[data-theme-set]").forEach(function (button) {
+      button.setAttribute("aria-pressed", button.getAttribute("data-theme-set") === theme ? "true" : "false");
+    });
+  }
+
+  function initTheme() {
+    applyTheme(readTheme());
+    document.addEventListener("click", function (event) {
+      var button = event.target.closest("[data-theme-set]");
+      if (!button) {
+        return;
+      }
+      var theme = button.getAttribute("data-theme-set");
+      try {
+        window.localStorage.setItem(THEME_KEY, theme);
+      } catch (e) { /* private mode: applies to this page only */ }
+      applyTheme(theme);
+    });
+  }
+
+  // Disclosure menus (account menu, row three-dot menus): one open at a
+  // time, close on outside click or Escape (focus back to the trigger).
+  function initMenus() {
+    function menus() {
+      return document.querySelectorAll("details[data-menu][open], details.row-menu[open]");
+    }
+    document.addEventListener("click", function (event) {
+      menus().forEach(function (menu) {
+        if (!menu.contains(event.target)) { menu.open = false; }
+      });
+    });
+    document.addEventListener("toggle", function (event) {
+      var opened = event.target;
+      if (!opened.open || !opened.matches || !opened.matches("details[data-menu], details.row-menu")) {
+        return;
+      }
+      menus().forEach(function (menu) {
+        if (menu !== opened) { menu.open = false; }
+      });
+      // Row menus live in scrollable table cards: float the list in the
+      // viewport (fixed) so the card cannot clip it; open upward near the bottom.
+      var list = opened.querySelector(".row-menu__list");
+      if (list) {
+        var rect = opened.querySelector("summary").getBoundingClientRect();
+        list.style.position = "fixed";
+        list.style.right = Math.max(8, window.innerWidth - rect.right) + "px";
+        list.style.top = rect.bottom + 4 + "px";
+        list.style.bottom = "auto";
+        var height = list.offsetHeight;
+        if (rect.bottom + 4 + height > window.innerHeight && rect.top - 4 - height > 0) {
+          list.style.top = rect.top - 4 - height + "px";
+        }
+      }
+    }, true);
+    window.addEventListener("scroll", function () {
+      document.querySelectorAll("details.row-menu[open]").forEach(function (menu) { menu.open = false; });
+    }, { passive: true });
+    window.addEventListener("resize", function () {
+      document.querySelectorAll("details.row-menu[open]").forEach(function (menu) { menu.open = false; });
+    });
+    document.addEventListener("keydown", function (event) {
+      if (event.key !== "Escape") {
+        return;
+      }
+      menus().forEach(function (menu) {
+        menu.open = false;
+        var summary = menu.querySelector("summary");
+        if (summary && menu.contains(document.activeElement)) { summary.focus(); }
+      });
+    });
+  }
+
+  // Phones: list filters fold behind a "Filters" button; search stays
+  // visible. Opened automatically when a filter other than search is set.
+  function initFilterToggle() {
+    document.querySelectorAll("form.filters[method='get']").forEach(function (form, index) {
+      var actions = form.querySelector(".filters__actions");
+      var extra = Array.prototype.slice.call(form.querySelectorAll(":scope > .field")).slice(1);
+      if (!actions || !extra.length) {
+        return;
+      }
+      var active = extra.filter(function (field) {
+        var input = field.querySelector("input, select");
+        return input && (input.type === "checkbox" ? input.checked : input.value);
+      }).length;
+      var id = "filters-more-" + index;
+      extra[0].id = extra[0].id || id;
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "button button--ghost filters__toggle";
+      button.setAttribute("aria-expanded", "false");
+      button.setAttribute("aria-controls", extra[0].id);
+      button.textContent = active ? "Filters (" + active + ")" : "Filters";
+      button.addEventListener("click", function () {
+        var open = form.classList.toggle("is-expanded");
+        button.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+      actions.insertBefore(button, actions.firstChild);
+      form.classList.add("is-collapsible");
+    });
+  }
+
+  // List filters: one removable chip per applied filter, from the GET form
+  // itself (labels and option text), so every list gets them for free.
+  function initFilterChips() {
+    document.querySelectorAll("form.filters[method='get']").forEach(function (form) {
+      var chips = [];
+      Array.prototype.forEach.call(form.elements, function (el) {
+        if (!el.name || el.type === "submit" || el.type === "button" || el.type === "hidden") {
+          return;
+        }
+        var value = el.type === "checkbox" ? (el.checked ? "on" : "") : (el.value || "").trim();
+        if (!value) {
+          return;
+        }
+        var label = form.querySelector("label[for='" + el.id + "']");
+        var text = el.tagName === "SELECT" ? el.options[el.selectedIndex].text : (el.type === "checkbox" ? "Yes" : value);
+        var name = label ? label.textContent.replace(/\*/g, "").trim() : el.name;
+        if (el.type === "checkbox" && el.closest("label")) {
+          name = el.closest("label").textContent.trim();
+          text = "";
+        }
+        chips.push({ el: el, name: name, text: text });
+      });
+      if (!chips.length) {
+        return;
+      }
+      var box = document.createElement("div");
+      box.className = "filter-chips";
+      box.setAttribute("aria-label", "Active filters");
+      var heading = document.createElement("span");
+      heading.className = "filter-chips__label";
+      heading.textContent = "Filtered by";
+      box.appendChild(heading);
+      chips.forEach(function (chip) {
+        var button = document.createElement("button");
+        button.type = "button";
+        button.className = "chip";
+        button.setAttribute("aria-label", "Remove filter " + chip.name + (chip.text ? ": " + chip.text : ""));
+        button.appendChild(document.createTextNode(chip.name + (chip.text ? ": " : "")));
+        if (chip.text) {
+          var strong = document.createElement("strong");
+          strong.textContent = chip.text;
+          button.appendChild(strong);
+        }
+        var x = document.createElement("span");
+        x.className = "chip__x";
+        x.setAttribute("aria-hidden", "true");
+        x.textContent = "×";
+        button.appendChild(x);
+        button.addEventListener("click", function () {
+          if (chip.el.type === "checkbox") { chip.el.checked = false; } else { chip.el.value = ""; }
+          form.submit();
+        });
+        box.appendChild(button);
+      });
+      if (chips.length > 1) {
+        var clear = document.createElement("a");
+        clear.className = "chip chip--clear";
+        clear.href = form.getAttribute("action") || window.location.pathname;
+        clear.textContent = "Clear all";
+        box.appendChild(clear);
+      }
+      form.insertAdjacentElement("afterend", box);
     });
   }
 
@@ -300,6 +494,10 @@
 
   document.addEventListener("DOMContentLoaded", function () {
     initSidebar();
+    initTheme();
+    initMenus();
+    initFilterChips();
+    initFilterToggle();
     initForms();
     initSale();
     initFormsets();

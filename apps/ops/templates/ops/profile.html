@@ -1,0 +1,40 @@
+{% extends "ops/base.html" %}
+{% block title %}Profile{% endblock %}
+{% block page_title %}Profile{% endblock %}
+{% block content %}
+{% with display_name=user.full_name|default:user.email|default:user.mobile_number %}
+<div class="page-head">
+  <div class="profile-head">
+    <span class="avatar avatar--lg" aria-hidden="true">{{ user.first_name|default:user.email|default:"?"|first|upper }}</span>
+    <div>
+      <h1>{{ display_name }}</h1>
+      <p class="muted">{{ user.role_label }}{% if user.is_superuser %} · Superuser{% endif %}</p>
+    </div>
+  </div>
+  <div class="page-actions">
+    <a class="button" href="{% url 'ops:password_change' %}">{% include "ops/_icon.html" with name="key" %}<span>Change password</span></a>
+  </div>
+</div>
+
+<div class="grid">
+  <section class="card">
+    <h2>Account</h2>
+    <dl class="dl">
+      <dt>Name</dt><dd>{{ user.full_name|default:"—" }}</dd>
+      <dt>Email</dt><dd>{{ user.email|default:"—" }}</dd>
+      <dt>Mobile</dt><dd>{{ user.mobile_number|default:"—" }}</dd>
+      <dt>Role</dt><dd>{{ user.role_label }}</dd>
+      <dt>Staff groups</dt><dd>{% if groups %}{{ groups|join:", " }}{% else %}<span class="muted">None</span>{% endif %}</dd>
+      <dt>Last sign-in</dt><dd>{{ user.last_login|date:"d M Y, H:i"|default:"—" }}</dd>
+      <dt>Member since</dt><dd>{{ user.date_joined|date:"d M Y" }}</dd>
+    </dl>
+    <p class="field__help profile-note">Name and access changes are made by a manager in Django Admin.</p>
+  </section>
+  <section class="card">
+    <h2>Appearance</h2>
+    <p class="muted profile-note">Theme for this browser. System follows your device setting.</p>
+    {% include "ops/_theme_switch.html" with theme_id="profile" %}
+  </section>
+</div>
+{% endwith %}
+{% endblock %}

@@ -1,5 +1,6 @@
 import logging
 
+from django.conf import settings
 from django.contrib.auth.views import redirect_to_login
 from django.http import Http404
 from django.shortcuts import render
@@ -17,6 +18,8 @@ def ops_context(request, active=""):
     return {
         "ops_nav": nav_for(request.user, active),
         "admin_switch_url": reverse("admin:index") if has_admin_access(request) else None,
+        # Storefront ("View site"), the same target as Django Admin's link.
+        "site_url": getattr(settings, "ADMIN_SITE_URL", ""),
     }
 
 

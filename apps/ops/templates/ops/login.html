@@ -8,6 +8,7 @@
       <span class="brand-text"><strong>Smerfume</strong><small>Panel</small></span>
     </div>
     <h1 class="auth__title">Sign in</h1>
+    <p class="auth__lead">Staff access to Smerfume operations.</p>
     <form method="post" action="{% url 'ops:login' %}" novalidate>
       {% csrf_token %}
       {% if form.non_field_errors %}

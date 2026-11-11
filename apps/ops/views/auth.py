@@ -3,12 +3,14 @@
 import posixpath
 from urllib.parse import unquote, urlsplit
 
+from django.contrib import messages
 from django.contrib.auth.forms import AuthenticationForm
-from django.contrib.auth.views import LoginView, LogoutView
+from django.contrib.auth.views import LoginView, LogoutView, PasswordChangeView
 from django.core.exceptions import ValidationError
 from django.urls import reverse, reverse_lazy
 
 from apps.ops.access import OPS_ACCESS_PERMISSION
+from apps.ops.mixins import OpsAccessMixin
 
 
 class OpsAuthenticationForm(AuthenticationForm):
@@ -64,3 +66,20 @@ class OpsLogoutView(LogoutView):
     """POST only (Django refuses GET with 405). Ends the session."""
 
     next_page = reverse_lazy("ops:login")
+
+
+class OpsPasswordChangeView(OpsAccessMixin, PasswordChangeView):
+    """GET/POST /ops/profile/password/: change your own password.
+
+    Django's PasswordChangeForm (old password + validated new password,
+    AUTH_PASSWORD_VALIDATORS applied); Django keeps the current session
+    signed in. Needs core.access_ops only; acts on the signed-in user only.
+    """
+
+    template_name = "ops/password_change.html"
+    success_url = reverse_lazy("ops:profile")
+
+    def form_valid(self, form):
+        response = super().form_valid(form)
+        messages.success(self.request, "Your password was changed.")
+        return response

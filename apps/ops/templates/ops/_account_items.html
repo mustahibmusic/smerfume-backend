@@ -1,0 +1,12 @@
+{% comment %}Account menu body, shared by the sidebar user menu and the top-bar account menu: theme, links, log out. Pass theme_id so each copy has unique ids.{% endcomment %}
+{% include "ops/_theme_switch.html" %}
+<div class="menu__sep" role="separator"></div>
+{% if site_url %}<a class="menu__item" href="{{ site_url }}" target="_blank" rel="noopener">{% include "ops/_icon.html" with name="external" %}<span>View site</span></a>{% endif %}
+<a class="menu__item" href="{% url 'ops:profile' %}">{% include "ops/_icon.html" with name="user" %}<span>Profile</span></a>
+<a class="menu__item" href="{% url 'ops:password_change' %}">{% include "ops/_icon.html" with name="key" %}<span>Change password</span></a>
+{% if admin_switch_url %}<a class="menu__item" href="{{ admin_switch_url }}">{% include "ops/_icon.html" with name="admin" %}<span>Django Admin</span></a>{% endif %}
+<div class="menu__sep" role="separator"></div>
+<form method="post" action="{% url 'ops:logout' %}">
+  {% csrf_token %}
+  <button type="submit" class="menu__item menu__item--danger"><span>Log out</span>{% include "ops/_icon.html" with name="logout" %}</button>
+</form>

@@ -28,3 +28,19 @@ class OpsNotFoundView(OpsAccessMixin, TemplateView):
     def get(self, request, *args, **kwargs):
         context = self.get_context_data(**kwargs)
         return self.render_to_response(context, status=404)
+
+
+class OpsProfileView(OpsAccessMixin, TemplateView):
+    """GET /ops/profile/: the signed-in user's own account, read-only.
+
+    Needs core.access_ops only and shows nobody else's data. Account
+    changes (name, password) stay in Django Admin; this page only adds the
+    per-browser theme choice.
+    """
+
+    template_name = "ops/profile.html"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["groups"] = list(self.request.user.groups.order_by("name").values_list("name", flat=True))
+        return context

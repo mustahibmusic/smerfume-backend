@@ -20,7 +20,7 @@
       {% csrf_token %}<button type="submit" class="button button--primary" data-once>Post receipt</button>
     </form>
     {% endif %}
-    {% if can_reverse %}<a class="button button--ghost" href="{% url 'ops:grn_reverse' receipt.grn_number %}">Reverse receipt</a>{% endif %}
+    {% if can_reverse %}<a class="button button--ghost button--danger-ghost" href="{% url 'ops:grn_reverse' receipt.grn_number %}">Reverse receipt</a>{% endif %}
   </div>
 </div>
 

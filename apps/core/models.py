@@ -26,3 +26,17 @@ class BaseModel(TimeStampedModel):
 
     class Meta:
         abstract = True
+
+
+class OpsAccess(models.Model):
+    """Permission holder only: no table, no rows.
+
+    Carries ``core.access_ops``, the explicit gate to the Smerfume
+    Operations backend (/ops/). Separate from Django Admin access
+    (``is_staff``): neither implies the other.
+    """
+
+    class Meta:
+        managed = False
+        default_permissions = ()
+        permissions = [("access_ops", "Can access Smerfume Operations")]

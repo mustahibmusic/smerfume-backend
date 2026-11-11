@@ -1,0 +1,11 @@
+{% extends "ops/base.html" %}
+{% block title %}No access{% endblock %}
+{% block page_title %}No access{% endblock %}
+{% block content %}
+<section class="empty">
+  <p class="empty__code">403</p>
+  <h1>You do not have access to this page</h1>
+  <p class="muted">Ask a manager to give your account the access it needs.</p>
+  {% if ops_nav %}<a class="button" href="{% url 'ops:home' %}">Go to Operations</a>{% endif %}
+</section>
+{% endblock %}

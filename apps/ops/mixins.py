@@ -5,14 +5,19 @@ from django.http import Http404
 from django.shortcuts import render
 from django.urls import reverse
 
-from apps.ops.access import has_ops_access
+from apps.ops.access import has_admin_access, has_ops_access
 from apps.ops.navigation import nav_for
 
 logger = logging.getLogger(__name__)
 
 
 def ops_context(request, active=""):
-    return {"ops_nav": nav_for(request.user, active)}
+    """Shared layout context: sidebar items, and the Django Admin switch
+    (None unless the user may open Django Admin)."""
+    return {
+        "ops_nav": nav_for(request.user, active),
+        "admin_switch_url": reverse("admin:index") if has_admin_access(request) else None,
+    }
 
 
 def render_forbidden(request):

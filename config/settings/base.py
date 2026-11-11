@@ -530,6 +530,8 @@ UNFOLD = {
                         "icon": "dashboard",
                         "link": reverse_lazy("admin:index"),
                     },
+                    # Switch to the Smerfume Panel (/ops/), shown only with core.access_ops.
+                    _nav_item("Smerfume Panel", "swap_horiz", "ops:home", "core.access_ops"),
                 ],
             },
             {

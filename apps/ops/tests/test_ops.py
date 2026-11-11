@@ -1,4 +1,4 @@
-"""Tests for the Smerfume Operations backend shell (/ops/), Phase 1."""
+"""Tests for the Smerfume Panel (/ops/), Phase 1."""
 
 import re
 import uuid
@@ -121,16 +121,15 @@ class AccessTests(TestCase):
         response = self.client.get(HOME_URL)
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "ops/home.html")
-        self.assertEqual(response.context["ops_nav"], [])
+        self.assertEqual(response.context["ops_nav"]["groups"], [])
+        self.assertEqual(response.context["quick_links"], [])
+        self.assertContains(response, "No sections are assigned")
+        self.assertNotContains(response, f'href="{LIST_URL}"')
 
-    def test_ops_user_sees_orders_and_nav(self):
+    def test_ops_user_sees_orders(self):
         self.client.force_login(_ops_user())
-        response = self.client.get(HOME_URL)
-        self.assertRedirects(response, LIST_URL)
         response = self.client.get(LIST_URL)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual([item["key"] for item in response.context["ops_nav"]], ["orders"])
-        self.assertTrue(response.context["ops_nav"][0]["active"])
         self.assertContains(response, self.order.order_number)
 
     def test_inactive_user_is_refused(self):
@@ -168,25 +167,120 @@ class AccessTests(TestCase):
         self.assertContains(response, admin_url)
 
 
+class HomeAndNavigationTests(TestCase):
+    def test_root_is_not_routed_to_ops(self):
+        # "/" stays reserved for the future storefront.
+        response = self.client.get("/")
+        self.assertNotEqual(response.status_code, 302)
+        self.assertEqual(response.status_code, 404)
+
+    def test_home_is_landing_page_not_redirect(self):
+        self.client.force_login(_ops_user())
+        response = self.client.get(HOME_URL)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "ops/home.html")
+        self.assertContains(response, "Welcome")
+        self.assertEqual([link["key"] for link in response.context["quick_links"]], ["orders"])
+        self.assertContains(response, f'href="{LIST_URL}"')
+
+    def test_home_runs_no_domain_queries(self):
+        self.client.force_login(_ops_user())
+
+        def count():
+            with CaptureQueriesContext(connection) as ctx:
+                self.assertEqual(self.client.get(HOME_URL).status_code, 200)
+            return [q["sql"] for q in ctx.captured_queries if "orders_" in q["sql"]]
+
+        _order(70)
+        self.assertEqual(count(), [])
+
+    def test_sidebar_groups_and_active_state(self):
+        self.client.force_login(_ops_user())
+        nav = self.client.get(HOME_URL).context["ops_nav"]
+        self.assertTrue(nav["home"]["active"])
+        self.assertEqual([group["key"] for group in nav["groups"]], ["sales"])
+        self.assertFalse(nav["groups"][0]["open"])
+
+        order = _order(71)
+        for url in (LIST_URL, reverse("ops:order_detail", args=[order.order_number])):
+            response = self.client.get(url)
+            nav = response.context["ops_nav"]
+            self.assertFalse(nav["home"]["active"], url)
+            sales = nav["groups"][0]
+            self.assertTrue(sales["open"], url)
+            self.assertEqual([(i["key"], i["active"]) for i in sales["items"]], [("orders", True)])
+            self.assertContains(response, 'data-nav-group="sales" open')
+            for hidden in ("Catalog", "Inventory", "Purchases", "Customers"):
+                self.assertNotContains(response, f"<span>{hidden}</span>")
+        self.assertContains(response, "Smerfume")
+        self.assertContains(response, "<small>Panel</small>")
+
+
+class AdminSwitchTests(TestCase):
+    """Ops -> Django Admin and Admin -> Ops links follow each panel's own
+    access rule."""
+
+    def test_no_admin_switch_without_admin_access(self):
+        self.client.force_login(_ops_user())
+        response = self.client.get(HOME_URL)
+        self.assertIsNone(response.context["admin_switch_url"])
+        self.assertNotContains(response, "Switch to Django Admin")
+        self.assertNotContains(response, "data-admin-switch")
+
+    def test_admin_switch_for_admin_capable_user(self):
+        self.client.force_login(_ops_user("opsadmin", is_staff=True))
+        for url in (HOME_URL, LIST_URL):
+            response = self.client.get(url)
+            admin_index = reverse("admin:index")
+            self.assertEqual(response.context["admin_switch_url"], admin_index)
+            self.assertContains(response, "Switch to Django Admin")
+            self.assertContains(response, f'href="{admin_index}"')
+
+    def test_admin_sidebar_links_to_smerfume_panel_only_with_access_ops(self):
+        self.client.force_login(_ops_user("bothpanels", is_staff=True))
+        response = self.client.get(reverse("admin:index"))
+        self.assertContains(response, "Smerfume Panel")
+        self.assertContains(response, f'href="{HOME_URL}"')
+
+        self.client.force_login(_staff("adminonly", "orders.view_order", is_staff=True))
+        response = self.client.get(reverse("admin:index"))
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "Smerfume Panel")
+
+
 class LoginLogoutTests(TestCase):
     def test_login_with_access_redirects_to_ops(self):
         _ops_user()
         response = self.client.post(LOGIN_URL, {"username": "opsuser@example.com", "password": PASSWORD})
-        self.assertRedirects(response, HOME_URL, target_status_code=302)
+        self.assertRedirects(response, HOME_URL)
         self.assertEqual(self.client.get(LIST_URL).status_code, 200)
 
-    def test_login_follows_safe_next_only(self):
-        _ops_user()
-        response = self.client.post(
-            LOGIN_URL, {"username": "opsuser@example.com", "password": PASSWORD, "next": LIST_URL},
-        )
-        self.assertRedirects(response, LIST_URL)
+    def _login_next(self, next_url, username="opsuser@example.com"):
         self.client.logout()
-        response = self.client.post(
-            LOGIN_URL,
-            {"username": "opsuser@example.com", "password": PASSWORD, "next": "https://evil.example/"},
+        return self.client.post(
+            LOGIN_URL, {"username": username, "password": PASSWORD, "next": next_url},
         )
-        self.assertRedirects(response, HOME_URL, target_status_code=302)
+
+    def test_login_follows_ops_next_only(self):
+        _ops_user()
+        self.assertRedirects(self._login_next(LIST_URL), LIST_URL)
+        self.assertRedirects(self._login_next("/ops/orders/?status=pending"), "/ops/orders/?status=pending")
+        for unsafe in (
+            "https://evil.example/", "//evil.example/ops/", "/admin/", "/api/orders/",
+            "/ops/../admin/", "/ops/%2e%2e/admin/", "/opsx/", LOGIN_URL, LOGOUT_URL, "",
+        ):
+            self.assertRedirects(self._login_next(unsafe), HOME_URL, msg_prefix=unsafe)
+
+    def test_superuser_ops_login_lands_on_ops(self):
+        User.objects.create_superuser(username="root2", email="root2@example.com", password=PASSWORD)
+        self.assertRedirects(self._login_next("", "root2@example.com"), HOME_URL)
+        self.assertRedirects(self._login_next("/admin/", "root2@example.com"), HOME_URL)
+
+    def test_signed_in_user_visiting_login_goes_to_ops(self):
+        self.client.force_login(_ops_user())
+        self.assertRedirects(self.client.get(LOGIN_URL), HOME_URL)
+        self.assertRedirects(self.client.get(LOGIN_URL, {"next": LIST_URL}), LIST_URL)
+        self.assertRedirects(self.client.get(LOGIN_URL, {"next": "/admin/"}), HOME_URL)
 
     def test_login_without_access_ops_is_refused(self):
         _staff("plainstaff", "orders.view_order", is_staff=True)
@@ -194,7 +288,7 @@ class LoginLogoutTests(TestCase):
             LOGIN_URL, {"username": "plainstaff@example.com", "password": PASSWORD},
         )
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "does not have access to Smerfume Operations")
+        self.assertContains(response, "does not have access to the Smerfume Panel")
         self.assertNotIn("_auth_user_id", self.client.session)
 
     def test_login_inactive_or_wrong_password_is_generic(self):

@@ -1,9 +1,36 @@
 {% extends "ops/base.html" %}
-{% block title %}Operations{% endblock %}
-{% block page_title %}Operations{% endblock %}
+{% block title %}Home{% endblock %}
+{% block page_title %}Home{% endblock %}
 {% block content %}
-<section class="empty">
-  <h1>No sections available</h1>
-  <p class="muted">Your account can sign in to Operations but has no sections assigned yet.</p>
-</section>
+<div class="page-head">
+  <div>
+    <h1>Welcome, {{ user.first_name|default:user.full_name|default:user.email }}</h1>
+    <p class="muted">{% now "l, d F Y" %} · Smerfume Panel</p>
+  </div>
+</div>
+
+{% if quick_links %}
+  <section aria-labelledby="quick-access">
+    <h2 id="quick-access" class="section-title">Quick access</h2>
+    <ul class="quick-grid">
+      {% for link in quick_links %}
+        <li>
+          <a class="quick-card" href="{{ link.url }}">
+            <span class="quick-card__icon">{% include "ops/_icon.html" with name=link.icon %}</span>
+            <span class="quick-card__body">
+              <small class="muted">{{ link.group }}</small>
+              <strong>{{ link.label }}</strong>
+              {% if link.description %}<span class="muted">{{ link.description }}</span>{% endif %}
+            </span>
+          </a>
+        </li>
+      {% endfor %}
+    </ul>
+  </section>
+{% else %}
+  <section class="empty card">
+    <h2>No sections assigned</h2>
+    <p class="muted">No sections are assigned to your account yet. Ask a manager for access.</p>
+  </section>
+{% endif %}
 {% endblock %}

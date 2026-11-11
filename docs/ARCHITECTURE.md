@@ -427,11 +427,15 @@ Admin available at `/admin/`. Protected by Django's standard session authenticat
 
 ---
 
-## Operations Backend (CURRENT, Phase 1)
+## Smerfume Panel / Operations Backend (CURRENT, Phase 1)
 
-`/ops/` is the staff-facing operations UI (`apps.ops`), separate from Django Admin. Django Admin stays the technical/admin console (raw model management, permissions and groups, emergency operations, low-level inspection).
+`/ops/` is the Smerfume Panel, the staff-facing operations UI (`apps.ops`), separate from Django Admin. It is the default staff landing page. Django Admin stays the technical/admin console (raw model management, permissions and groups, emergency operations, low-level inspection) and is never the default landing page. The root `/` is not routed to the panel; it stays reserved for the customer storefront.
 
 - **Access:** session auth via `/ops/login/` and POST-only `/ops/logout/`. Gate permission `core.access_ops` (independent of `is_staff`), plus the model permission of each view (for example `orders.view_order`). Unknown paths, records and pages return a branded 404; missing permissions return a branded 403.
+- **Login redirect:** a same-host `next` that resolves (after dot segments) to an `/ops/` page other than login/logout; otherwise `/ops/`. Never Django Admin, superusers included.
+- **Home (`/ops/`):** welcome line and quick-access cards for implemented pages the user may open. No analytics.
+- **Sidebar:** "Smerfume Panel" brand, Home, then accordion groups (Sales, Catalog, Inventory, Purchases, Customers) from `apps/ops/navigation.py`. Only implemented, permitted pages show; empty groups are hidden; the active group is open.
+- **Panel switch:** "Switch to Django Admin" in the sidebar's bottom section, shown only when Django Admin's own `AdminSite.has_permission` allows the user (active + `is_staff`). The admin sidebar shows "Smerfume Panel" only to users with `core.access_ops`.
 - **Presentation only:** `apps.ops` holds views, UI forms, templates, presentation helpers and its own static assets (no Unfold assets). It has no business rules: reads use domain models, selectors and `apps/orders/payments`; writes (none yet) must call existing domain services.
 - **Identifiers:** ops-native URLs use public identifiers (`/ops/orders/<order_number>/`), never database PKs.
 - **Phase 1 scope:** Orders list (search, status/channel/payment filters, pagination) and read-only order detail.

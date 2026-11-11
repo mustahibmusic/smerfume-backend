@@ -1,6 +1,6 @@
 from django.urls import path, re_path
 
-from apps.ops.views import inventory, list_pages, payments, purchase_drafts, purchases, refunds, returns, sales
+from apps.ops.views import catalog, customers, inventory, list_pages, payments, purchase_drafts, purchases, refunds, returns, sales
 from apps.ops.views.auth import OpsLoginView, OpsLogoutView
 from apps.ops.views.home import OpsHomeView, OpsNotFoundView
 from apps.ops.views.orders import OrderDetailView
@@ -11,6 +11,30 @@ urlpatterns = [
     path("", OpsHomeView.as_view(), name="home"),
     path("login/", OpsLoginView.as_view(), name="login"),
     path("logout/", OpsLogoutView.as_view(), name="logout"),
+    # Catalog
+    path("catalog/products/", list_pages.ProductListPage.as_view(), name="product_list"),
+    path("catalog/products/<slug:slug>/", catalog.ProductDetailView.as_view(), name="product_detail"),
+    path("catalog/editions/", list_pages.EditionListPage.as_view(), name="edition_list"),
+    path("catalog/editions/<uuid:public_id>/", catalog.EditionDetailView.as_view(), name="edition_detail"),
+    path("catalog/variants/", list_pages.VariantListPage.as_view(), name="variant_list"),
+    path(
+        "catalog/variants/<str:sku>/images/upload/", catalog.GalleryUploadView.as_view(),
+        name="variant_image_upload",
+    ),
+    path(
+        "catalog/variants/<str:sku>/images/<uuid:image_id>/<slug:action>/",
+        catalog.GalleryImageActionView.as_view(), name="variant_image_action",
+    ),
+    path("catalog/variants/<str:sku>/", catalog.VariantDetailView.as_view(), name="variant_detail"),
+    path("catalog/brands/", list_pages.BrandListPage.as_view(), name="brand_list"),
+    path("catalog/brands/<slug:slug>/", catalog.BrandDetailView.as_view(), name="brand_detail"),
+    path("catalog/notes/", list_pages.PerfumeNoteListPage.as_view(), name="note_list"),
+    path("catalog/notes/<uuid:public_id>/", catalog.PerfumeNoteDetailView.as_view(), name="note_detail"),
+    # Customers
+    path("customers/", list_pages.CustomerListPage.as_view(), name="customer_list"),
+    path("customers/<uuid:public_id>/", customers.CustomerDetailView.as_view(), name="customer_detail"),
+    path("users/", list_pages.UserListPage.as_view(), name="user_list"),
+    path("users/<uuid:public_id>/", customers.UserDetailView.as_view(), name="user_detail"),
     # Sales
     path("orders/", list_pages.OrderListPage.as_view(), name="order_list"),
     path("orders/<str:order_number>/", OrderDetailView.as_view(), name="order_detail"),

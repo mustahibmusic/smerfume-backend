@@ -1,0 +1,43 @@
+{% extends "ops/base.html" %}
+{% block title %}Customers{% endblock %}
+{% block page_title %}Customers{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Customers</h1>
+  <p class="muted">{{ paginator.count }} customer{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %}</p>
+</div></div>
+<form method="get" class="filters filters--two" role="search">
+  {% include "ops/_field.html" with field=filter_form.q %}
+  {% include "ops/_field.html" with field=filter_form.state %}
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:customer_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+{% if object_list %}
+{% include "ops/_bulk_bar.html" %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr>{% include "ops/_list_select_all.html" %}<th scope="col">Customer</th><th scope="col">Mobile</th><th scope="col">Email</th><th scope="col">Joined</th><th scope="col">Status</th><th scope="col" class="num">Orders</th><th scope="col" class="actions-col">Actions</th></tr></thead>
+    <tbody>
+      {% for customer in object_list %}
+      <tr>
+        {% include "ops/_list_select_row.html" with obj=customer %}
+        <td data-label="Customer"><a class="link-strong" href="{% url 'ops:customer_detail' customer.public_id %}">{{ customer.full_name|default:"No name" }}</a></td>
+        <td data-label="Mobile" class="nowrap">{{ customer.mobile_number|default:"—" }}</td>
+        <td data-label="Email">{{ customer.email|default:"—" }}</td>
+        <td data-label="Joined">{{ customer.date_joined|date:"d M Y" }}</td>
+        <td data-label="Status">{% if customer.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}</td>
+        <td data-label="Orders" class="num">{{ customer.order_count }}</td>
+        {% include "ops/_row_actions.html" with obj=customer %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% include "ops/_pagination.html" %}
+{% else %}
+<section class="empty card"><h2>No customers found</h2></section>
+{% endif %}
+{% include "ops/_quick_drawer.html" %}
+{% endblock %}

@@ -1,0 +1,24 @@
+{% extends ops_layout|default:"ops/base.html" %}
+{% block title %}{{ product }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:product_list' %}">{% include "ops/_icon.html" with name="back" %}Products</a>{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>{{ product }}</h1>
+  <p class="muted">
+    {% if can_view_brand %}<a href="{% url 'ops:brand_detail' product.brand.slug %}">{{ product.brand.name }}</a>{% else %}{{ product.brand.name }}{% endif %}
+    · {{ product.category }} · <code>{{ product.slug }}</code>
+  </p>
+  <div class="badges">{% if product.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}</div>
+</div></div>
+{% for edition in editions %}
+<section class="card card--flush">
+  <h2 class="card__title">
+    {% if can_view_edition %}<a href="{% url 'ops:edition_detail' edition.public_id %}">{{ edition.name|default:"Standard edition" }}</a>{% else %}{{ edition.name|default:"Standard edition" }}{% endif %}
+    <small class="muted">{{ edition.get_concentration_display }} · {{ edition.get_gender_display }}{% if not edition.is_active %} · Inactive{% endif %}</small>
+  </h2>
+  {% include "ops/catalog/_variant_rows.html" with variants=edition.variants.all %}
+</section>
+{% empty %}
+<section class="empty card"><h2>No editions yet</h2></section>
+{% endfor %}
+{% endblock %}

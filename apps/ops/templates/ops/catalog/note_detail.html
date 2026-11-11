@@ -1,0 +1,25 @@
+{% extends ops_layout|default:"ops/base.html" %}
+{% block title %}{{ note.name }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:note_list' %}">{% include "ops/_icon.html" with name="back" %}Perfume notes</a>{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>{{ note.name }}</h1>
+  <p class="muted">{{ note.get_notes_category_display|default:"No family set" }}</p>
+</div></div>
+<section class="card card--flush">
+  <h2 class="card__title">Used in editions</h2>
+  {% if uses %}
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Edition</th><th scope="col">Position</th></tr></thead>
+    <tbody>
+      {% for use in uses %}
+      <tr>
+        <td data-label="Edition">{% if can_view_edition %}<a href="{% url 'ops:edition_detail' use.edition.public_id %}">{{ use.edition }}</a>{% else %}{{ use.edition }}{% endif %}</td>
+        <td data-label="Position">{{ use.get_position_display }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="card__body muted">Not used by any edition.</p>{% endif %}
+</section>
+{% endblock %}

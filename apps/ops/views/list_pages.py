@@ -10,6 +10,8 @@ payments, stock movements, booked-quantity history) get Quick view and
 their domain actions only, never Edit or Delete.
 """
 
+from urllib.parse import quote
+
 from django.urls import reverse
 
 from apps.ops.list_actions import (
@@ -21,7 +23,7 @@ from apps.ops.list_actions import (
     quick_view,
     row_quick_view,
 )
-from apps.ops.views import inventory, purchases, refunds, returns
+from apps.ops.views import catalog, customers, inventory, purchases, refunds, returns
 from apps.ops.views.orders import OrderListView
 from apps.ops.views.returns import RETURN_ACTIONS, order_can_create_return
 from apps.orders import payments as order_payments
@@ -307,3 +309,61 @@ class WarehouseListPage(ActionListMixin, inventory.WarehouseListView):
     def row_actions(self, warehouse, user):
         return [row_quick_view()]
 
+
+
+# ── Catalog (read-only; gallery changes are made on the variant page) ────────
+
+
+class BrandListPage(ActionListMixin, catalog.BrandListView):
+    ops_key_field = "slug"
+
+    def row_actions(self, brand, user):
+        return [quick_view(reverse("ops:brand_detail", args=[brand.slug]))]
+
+
+class PerfumeNoteListPage(ActionListMixin, catalog.PerfumeNoteListView):
+    def row_actions(self, note, user):
+        return [quick_view(reverse("ops:note_detail", args=[note.public_id]))]
+
+
+class ProductListPage(ActionListMixin, catalog.ProductListView):
+    ops_key_field = "slug"
+
+    def row_actions(self, product, user):
+        return [quick_view(reverse("ops:product_detail", args=[product.slug]))]
+
+
+class EditionListPage(ActionListMixin, catalog.EditionListView):
+    def row_actions(self, edition, user):
+        return [quick_view(reverse("ops:edition_detail", args=[edition.public_id]))]
+
+
+class VariantListPage(ActionListMixin, catalog.VariantListView):
+    ops_key_field = "sku"
+
+    def row_actions(self, variant, user):
+        url = reverse("ops:variant_detail", args=[variant.sku])
+        actions = [quick_view(url)]
+        if user.has_perm(catalog.VIEW_IMAGE):
+            actions.append(RowAction("Manage images", url + "#gallery", kind="view"))
+        return actions
+
+
+# ── Customers (read-only) ────────────────────────────────────────────────────
+
+
+class CustomerListPage(ActionListMixin, customers.CustomerListView):
+    def row_actions(self, customer, user):
+        actions = [quick_view(reverse("ops:customer_detail", args=[customer.public_id]))]
+        search = customer.mobile_number or customer.email
+        if search and user.has_perm("orders.view_order"):
+            actions.append(RowAction("Orders", f"{reverse('ops:order_list')}?q={quote(search)}", kind="view"))
+        return actions
+
+
+class UserListPage(ActionListMixin, customers.UserListView):
+    def row_actions(self, account, user):
+        actions = [quick_view(reverse("ops:user_detail", args=[account.public_id]))]
+        if customers.is_customer(account) and user.has_perm(customers.VIEW_CUSTOMER):
+            actions.append(RowAction("Customer", reverse("ops:customer_detail", args=[account.public_id]), kind="view"))
+        return actions

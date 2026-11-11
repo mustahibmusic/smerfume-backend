@@ -398,12 +398,6 @@ class SalesNavigationTests(TestCase):
         )
         self.assertTrue(sales["open"])
         self.assertNotIn('data-coming-soon="returns"', response.content.decode())
-        # Other groups stay planned placeholders.
-        others = [
-            i for g in response.context["ops_nav"]["groups"] if g["key"] in ("catalog", "customers")
-            for i in g["items"]
-        ]
-        self.assertTrue(others and not any(i["implemented"] for i in others))
         home = self.client.get(reverse("ops:home"))
         self.assertEqual(
             [link["key"] for link in home.context["quick_links"]][:4],

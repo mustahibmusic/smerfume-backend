@@ -1,0 +1,16 @@
+{% if variants %}
+<table class="table table--responsive">
+  <thead><tr><th scope="col">Variant</th><th scope="col">SKU</th><th scope="col" class="num">MRP</th><th scope="col" class="num">Selling price</th><th scope="col">Status</th></tr></thead>
+  <tbody>
+    {% for variant in variants %}
+    <tr>
+      <td data-label="Variant">{{ variant.size_ml }} ml{% if variant.is_decant %} <span class="badge badge--info">Decant</span>{% endif %}</td>
+      <td data-label="SKU" class="nowrap">{% if can_view_variant %}<a href="{% url 'ops:variant_detail' variant.sku %}"><code>{{ variant.sku }}</code></a>{% else %}<code>{{ variant.sku }}</code>{% endif %}</td>
+      <td data-label="MRP" class="num">₹{{ variant.mrp }}</td>
+      <td data-label="Selling price" class="num">₹{{ variant.selling_price }}</td>
+      <td data-label="Status">{% if variant.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="card__body muted">No variants yet.</p>{% endif %}

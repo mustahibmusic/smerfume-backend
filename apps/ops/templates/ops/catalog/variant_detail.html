@@ -1,0 +1,72 @@
+{% extends ops_layout|default:"ops/base.html" %}
+{% block title %}{{ variant.sku }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:variant_list' %}">{% include "ops/_icon.html" with name="back" %}Variants</a>{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>{{ variant }}</h1>
+  <p class="muted">
+    <code>{{ variant.sku }}</code>{% if variant.barcode %} · barcode {{ variant.barcode }}{% endif %} ·
+    {% if can_view_edition %}<a href="{% url 'ops:edition_detail' variant.edition.public_id %}">{{ variant.edition }}</a>{% else %}{{ variant.edition }}{% endif %}
+    {% if can_view_product %} · <a href="{% url 'ops:product_detail' variant.edition.product.slug %}">Product</a>{% endif %}
+  </p>
+  <div class="badges">
+    {% if variant.is_purchasable %}<span class="badge badge--ok">Purchasable</span>{% elif variant.is_active %}<span class="badge badge--warn">Active, but edition or product inactive</span>{% else %}<span class="badge">Inactive</span>{% endif %}
+    {% if variant.is_decant %}<span class="badge badge--info">Decant</span>{% endif %}
+  </div>
+</div>
+{% if can_view_stock %}<a class="button" href="{% url 'ops:stock_list' %}?q={{ variant.sku|urlencode }}">Stock</a>{% endif %}
+</div>
+<div class="stats">
+  <div class="stat"><span class="stat__label">Size</span><span class="stat__value">{{ variant.size_ml }} ml</span></div>
+  <div class="stat"><span class="stat__label">MRP</span><span class="stat__value">₹{{ variant.mrp }}</span></div>
+  <div class="stat"><span class="stat__label">Selling price</span><span class="stat__value">₹{{ variant.selling_price }}</span></div>
+  <div class="stat"><span class="stat__label">Shipping surcharge</span><span class="stat__value">₹{{ variant.shipping_surcharge }}</span></div>
+</div>
+
+{% if can_view_gallery %}
+<section class="card" id="gallery">
+  <h2>Gallery <small class="muted">{{ images|length }} / {{ max_images }}</small></h2>
+  <p class="muted">Primary is the canonical product image; secondary is only the card hover image. Removing an image never promotes another one.</p>
+  {% if images %}
+  <ul class="gallery">
+    {% for image in images %}
+    <li class="gallery__item">
+      <a href="{{ image.image.url }}" target="_blank" rel="noopener"><img src="{{ image.image.url }}" alt="{{ image.alt_text }}" loading="lazy"></a>
+      <div class="badges"><span class="badge{% if image.role != 'gallery' %} badge--info{% endif %}">{{ image.get_role_display }}</span>{% if image.width %}<small class="muted">{{ image.width }}×{{ image.height }}</small>{% endif %}</div>
+      {% if can_change_image %}
+      <form method="post" action="{% url 'ops:variant_image_action' variant.sku image.public_id 'role' %}" class="inline-form">
+        {% csrf_token %}<div class="field"><label class="visually-hidden" for="{{ image.role_form.role.id_for_label }}">Role</label>{{ image.role_form.role }}</div><button type="submit" class="button" data-once>Set role</button>
+      </form>
+      <form method="post" action="{% url 'ops:variant_image_action' variant.sku image.public_id 'alt-text' %}" class="inline-form">
+        {% csrf_token %}<div class="field"><label class="visually-hidden" for="{{ image.alt_form.alt_text.id_for_label }}">Alt text</label>{{ image.alt_form.alt_text }}</div><button type="submit" class="button" data-once>Save alt text</button>
+      </form>
+      {% if image.role == "gallery" %}
+      <div class="inline-form">
+        <form method="post" action="{% url 'ops:variant_image_action' variant.sku image.public_id 'up' %}">{% csrf_token %}<button type="submit" class="button button--ghost" aria-label="Move earlier">↑</button></form>
+        <form method="post" action="{% url 'ops:variant_image_action' variant.sku image.public_id 'down' %}">{% csrf_token %}<button type="submit" class="button button--ghost" aria-label="Move later">↓</button></form>
+      </div>
+      {% endif %}
+      {% else %}
+      <p class="muted">{{ image.alt_text|default:"No alt text" }}</p>
+      {% endif %}
+      {% if can_delete_image %}
+      <form method="post" action="{% url 'ops:variant_image_action' variant.sku image.public_id 'remove' %}" data-confirm="Remove this image? This cannot be undone.">
+        {% csrf_token %}<button type="submit" class="button button--danger" data-once>Remove</button>
+      </form>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}<p class="muted">No gallery images yet.</p>{% endif %}
+  {% if can_add_image %}
+  <form method="post" action="{% url 'ops:variant_image_upload' variant.sku %}" enctype="multipart/form-data" class="stack">
+    {% csrf_token %}
+    {% include "ops/_field.html" with field=upload_form.images %}
+    <p class="muted">Images are checked and converted on upload (max {{ max_upload_mb }} MB each). Duplicates are refused.</p>
+    <div class="form-actions"><button type="submit" class="button button--primary" data-once>Upload</button></div>
+  </form>
+  {% endif %}
+  {% if variant.image %}<p class="muted">A legacy single image is also stored for this variant (not part of the gallery).</p>{% endif %}
+</section>
+{% endif %}
+{% endblock %}

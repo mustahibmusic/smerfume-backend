@@ -97,8 +97,6 @@ class PurchasesNavigationAndAccessTests(_Base):
         self.assertTrue(purchases["open"])
         self.assertTrue(all(item["implemented"] for item in purchases["items"]))
         self.assertEqual(len(purchases["items"]), 7)
-        for key in ("catalog", "customers"):
-            self.assertFalse(any(i["implemented"] for i in groups[key]["items"]), key)
         self.assertNotIn('data-coming-soon="purchase_orders"', response.content.decode())
 
     def test_each_page_needs_its_view_permission(self):

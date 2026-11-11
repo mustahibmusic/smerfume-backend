@@ -1,0 +1,42 @@
+{% extends "ops/base.html" %}
+{% block title %}Brands{% endblock %}
+{% block page_title %}Brands{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Brands</h1>
+  <p class="muted">{{ paginator.count }} brand{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %}</p>
+</div></div>
+<form method="get" class="filters filters--three" role="search">
+  {% include "ops/_field.html" with field=filter_form.q %}
+  {% include "ops/_field.html" with field=filter_form.brand_category %}
+  {% include "ops/_field.html" with field=filter_form.state %}
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:brand_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+{% if object_list %}
+{% include "ops/_bulk_bar.html" %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr>{% include "ops/_list_select_all.html" %}<th scope="col">Brand</th><th scope="col">Category</th><th scope="col">Status</th><th scope="col" class="num">Products</th><th scope="col" class="actions-col">Actions</th></tr></thead>
+    <tbody>
+      {% for brand in object_list %}
+      <tr>
+        {% include "ops/_list_select_row.html" with obj=brand %}
+        <td data-label="Brand"><a class="link-strong" href="{% url 'ops:brand_detail' brand.slug %}">{{ brand.name }}</a><br><small class="muted"><code>{{ brand.slug }}</code></small></td>
+        <td data-label="Category">{{ brand.get_brand_category_display }}</td>
+        <td data-label="Status">{% if brand.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}</td>
+        <td data-label="Products" class="num">{{ brand.product_count }}</td>
+        {% include "ops/_row_actions.html" with obj=brand %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% include "ops/_pagination.html" %}
+{% else %}
+<section class="empty card"><h2>No brands found</h2></section>
+{% endif %}
+{% include "ops/_quick_drawer.html" %}
+{% endblock %}

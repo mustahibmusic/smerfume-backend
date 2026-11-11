@@ -1,0 +1,28 @@
+{% extends ops_layout|default:"ops/base.html" %}
+{% block title %}{{ brand.name }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:brand_list' %}">{% include "ops/_icon.html" with name="back" %}Brands</a>{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>{{ brand.name }}</h1>
+  <p class="muted"><code>{{ brand.slug }}</code> · {{ brand.get_brand_category_display }}</p>
+  <div class="badges">{% if brand.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}</div>
+</div></div>
+<section class="card card--flush">
+  <h2 class="card__title">Products</h2>
+  {% if products %}
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Product</th><th scope="col">Category</th><th scope="col">Status</th><th scope="col" class="num">Editions</th></tr></thead>
+    <tbody>
+      {% for product in products %}
+      <tr>
+        <td data-label="Product">{% if can_view_product %}<a href="{% url 'ops:product_detail' product.slug %}">{{ product.name }}</a>{% else %}{{ product.name }}{% endif %}</td>
+        <td data-label="Category">{{ product.category }}</td>
+        <td data-label="Status">{% if product.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}</td>
+        <td data-label="Editions" class="num">{{ product.edition_count }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="card__body muted">No products yet.</p>{% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,47 @@
+{% extends "ops/base.html" %}
+{% block title %}Purchase orders{% endblock %}
+{% block page_title %}Purchase orders{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Purchase orders</h1>
+  <p class="muted">{{ paginator.count }} purchase order{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %}</p>
+</div></div>
+<form method="get" class="filters filters--four" role="search">
+  {% include "ops/_field.html" with field=filter_form.q %}
+  {% include "ops/_field.html" with field=filter_form.status %}
+  {% include "ops/_field.html" with field=filter_form.vendor %}
+  {% if can_view_payments %}{% include "ops/_field.html" with field=filter_form.payment_status %}{% endif %}
+  <label class="check"><input type="checkbox" name="overdue"{% if filter_form.overdue.value %} checked{% endif %}> Overdue only</label>
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:po_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+{% if object_list %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">PO</th><th scope="col">Vendor</th><th scope="col">Ordered</th><th scope="col">Expected</th><th scope="col">Status</th><th scope="col" class="num">Lines</th><th scope="col" class="num">Ordered total</th>{% if can_view_payments %}<th scope="col" class="num">Net paid</th><th scope="col">Payment</th>{% endif %}</tr></thead>
+    <tbody>
+      {% for po in object_list %}
+      <tr>
+        <td data-label="PO" class="nowrap"><a class="link-strong" href="{% url 'ops:po_detail' po.po_number %}">{{ po.po_number }}</a></td>
+        <td data-label="Vendor">{{ po.supplier }}</td>
+        <td data-label="Ordered" class="nowrap">{{ po.order_date|date:"d M Y" }}</td>
+        <td data-label="Expected" class="nowrap">{{ po.expected_date|date:"d M Y"|default:"—" }}</td>
+        <td data-label="Status"><span class="badge">{{ po.get_status_display }}</span></td>
+        <td data-label="Lines" class="num">{{ po.line_count }}</td>
+        <td data-label="Ordered total" class="num">{% if po.ordered_gross_total_db is not None %}₹{{ po.ordered_gross_total_db|floatformat:"2g" }}{% else %}—{% endif %}</td>
+        {% if can_view_payments %}
+        <td data-label="Net paid" class="num">₹{{ po.net_paid_db|floatformat:"2g" }}</td>
+        <td data-label="Payment">{% for key, label in payment_status_labels.items %}{% if key == po.payment_status_db %}<span class="badge">{{ label }}</span>{% endif %}{% endfor %}</td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% include "ops/_pagination.html" %}
+{% else %}
+<section class="empty card"><h2>No purchase orders found</h2><p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Purchase orders are created in Django Admin for now.{% endif %}</p></section>
+{% endif %}
+{% endblock %}

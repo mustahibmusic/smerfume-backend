@@ -1,0 +1,35 @@
+{% extends "ops/base.html" %}
+{% load ops_tags %}
+{% block title %}Discrepancy · {{ discrepancy.receipt.grn_number }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:discrepancy_list' %}">{% include "ops/_icon.html" with name="back" %}Receipt discrepancies</a>{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>{{ discrepancy.get_discrepancy_type_display }} · {{ discrepancy.item_label }}</h1>
+  <p class="muted"><a href="{% url 'ops:grn_detail' discrepancy.receipt.grn_number %}">{{ discrepancy.receipt.grn_number }}</a>{% if discrepancy.receipt.purchase_order %} · <a href="{% url 'ops:po_detail' discrepancy.receipt.purchase_order.po_number %}">{{ discrepancy.receipt.purchase_order.po_number }}</a>{% endif %} · {{ discrepancy.receipt.supplier|default:"" }}</p>
+  <div class="badges"><span class="badge badge--info">{{ discrepancy.get_status_display }}</span></div>
+</div></div>
+<section class="card">
+  <dl class="dl">
+    <dt>Quantity</dt><dd>{{ discrepancy.quantity }}</dd>
+    {% if discrepancy.observed_item_description %}<dt>Observed item</dt><dd>{{ discrepancy.observed_item_description }}</dd>{% endif %}
+    {% if discrepancy.notes %}<dt>Notes</dt><dd class="prewrap">{{ discrepancy.notes }}</dd>{% endif %}
+    <dt>Reported</dt><dd>{{ discrepancy.created_at|date:"d M Y, H:i" }} by {{ discrepancy.created_by|person }}</dd>
+    {% if discrepancy.resolved_at %}
+      <dt>Resolution</dt><dd>{{ discrepancy.get_resolution_display }}</dd>
+      {% if discrepancy.resolution_notes %}<dt>Resolution notes</dt><dd class="prewrap">{{ discrepancy.resolution_notes }}</dd>{% endif %}
+      <dt>Resolved</dt><dd>{{ discrepancy.resolved_at|date:"d M Y, H:i" }} by {{ discrepancy.resolved_by|person }}</dd>
+    {% endif %}
+  </dl>
+</section>
+{% if resolve_form %}
+<section class="card">
+  <h2>Resolve</h2>
+  <p class="muted">Records the outcome only: no stock movement and no accounting entry.</p>
+  <form method="post" action="{% url 'ops:discrepancy_resolve' discrepancy.public_id %}" class="stack">
+    {% csrf_token %}
+    <div class="form-grid">{% for field in resolve_form %}{% include "ops/_field.html" with field=field %}{% endfor %}</div>
+    <div class="form-actions"><button type="submit" class="button button--primary" data-once>Resolve</button></div>
+  </form>
+</section>
+{% endif %}
+{% endblock %}

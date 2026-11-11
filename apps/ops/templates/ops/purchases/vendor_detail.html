@@ -1,0 +1,40 @@
+{% extends "ops/base.html" %}
+{% block title %}{{ vendor.name }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:vendor_list' %}">{% include "ops/_icon.html" with name="back" %}Vendors</a>{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>{{ vendor.name }}</h1>
+  <p class="muted"><code>{{ vendor.vendor_code }}</code>{% if vendor.legal_name %} · {{ vendor.legal_name }}{% endif %}</p>
+  <div class="badges">{% if vendor.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}</div>
+</div></div>
+<section class="card">
+  <dl class="dl">
+    <dt>GST treatment</dt><dd>{{ vendor.get_gst_treatment_display|default:"—" }}</dd>
+    <dt>GSTIN</dt><dd>{{ vendor.gstin|default:"—" }}</dd>
+    <dt>State</dt><dd>{{ vendor.get_state_display|default:vendor.state|default:"—" }}</dd>
+    <dt>Contact</dt><dd>{{ vendor.contact_person|default:"—" }}</dd>
+    <dt>Phone</dt><dd>{{ vendor.phone|default:"—" }}</dd>
+    <dt>Email</dt><dd>{{ vendor.email|default:"—" }}</dd>
+  </dl>
+</section>
+{% if can_view_pos %}
+<section class="card card--flush">
+  <h2 class="card__title">Recent purchase orders</h2>
+  {% if orders %}
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">PO</th><th scope="col">Date</th><th scope="col">Warehouse</th><th scope="col">Status</th></tr></thead>
+    <tbody>
+      {% for po in orders %}
+      <tr>
+        <td data-label="PO" class="nowrap"><a href="{% url 'ops:po_detail' po.po_number %}">{{ po.po_number }}</a></td>
+        <td data-label="Date">{{ po.order_date|date:"d M Y" }}</td>
+        <td data-label="Warehouse">{{ po.warehouse }}</td>
+        <td data-label="Status"><span class="badge">{{ po.get_status_display }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="card__body muted">No purchase orders yet.</p>{% endif %}
+</section>
+{% endif %}
+{% endblock %}

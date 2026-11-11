@@ -152,6 +152,8 @@ small { font-size: 12px; }
 .alert { padding: 10px 14px; border-radius: 8px; }
 .alert p { margin: 0; }
 .alert--danger { background: var(--danger-soft); color: var(--danger); }
+.alert--info { background: var(--info-soft); color: var(--info); margin: 0; }
+form.inline { display: inline; }
 .messages { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
 .message { padding: 10px 14px; border-radius: 8px; background: var(--info-soft); color: var(--info); }
 .message--success { background: var(--ok-soft); color: var(--ok); }

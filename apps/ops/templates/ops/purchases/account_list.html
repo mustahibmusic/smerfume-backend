@@ -1,0 +1,28 @@
+{% extends "ops/base.html" %}
+{% block title %}Paid Through accounts{% endblock %}
+{% block page_title %}Paid Through accounts{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Paid Through accounts</h1>
+  <p class="muted">Accounts supplier payments are made from, named as in Zoho Books. Read-only here; managers add and deactivate them in Django Admin.</p>
+</div></div>
+{% if object_list %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Account</th><th scope="col">Kind</th><th scope="col">Status</th><th scope="col" class="num">Posted payments</th></tr></thead>
+    <tbody>
+      {% for account in object_list %}
+      <tr>
+        <td data-label="Account"><strong>{{ account.name }}</strong></td>
+        <td data-label="Kind">{{ account.get_kind_display }}</td>
+        <td data-label="Status">{% if account.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}</td>
+        <td data-label="Posted payments" class="num">{{ account.posted_count }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<section class="empty card"><h2>No accounts yet</h2></section>
+{% endif %}
+{% endblock %}

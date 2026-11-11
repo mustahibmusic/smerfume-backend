@@ -245,14 +245,16 @@ class HomeAndNavigationTests(TestCase):
         self.assertEqual(implemented, [
             "orders", "in_store_sale", "returns", "refunds",
             "stock", "partial_bottles", "stock_movements", "reservations", "warehouses",
+            "vendors", "purchase_orders", "goods_receipts", "supplier_payments", "paid_through",
+            "receipt_discrepancies", "booked_quantity_history",
         ])
         for item in items:
             if not item["implemented"]:
                 self.assertIsNone(item["url"], item["key"])
                 self.assertFalse(item["active"], item["key"])
         html = response.content.decode()
-        self.assertEqual(html.count("Coming soon"), len(items) - 9)
-        self.assertEqual(html.count("data-coming-soon="), len(items) - 9)
+        self.assertEqual(html.count("Coming soon"), len(items) - 16)
+        self.assertEqual(html.count("data-coming-soon="), len(items) - 16)
         self.assertIn('data-coming-soon="products"', html)
         # Coming-soon items are not links.
         self.assertNotRegex(html, r'<a [^>]*data-coming-soon')

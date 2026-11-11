@@ -73,7 +73,7 @@ class InventoryNavigationTests(TestCase):
              ("stock_movements", True, MOVES_URL), ("reservations", True, RES_URL),
              ("warehouses", True, WH_URL)],
         )
-        for key in ("catalog", "purchases", "customers"):
+        for key in ("catalog", "customers"):
             self.assertFalse(any(i["implemented"] for i in groups[key]["items"]), key)
         html = response.content.decode()
         self.assertNotIn('data-coming-soon="stock"', html)

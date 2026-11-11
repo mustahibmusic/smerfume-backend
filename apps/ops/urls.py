@@ -1,6 +1,6 @@
 from django.urls import path, re_path
 
-from apps.ops.views import inventory, payments, refunds, returns, sales
+from apps.ops.views import inventory, payments, purchases, refunds, returns, sales
 from apps.ops.views.auth import OpsLoginView, OpsLogoutView
 from apps.ops.views.home import OpsHomeView, OpsNotFoundView
 from apps.ops.views.orders import OrderDetailView, OrderListView
@@ -83,6 +83,62 @@ urlpatterns = [
         name="allocation_reallocate",
     ),
     path("inventory/warehouses/", inventory.WarehouseListView.as_view(), name="warehouse_list"),
+    # Purchases
+    path("purchases/vendors/", purchases.VendorListView.as_view(), name="vendor_list"),
+    path("purchases/vendors/<str:vendor_code>/", purchases.VendorDetailView.as_view(), name="vendor_detail"),
+    path("purchases/orders/", purchases.PurchaseOrderListView.as_view(), name="po_list"),
+    path("purchases/orders/<str:po_number>/", purchases.PurchaseOrderDetailView.as_view(), name="po_detail"),
+    path("purchases/orders/<str:po_number>/issue/", purchases.PurchaseOrderIssueView.as_view(), name="po_issue"),
+    path("purchases/orders/<str:po_number>/close/", purchases.PurchaseOrderCloseView.as_view(), name="po_close"),
+    path("purchases/orders/<str:po_number>/cancel/", purchases.PurchaseOrderCancelView.as_view(), name="po_cancel"),
+    path(
+        "purchases/orders/<str:po_number>/tax-treatment/", purchases.PurchaseOrderTaxTreatmentView.as_view(),
+        name="po_tax_treatment",
+    ),
+    path(
+        "purchases/orders/<str:po_number>/confirm-booked/", purchases.PurchaseOrderConfirmBookedView.as_view(),
+        name="po_confirm_booked",
+    ),
+    path(
+        "purchases/orders/<str:po_number>/payments/new/", purchases.PaymentEntryView.as_view(),
+        name="po_payment_new",
+    ),
+    path(
+        "purchases/orders/<str:po_number>/vendor-refund/", purchases.PurchaseOrderVendorRefundView.as_view(),
+        name="po_vendor_refund",
+    ),
+    path(
+        "purchases/orders/<str:po_number>/reverse-entry/", purchases.PurchaseOrderReverseEntryView.as_view(),
+        name="po_reverse_entry",
+    ),
+    path("purchases/payments/", purchases.PaymentLedgerView.as_view(), name="payment_list"),
+    path("purchases/payments/<uuid:public_id>/", purchases.PaymentEntryView.as_view(), name="payment_entry"),
+    path(
+        "purchases/attachments/<uuid:public_id>/", purchases.PaymentAttachmentDownloadView.as_view(),
+        name="payment_attachment",
+    ),
+    path("purchases/paid-through/", purchases.PaymentAccountListView.as_view(), name="account_list"),
+    path("purchases/receipts/", purchases.GoodsReceiptListView.as_view(), name="grn_list"),
+    path("purchases/receipts/<str:grn_number>/", purchases.GoodsReceiptDetailView.as_view(), name="grn_detail"),
+    path("purchases/receipts/<str:grn_number>/post/", purchases.GoodsReceiptPostView.as_view(), name="grn_post"),
+    path(
+        "purchases/receipts/<str:grn_number>/cancel/", purchases.GoodsReceiptCancelView.as_view(),
+        name="grn_cancel",
+    ),
+    path(
+        "purchases/receipts/<str:grn_number>/reverse/", purchases.GoodsReceiptReverseView.as_view(),
+        name="grn_reverse",
+    ),
+    path("purchases/discrepancies/", purchases.DiscrepancyListView.as_view(), name="discrepancy_list"),
+    path(
+        "purchases/discrepancies/<uuid:public_id>/", purchases.DiscrepancyDetailView.as_view(),
+        name="discrepancy_detail",
+    ),
+    path(
+        "purchases/discrepancies/<uuid:public_id>/resolve/", purchases.DiscrepancyResolveView.as_view(),
+        name="discrepancy_resolve",
+    ),
+    path("purchases/booked-history/", purchases.BookedChangeListView.as_view(), name="booked_list"),
     # Must stay last: branded 404 for any other /ops/ path.
     re_path(r"^.*$", OpsNotFoundView.as_view(), name="not_found"),
 ]

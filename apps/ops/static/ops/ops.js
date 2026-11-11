@@ -28,7 +28,8 @@
   function initForms() {
     document.addEventListener("submit", function (event) {
       var form = event.target;
-      var message = form.getAttribute("data-confirm");
+      var submitter = event.submitter;
+      var message = (submitter && submitter.getAttribute("data-confirm-button")) || form.getAttribute("data-confirm");
       if (message && !window.confirm(message)) {
         event.preventDefault();
         return;

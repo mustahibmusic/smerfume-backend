@@ -400,7 +400,7 @@ class SalesNavigationTests(TestCase):
         self.assertNotIn('data-coming-soon="returns"', response.content.decode())
         # Other groups stay planned placeholders.
         others = [
-            i for g in response.context["ops_nav"]["groups"] if g["key"] in ("catalog", "purchases", "customers")
+            i for g in response.context["ops_nav"]["groups"] if g["key"] in ("catalog", "customers")
             for i in g["items"]
         ]
         self.assertTrue(others and not any(i["implemented"] for i in others))

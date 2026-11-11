@@ -1,0 +1,123 @@
+{% extends "ops/base.html" %}
+{% load ops_tags %}
+{% block title %}{{ po.po_number }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:po_list' %}">{% include "ops/_icon.html" with name="back" %}Purchase orders</a>{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ po.po_number }}</h1>
+    <p class="muted">{{ po.supplier }} · {{ po.warehouse }} · ordered {{ po.order_date|date:"d M Y" }}{% if po.expected_date %} · expected {{ po.expected_date|date:"d M Y" }}{% endif %}</p>
+    <div class="badges">
+      <span class="badge badge--info">{{ po.get_status_display }}</span>
+      <span class="badge">{{ po.get_purchase_tax_treatment_display|default:"Tax treatment not set" }}</span>
+      {% if open_discrepancies %}<span class="badge badge--warn">{{ open_discrepancies }} open discrepanc{{ open_discrepancies|pluralize:"y,ies" }}</span>{% endif %}
+    </div>
+  </div>
+  <div class="page-actions">
+    {% if actions.issue %}<a class="button button--primary" href="{% url 'ops:po_issue' po.po_number %}">Issue</a>{% endif %}
+    {% if actions.confirm_booked %}<a class="button" href="{% url 'ops:po_confirm_booked' po.po_number %}">Confirm booked quantity</a>{% endif %}
+    {% if actions.record_payment %}<a class="button button--primary" href="{% url 'ops:po_payment_new' po.po_number %}">Record payment</a>{% endif %}
+    {% if actions.record_vendor_refund %}<a class="button" href="{% url 'ops:po_vendor_refund' po.po_number %}">Record vendor refund</a>{% endif %}
+    {% if actions.reverse_payment_entry %}<a class="button" href="{% url 'ops:po_reverse_entry' po.po_number %}">Reverse entry</a>{% endif %}
+    {% if actions.set_tax_treatment %}<a class="button" href="{% url 'ops:po_tax_treatment' po.po_number %}">Set tax treatment</a>{% endif %}
+    {% if actions.close %}<a class="button button--ghost" href="{% url 'ops:po_close' po.po_number %}">Close</a>{% endif %}
+    {% if actions.cancel %}<a class="button button--ghost" href="{% url 'ops:po_cancel' po.po_number %}">Cancel</a>{% endif %}
+  </div>
+</div>
+
+{% if actions.receive or po.status == "draft" %}
+<p class="alert alert--info">{% if po.status == "draft" %}Draft purchase orders are edited in Django Admin for now.{% else %}Receiving goods (entering received lines) is done in Django Admin for now; posting, cancelling and reversing receipts work here.{% endif %}</p>
+{% endif %}
+
+<section class="card card--flush">
+  <h2 class="card__title">Lines</h2>
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Item</th><th scope="col" class="num">Ordered</th><th scope="col" class="num">Received</th><th scope="col" class="num">Outstanding</th><th scope="col" class="num">Vendor-confirmed</th><th scope="col" class="num">Allocated (awaiting)</th><th scope="col" class="num">Incoming to sell</th><th scope="col" class="num">Unit price</th><th scope="col" class="num">Tax %</th></tr></thead>
+    <tbody>
+      {% for line in lines %}
+      <tr>
+        <td data-label="Item">{{ line.variant }}<br><code>{{ line.variant.sku }}</code></td>
+        <td data-label="Ordered" class="num">{{ line.quantity_ordered }}</td>
+        <td data-label="Received" class="num">{{ line.received_total }}</td>
+        <td data-label="Outstanding" class="num">{{ line.outstanding }}</td>
+        <td data-label="Vendor-confirmed" class="num">{{ line.confirmed_booked_quantity }}</td>
+        <td data-label="Allocated (awaiting)" class="num">{{ line.figures.allocated|floatformat:"-2" }}</td>
+        <td data-label="Incoming to sell" class="num">{{ line.figures.incoming|floatformat:"-2" }}</td>
+        <td data-label="Unit price" class="num">₹{{ line.unit_price|floatformat:"2g" }}</td>
+        <td data-label="Tax %" class="num">{{ line.tax_rate|floatformat:"-2"|default:"—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <dl class="totals">
+    <dt>Gross</dt><dd>₹{{ po.total_gross_amount|floatformat:"2g" }}</dd>
+    <dt>Discount</dt><dd>₹{{ po.total_discount_amount|floatformat:"2g" }}</dd>
+    <dt class="totals__grand">Ordered gross total</dt><dd class="totals__grand">{% if po.ordered_gross_total is not None %}₹{{ po.ordered_gross_total|floatformat:"2g" }}{% else %}—{% endif %}</dd>
+  </dl>
+</section>
+
+{% if payments %}
+<section class="card card--flush">
+  <h2 class="card__title">Supplier payments (operational)</h2>
+  <p class="card__body muted">Operational tracking against this PO only. Zoho Books is authoritative for vendor bills and amounts owed. Drafts are not counted.</p>
+  <div class="stats card__body">
+    <div class="stat"><span class="stat__label">Status</span><span class="stat__value stat__value--text"><span class="badge">{{ payments.status }}</span></span></div>
+    <div class="stat"><span class="stat__label">Net paid</span><span class="stat__value">₹{{ payments.summary.net_paid|floatformat:"2g" }}</span></div>
+    <div class="stat"><span class="stat__label">Remaining against PO</span><span class="stat__value">{% if payments.remaining is not None %}₹{{ payments.remaining|floatformat:"2g" }}{% else %}—{% endif %}</span></div>
+  </div>
+  {% if payments.entries %}
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Entry</th><th scope="col">Date</th><th scope="col">Type</th><th scope="col">Status</th><th scope="col">Mode</th><th scope="col">Paid through</th><th scope="col">Reference</th><th scope="col" class="num">Amount</th></tr></thead>
+    <tbody>
+      {% for entry in payments.entries %}
+      <tr>
+        <td data-label="Entry" class="nowrap"><a href="{% url 'ops:payment_entry' entry.public_id %}">{{ entry.payment_number|default:"Draft" }}</a></td>
+        <td data-label="Date">{{ entry.entry_date|date:"d M Y" }}</td>
+        <td data-label="Type">{{ entry.get_entry_type_display }}{% if entry.reverses %}<br><small class="muted">reverses {{ entry.reverses.payment_number|default:"an entry" }}</small>{% endif %}</td>
+        <td data-label="Status"><span class="badge{% if entry.is_draft %} badge--warn{% endif %}">{{ entry.get_status_display }}</span></td>
+        <td data-label="Mode">{{ entry.get_method_display }}</td>
+        <td data-label="Paid through">{{ entry.paid_through|default:"—" }}</td>
+        <td data-label="Reference">{{ entry.reference|default:"—" }}</td>
+        <td data-label="Amount" class="num">₹{{ entry.amount|floatformat:"2g" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="card__body muted">No payment entries.</p>{% endif %}
+</section>
+{% endif %}
+
+{% if receipts is not None %}
+<section class="card card--flush">
+  <h2 class="card__title">Goods receipts</h2>
+  {% if receipts %}
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">GRN</th><th scope="col">Received</th><th scope="col">Type</th><th scope="col">Status</th></tr></thead>
+    <tbody>
+      {% for receipt in receipts %}
+      <tr>
+        <td data-label="GRN" class="nowrap"><a href="{% url 'ops:grn_detail' receipt.grn_number %}">{{ receipt.grn_number }}</a></td>
+        <td data-label="Received">{{ receipt.received_date|date:"d M Y" }}</td>
+        <td data-label="Type">{{ receipt.get_receipt_type_display }}</td>
+        <td data-label="Status"><span class="badge">{{ receipt.get_status_display }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="card__body muted">No goods receipts yet.</p>{% endif %}
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>Details</h2>
+  <dl class="dl">
+    <dt>Vendor reference</dt><dd>{{ po.vendor_reference|default:"—" }}</dd>
+    <dt>Prices include tax</dt><dd>{{ po.amounts_include_tax|yesno:"Yes,No" }}</dd>
+    <dt>Created by</dt><dd>{{ po.created_by|person }}</dd>
+    {% if po.issued_at %}<dt>Issued</dt><dd>{{ po.issued_at|date:"d M Y, H:i" }} by {{ po.issued_by|person }}</dd>{% endif %}
+    {% if po.closed_at %}<dt>Closed</dt><dd>{{ po.closed_at|date:"d M Y, H:i" }} · {{ po.close_reason }}</dd>{% endif %}
+    {% if po.cancelled_at %}<dt>Cancelled</dt><dd>{{ po.cancelled_at|date:"d M Y, H:i" }} · {{ po.cancel_reason }}</dd>{% endif %}
+    {% if po.notes %}<dt>Notes</dt><dd class="prewrap">{{ po.notes }}</dd>{% endif %}
+  </dl>
+</section>
+{% endblock %}

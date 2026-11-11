@@ -1,0 +1,41 @@
+{% extends "ops/base.html" %}
+{% block title %}Receipt discrepancies{% endblock %}
+{% block page_title %}Receipt discrepancies{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Receipt discrepancies</h1>
+  <p class="muted">{{ paginator.count }} discrepanc{{ paginator.count|pluralize:"y,ies" }}{% if is_filtered %} match the filters{% endif %} · from posted receipts</p>
+</div></div>
+<form method="get" class="filters filters--three" role="search">
+  {% include "ops/_field.html" with field=filter_form.q %}
+  {% include "ops/_field.html" with field=filter_form.status %}
+  {% include "ops/_field.html" with field=filter_form.discrepancy_type %}
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:discrepancy_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+{% if object_list %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Reported</th><th scope="col">GRN</th><th scope="col">PO</th><th scope="col">Type</th><th scope="col">Item</th><th scope="col" class="num">Qty</th><th scope="col">Status</th></tr></thead>
+    <tbody>
+      {% for d in object_list %}
+      <tr>
+        <td data-label="Reported" class="nowrap"><a class="link-strong" href="{% url 'ops:discrepancy_detail' d.public_id %}">{{ d.created_at|date:"d M Y" }}</a></td>
+        <td data-label="GRN" class="nowrap">{{ d.receipt.grn_number }}</td>
+        <td data-label="PO" class="nowrap">{{ d.receipt.purchase_order.po_number|default:"—" }}</td>
+        <td data-label="Type">{{ d.get_discrepancy_type_display }}</td>
+        <td data-label="Item">{{ d.item_label }}</td>
+        <td data-label="Qty" class="num">{{ d.quantity }}</td>
+        <td data-label="Status"><span class="badge{% if d.status == 'open' %} badge--warn{% else %} badge--ok{% endif %}">{{ d.get_status_display }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% include "ops/_pagination.html" %}
+{% else %}
+<section class="empty card"><h2>No discrepancies</h2></section>
+{% endif %}
+{% endblock %}

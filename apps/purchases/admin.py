@@ -1,13 +1,11 @@
 from decimal import Decimal
 
 from django import forms
-from django.forms.models import ModelChoiceIterator
 from django.core.exceptions import PermissionDenied
 from django.contrib import admin, messages
 from django.db import transaction
 from django.db.models import Count, Exists, OuterRef, Q, Sum
 from django.utils.html import format_html, format_html_join
-from django.utils.safestring import mark_safe
 from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
@@ -16,21 +14,33 @@ from django.utils import timezone
 from unfold.admin import ModelAdmin, TabularInline
 from unfold.decorators import action, display
 from unfold.enums import ActionVariant
-from unfold.widgets import (
-    DATETIME_CLASSES,
-    UnfoldAdminDateWidget,
-    UnfoldAdminDecimalFieldWidget,
-    UnfoldAdminIntegerFieldWidget,
-    UnfoldAdminSelect2Widget,
-    UnfoldAdminSelectWidget,
-    UnfoldAdminTextareaWidget,
-    UnfoldAdminTextInputWidget,
-)
 
-from apps.inventory.models import Supplier, Warehouse
+from apps.inventory.models import Supplier
 
+from . import rules as purchase_rules
 from . import selectors
 from . import services as po_services
+from .forms import (  # noqa: F401  (re-exported for existing imports)
+    CancelPurchaseOrderForm,
+    ClosePurchaseOrderForm,
+    ConfirmBookedFormSet,
+    ConfirmBookedLineForm,
+    ConfirmBookedNoteForm,
+    GroupedPaymentAccountIterator,
+    MultipleFileField,
+    MultipleFileInput,
+    OpeningReceiptForm,
+    PaymentAccountChoiceField,
+    PaymentDateInput,
+    PaymentProofForm,
+    ReceiveGoodsForm,
+    ResolveDiscrepancyForm,
+    ReverseGoodsReceiptForm,
+    ReversePaymentEntryForm,
+    SetTaxTreatmentForm,
+    SupplierPaymentEntryForm,
+    SupplierPaymentForm,
+)
 from .models import (
     PAYMENT_STATUS_CHOICES,
     BookedQuantityChange,
@@ -165,311 +175,6 @@ class PurchaseOrderLineInline(TabularInline):
     @admin.display(description="Incoming available to sell")
     def incoming_available(self, line):
         return self._booking_figure(line, "incoming")
-
-
-class CancelPurchaseOrderForm(forms.Form):
-    reason = forms.CharField(widget=UnfoldAdminTextareaWidget, label="Reason for cancelling")
-
-
-class ClosePurchaseOrderForm(forms.Form):
-    reason = forms.CharField(widget=UnfoldAdminTextareaWidget, label="Reason for closing")
-
-
-class ConfirmBookedLineForm(forms.Form):
-    """One PO line on the Confirm booked quantity page. original_total is
-    the value the page was loaded with, so a stale page is refused."""
-
-    line = forms.IntegerField(widget=forms.HiddenInput)
-    original_total = forms.IntegerField(min_value=0, widget=forms.HiddenInput)
-    confirmed_total = forms.IntegerField(
-        min_value=0, label="New confirmed total",
-        widget=UnfoldAdminIntegerFieldWidget(attrs={"class": "max-w-24", "data-confirmed-total": ""}),
-    )
-
-
-class _BaseConfirmBookedFormSet(forms.BaseFormSet):
-    """Exactly one row per line of the purchase order, no more, no fewer."""
-
-    def __init__(self, *args, po_lines, **kwargs):
-        self.po_lines = {line.pk: line for line in po_lines}
-        super().__init__(*args, **kwargs)
-
-    def clean(self):
-        super().clean()
-        if any(self.errors):
-            return
-        submitted = [form.cleaned_data["line"] for form in self.forms]
-        if sorted(submitted) != sorted(self.po_lines):
-            raise forms.ValidationError(
-                "The lines on this page no longer match the purchase order. Reload the page."
-            )
-
-    def totals(self):
-        return {form.cleaned_data["line"]: form.cleaned_data["confirmed_total"] for form in self.forms}
-
-    def originals(self):
-        return {form.cleaned_data["line"]: form.cleaned_data["original_total"] for form in self.forms}
-
-
-ConfirmBookedFormSet = forms.formset_factory(
-    ConfirmBookedLineForm, formset=_BaseConfirmBookedFormSet, extra=0, max_num=1000,
-)
-
-
-class ConfirmBookedNoteForm(forms.Form):
-    # Required only when a total changes; the view and the service check that.
-    note = forms.CharField(
-        required=False, widget=UnfoldAdminTextareaWidget(attrs={"rows": 2}),
-        label="Vendor confirmation note",
-        help_text="One note for this save, e.g. who confirmed and how (mail, call, PI number).",
-    )
-
-
-class ReverseGoodsReceiptForm(forms.Form):
-    """One quantity field per reversible line plus a required reason."""
-
-    def __init__(self, *args, lines=(), reversible=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        reversible = reversible or {}
-        for line in lines:
-            remaining = reversible.get(line.pk, 0)
-            if remaining <= 0:
-                continue
-            self.fields[f"line_{line.pk}"] = forms.IntegerField(
-                required=False, min_value=0, max_value=remaining,
-                label=(
-                    f"{line.variant.sku} [{line.get_stock_type_display().lower()}]: "
-                    f"received {line.quantity}, reversible {remaining}"
-                ),
-                widget=UnfoldAdminTextInputWidget,
-            )
-        self.fields["reason"] = forms.CharField(
-            widget=UnfoldAdminTextareaWidget, label="Reason for reversal"
-        )
-
-    def quantities(self):
-        return {
-            int(name.removeprefix("line_")): value
-            for name, value in self.cleaned_data.items()
-            if name.startswith("line_") and value
-        }
-
-
-class ResolveDiscrepancyForm(forms.Form):
-    resolution = forms.ChoiceField(
-        choices=ReceiptDiscrepancy.RESOLUTION_CHOICES, widget=UnfoldAdminSelectWidget
-    )
-    notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget, label="Notes")
-
-
-class ReceiveGoodsForm(forms.Form):
-    received_date = forms.DateField(widget=UnfoldAdminDateWidget)
-    vendor_document_reference = forms.CharField(
-        required=False, max_length=100, widget=UnfoldAdminTextInputWidget,
-        label="Delivery challan / invoice number",
-    )
-
-
-class OpeningReceiptForm(forms.Form):
-    warehouse = forms.ModelChoiceField(
-        queryset=Warehouse.objects.filter(is_active=True).order_by("name"),
-        widget=UnfoldAdminSelectWidget,
-    )
-    received_date = forms.DateField(widget=UnfoldAdminDateWidget, label="Stock count date")
-    notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget)
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.fields["warehouse"].initial = Warehouse.objects.filter(is_default=True).first()
-        self.fields["received_date"].initial = timezone.localdate()
-
-
-class GroupedPaymentAccountIterator(ModelChoiceIterator):
-    """Paid Through options as <optgroup>s by kind, in the order the kinds are
-    declared on the model, accounts by name inside each group."""
-
-    def __iter__(self):
-        if self.field.empty_label is not None:
-            yield ("", self.field.empty_label)
-        labels = dict(PaymentAccount.KIND_CHOICES)
-        rank = {kind: i for i, kind in enumerate(labels)}
-        groups = {}
-        for account in self.queryset:
-            groups.setdefault(account.kind, []).append(account)
-        for kind in sorted(groups, key=lambda k: (rank.get(k, len(rank)), k)):
-            accounts = sorted(groups[kind], key=lambda a: a.name.lower())
-            yield (labels.get(kind, kind), [self.choice(a) for a in accounts])
-
-    def __len__(self):
-        return self.queryset.count() + (1 if self.field.empty_label is not None else 0)
-
-
-class PaymentAccountChoiceField(forms.ModelChoiceField):
-    """Grouped, searchable Paid Through select (Select2, Unfold theme)."""
-
-    iterator = GroupedPaymentAccountIterator
-
-    def __init__(self, **kwargs):
-        kwargs.setdefault("queryset", PaymentAccount.objects.filter(is_active=True))
-        kwargs.setdefault("widget", UnfoldAdminSelect2Widget)
-        kwargs.setdefault("empty_label", "Select an account")
-        super().__init__(**kwargs)
-
-    def label_from_instance(self, obj):
-        return obj.name if obj.is_active else f"{obj.name} (inactive)"
-
-
-class SupplierPaymentForm(forms.Form):
-    amount = forms.DecimalField(
-        max_digits=12, decimal_places=2, min_value=Decimal("0.01"), widget=UnfoldAdminDecimalFieldWidget,
-    )
-    entry_date = forms.DateField(widget=UnfoldAdminDateWidget, label="Date")
-    method = forms.ChoiceField(choices=PurchaseOrderPayment.METHOD_CHOICES, widget=UnfoldAdminSelectWidget)
-    reference = forms.CharField(
-        required=False, max_length=100, widget=UnfoldAdminTextInputWidget,
-        help_text="UTR, cheque or card slip number. Optional for cash.",
-    )
-    notes = forms.CharField(required=False, widget=UnfoldAdminTextareaWidget)
-    paid_through = PaymentAccountChoiceField(required=False, label="Paid through")
-
-    def __init__(self, *args, with_paid_through=True, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.fields["entry_date"].initial = timezone.localdate()
-        if not with_paid_through:
-            del self.fields["paid_through"]
-
-
-class PaymentDateInput(forms.DateInput):
-    """Native date picker: keyboard entry and a calendar without the admin
-    calendar script (which needs jsi18n), and an unambiguous ISO value."""
-
-    input_type = "date"
-    template_name = "unfold/widgets/date.html"
-
-    def __init__(self, attrs=None):
-        super().__init__(attrs={"class": " ".join(DATETIME_CLASSES), **(attrs or {})}, format="%Y-%m-%d")
-
-
-class MultipleFileInput(forms.ClearableFileInput):
-    allow_multiple_selected = True
-
-
-class MultipleFileField(forms.FileField):
-    """Several proof files in one input; the service validates their content."""
-
-    def __init__(self, *args, **kwargs):
-        # Unfold's prebuilt CSS has no file: utilities, so the input is
-        # transparent over a styled "Upload files" label in the template.
-        kwargs.setdefault("widget", MultipleFileInput(attrs={
-            "accept": "application/pdf,image/jpeg,image/png,image/webp",
-            "class": "absolute cursor-pointer inset-0 opacity-0",
-        }))
-        kwargs.setdefault("required", False)
-        super().__init__(*args, **kwargs)
-
-    def clean(self, data, initial=None):
-        single = super().clean
-        if isinstance(data, (list, tuple)):
-            return [single(item, initial) for item in data if item]
-        return [single(data, initial)] if data else []
-
-
-class PaymentProofForm(forms.Form):
-    attachments = MultipleFileField(
-        label="Attachments",
-        help_text="PDF, JPG, PNG or WebP. Up to 5 files per payment, 5 MB each. "
-                  "If the form shows an error, select the files again.",
-    )
-
-    def __init__(self, *args, existing_count=0, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.existing_count = existing_count
-
-    def clean_attachments(self):
-        files = self.cleaned_data["attachments"]
-        limit = SupplierPaymentAttachment.MAX_PER_PAYMENT
-        if self.existing_count + len(files) > limit:
-            raise forms.ValidationError(
-                f"A payment can have at most {limit} attachments ({self.existing_count} already attached)."
-            )
-        return files
-
-
-class SupplierPaymentEntryForm(SupplierPaymentForm, PaymentProofForm):
-    """DEC-011 Record Payment form: Save as Draft or Save as Paid."""
-
-    # ISO only: en-us parsing would read a typed 01/11/2026 as 11 January.
-    entry_date = forms.DateField(widget=PaymentDateInput, input_formats=["%Y-%m-%d"], label="Payment date")
-    # Display only: disabled fields ignore submitted data; the service numbers on posting.
-    payment_number = forms.CharField(
-        required=False, disabled=True, label="Payment #",
-        widget=UnfoldAdminTextInputWidget(attrs={"placeholder": "Assigned when saved as paid"}),
-    )
-
-    field_order = (
-        "amount", "method", "entry_date", "payment_number", "paid_through", "reference", "notes", "attachments",
-    )
-
-    def __init__(self, *args, current_account=None, posting=False, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.posting = posting
-        self.fields["entry_date"].widget.attrs["max"] = timezone.localdate().isoformat()
-        self.fields["method"].label = "Payment mode"
-        self.fields["notes"].widget.attrs["rows"] = 3
-        # Not a required field (drafts may omit it), so Unfold draws no marker itself.
-        self.fields["paid_through"].label = mark_safe('Paid through <span class="text-red-600">*</span>')
-        self.fields["paid_through"].help_text = "Required to save as paid. Optional on a draft."
-        if current_account is not None:
-            # Keep a draft's now-inactive account visible; posting will refuse it.
-            self.fields["paid_through"].queryset = PaymentAccount.objects.filter(
-                Q(is_active=True) | Q(pk=current_account.pk)
-            )
-        if not self.fields["paid_through"].queryset.exists():
-            self.fields["paid_through"].help_text = (
-                "No Paid Through accounts yet. A manager adds them under Purchases > Paid Through Accounts, "
-                "named as the ledger account in Zoho Books. Required to save as paid."
-            )
-
-    def clean(self):
-        """Mirror the service input rules so each message shows under its
-        field. The services re-check everything and stay authoritative."""
-        cleaned = super().clean()
-        entry_date = cleaned.get("entry_date")
-        if entry_date and entry_date > timezone.localdate():
-            self.add_error("entry_date", "The date cannot be in the future.")
-        method = cleaned.get("method")
-        reference = (cleaned.get("reference") or "").strip()
-        notes = (cleaned.get("notes") or "").strip()
-        if method in PurchaseOrderPayment.REFERENCE_REQUIRED_METHODS and not reference:
-            self.add_error("reference", "A reference (UTR, cheque or card slip number) is required for this method.")
-        elif method == PurchaseOrderPayment.METHOD_OTHER and not reference and len(notes) < 10:
-            self.add_error("reference", "For 'Other', enter a reference or notes explaining the payment.")
-        if self.posting and "paid_through" in self.fields and "paid_through" not in self.errors:
-            account = cleaned.get("paid_through")
-            if account is None:
-                self.add_error("paid_through", "Paid through is required to post a payment.")
-            elif not account.is_active:
-                self.add_error("paid_through", f"Paid through account '{account.name}' is inactive.")
-        return cleaned
-
-
-class ReversePaymentEntryForm(forms.Form):
-    entry = forms.ModelChoiceField(queryset=PurchaseOrderPayment.objects.none(), widget=UnfoldAdminSelectWidget)
-    reason = forms.CharField(widget=UnfoldAdminTextareaWidget, help_text="Why the original entry was wrong.")
-
-    def __init__(self, *args, po, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.fields["entry"].queryset = selectors.reversible_payment_entries(po)
-        self.fields["entry"].label_from_instance = lambda e: (
-            f"{e.entry_date} {e.get_entry_type_display()} {e.amount} ({e.get_method_display()} {e.reference})"
-        )
-
-
-class SetTaxTreatmentForm(forms.Form):
-    treatment = forms.ChoiceField(
-        choices=PurchaseOrder.TAX_TREATMENT_CHOICES, widget=UnfoldAdminSelectWidget,
-        label="Purchase tax treatment",
-    )
 
 
 class PaymentStatusFilter(admin.SimpleListFilter):
@@ -798,79 +503,53 @@ class PurchaseOrderAdmin(ModelAdmin):
 
     # --- lifecycle actions ---
 
-    def _po_in_status(self, object_id, status):
+    # When each action is offered: apps.purchases.rules, shared with the
+    # Smerfume Panel. Without an object (list/registration checks) only the
+    # permission matters.
+    @staticmethod
+    def _po_rule(request, object_id, rule, *perms):
         if object_id is None:
-            return True
-        return PurchaseOrder.objects.filter(pk=object_id, status__in=status).exists()
-
-    def _payable(self, object_id):
-        if object_id is None:
-            return True
-        return PurchaseOrder.objects.filter(
-            pk=object_id, status__in=PurchaseOrder.PAYABLE_STATUSES, purchase_tax_treatment__isnull=False,
-        ).exists()
+            return any(request.user.has_perm(perm) for perm in perms)
+        po = PurchaseOrder.objects.filter(pk=object_id).first()
+        return po is not None and rule(request.user, po)
 
     def has_record_payment_permission(self, request, object_id=None):
-        # DEC-011: drafting needs record_po_payment, Save as Paid needs post_po_payment.
-        user = request.user
-        can_use = user.has_perm("purchases.record_po_payment") or user.has_perm("purchases.post_po_payment")
-        return can_use and self._payable(object_id) and not self._fully_paid(object_id)
-
-    @staticmethod
-    def _fully_paid(object_id):
-        """Nothing left to pay against the PO (posted entries only, DEC-011),
-        so a new payment could never be posted. Existing drafts stay reachable
-        from the payments panel. Unknown totals keep the action available;
-        post_payment still refuses them."""
-        if object_id is None:
-            return False
-        po = PurchaseOrder.objects.filter(pk=object_id).first()
-        remaining = po.remaining_against_po if po is not None else None
-        return remaining is not None and remaining <= 0
+        return self._po_rule(
+            request, object_id, purchase_rules.can_record_payment,
+            "purchases.record_po_payment", "purchases.post_po_payment",
+        )
 
     def has_record_vendor_refund_permission(self, request, object_id=None):
-        return request.user.has_perm("purchases.record_po_payment") and self._payable(object_id)
+        return self._po_rule(
+            request, object_id, purchase_rules.can_record_vendor_refund, "purchases.record_po_payment",
+        )
 
     def has_reverse_payment_entry_permission(self, request, object_id=None):
-        if not request.user.has_perm("purchases.reverse_po_payment"):
-            return False
-        if object_id is None:
-            return True
-        return selectors.reversible_payment_entries(PurchaseOrder(pk=object_id)).exists()
+        return self._po_rule(
+            request, object_id, purchase_rules.can_reverse_payment_entry, "purchases.reverse_po_payment",
+        )
 
     def has_set_tax_treatment_permission(self, request, object_id=None):
-        if not request.user.has_perm("purchases.set_po_tax_treatment"):
-            return False
-        if object_id is None:
-            return True
-        return PurchaseOrder.objects.filter(pk=object_id, purchase_tax_treatment__isnull=True).exclude(
-            status__in=[PurchaseOrder.STATUS_DRAFT, PurchaseOrder.STATUS_CANCELLED]
-        ).exists()
+        return self._po_rule(
+            request, object_id, purchase_rules.can_set_tax_treatment, "purchases.set_po_tax_treatment",
+        )
 
     def has_issue_permission(self, request, object_id=None):
-        return request.user.has_perm("purchases.issue_purchaseorder") and self._po_in_status(
-            object_id, [PurchaseOrder.STATUS_DRAFT]
-        )
+        return self._po_rule(request, object_id, purchase_rules.can_issue, "purchases.issue_purchaseorder")
 
     def has_cancel_permission(self, request, object_id=None):
-        return request.user.has_perm("purchases.cancel_purchaseorder") and self._po_in_status(
-            object_id, [PurchaseOrder.STATUS_DRAFT, PurchaseOrder.STATUS_ISSUED]
-        )
+        return self._po_rule(request, object_id, purchase_rules.can_cancel, "purchases.cancel_purchaseorder")
 
     def has_close_permission(self, request, object_id=None):
-        return request.user.has_perm("purchases.close_purchaseorder") and self._po_in_status(
-            object_id, [PurchaseOrder.STATUS_PARTIALLY_RECEIVED]
-        )
+        return self._po_rule(request, object_id, purchase_rules.can_close, "purchases.close_purchaseorder")
 
     def has_confirm_booked_permission(self, request, object_id=None):
-        return request.user.has_perm("purchases.confirm_booked_quantity") and self._po_in_status(
-            object_id, list(PurchaseOrder.BOOKABLE_STATUSES)
+        return self._po_rule(
+            request, object_id, purchase_rules.can_confirm_booked, "purchases.confirm_booked_quantity",
         )
 
     def has_receive_permission(self, request, object_id=None):
-        return request.user.has_perm("purchases.add_goodsreceipt") and self._po_in_status(
-            object_id, list(PurchaseOrder.RECEIVABLE_STATUSES)
-        )
+        return self._po_rule(request, object_id, purchase_rules.can_receive, "purchases.add_goodsreceipt")
 
     def _change_url(self, po):
         return reverse("admin:purchases_purchaseorder_change", args=[po.pk])
@@ -1623,11 +1302,6 @@ class GoodsReceiptAdmin(ModelAdmin):
 
     # --- lifecycle actions ---
 
-    def _receipt_in_status(self, object_id, status):
-        if object_id is None:
-            return True
-        return GoodsReceipt.objects.filter(pk=object_id, status=status).exists()
-
     def has_add_opening_permission(self, request):
         return request.user.has_perm("purchases.add_goodsreceipt")
 
@@ -1668,24 +1342,24 @@ class GoodsReceiptAdmin(ModelAdmin):
         }
         return TemplateResponse(request, "admin/purchases/po_action.html", context)
 
+    @staticmethod
+    def _receipt_rule(request, object_id, rule, perm):
+        if object_id is None:
+            return request.user.has_perm(perm)
+        receipt = GoodsReceipt.objects.filter(pk=object_id).first()
+        return receipt is not None and rule(request.user, receipt)
+
     def has_post_permission(self, request, object_id=None):
-        return request.user.has_perm("purchases.post_goodsreceipt") and self._receipt_in_status(
-            object_id, GoodsReceipt.STATUS_DRAFT
-        )
+        return self._receipt_rule(request, object_id, purchase_rules.can_post_receipt, "purchases.post_goodsreceipt")
 
     def has_cancel_permission(self, request, object_id=None):
-        return request.user.has_perm("purchases.cancel_goodsreceipt") and self._receipt_in_status(
-            object_id, GoodsReceipt.STATUS_DRAFT
+        return self._receipt_rule(
+            request, object_id, purchase_rules.can_cancel_receipt, "purchases.cancel_goodsreceipt",
         )
 
     def has_reverse_permission(self, request, object_id=None):
-        if not request.user.has_perm("purchases.reverse_goodsreceipt"):
-            return False
-        if object_id is None:
-            return True
-        receipt = GoodsReceipt.objects.filter(pk=object_id).first()
-        return receipt is not None and any(
-            remaining > 0 for remaining in selectors.reversible_quantities(receipt).values()
+        return self._receipt_rule(
+            request, object_id, purchase_rules.can_reverse_receipt, "purchases.reverse_goodsreceipt",
         )
 
     def _change_url(self, receipt):
@@ -1847,14 +1521,10 @@ class ReceiptDiscrepancyAdmin(ModelAdmin):
         return obj.receipt.supplier
 
     def has_resolve_permission(self, request, object_id=None):
-        if not request.user.has_perm("purchases.resolve_receiptdiscrepancy"):
-            return False
         if object_id is None:
-            return True
-        return ReceiptDiscrepancy.objects.filter(
-            pk=object_id, status=ReceiptDiscrepancy.STATUS_OPEN,
-            receipt__status=GoodsReceipt.STATUS_POSTED,
-        ).exists()
+            return request.user.has_perm("purchases.resolve_receiptdiscrepancy")
+        discrepancy = ReceiptDiscrepancy.objects.select_related("receipt").filter(pk=object_id).first()
+        return discrepancy is not None and purchase_rules.can_resolve_discrepancy(request.user, discrepancy)
 
     @action(description="Resolve", url_path="resolve", permissions=["resolve"], icon="task_alt")
     def resolve(self, request, object_id):

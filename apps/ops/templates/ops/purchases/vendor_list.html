@@ -1,0 +1,39 @@
+{% extends "ops/base.html" %}
+{% block title %}Vendors{% endblock %}
+{% block page_title %}Vendors{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Vendors</h1>
+  <p class="muted">{{ paginator.count }} vendor{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %} · read-only here; vendor details are edited in Django Admin</p>
+</div></div>
+<form method="get" class="filters filters--two" role="search">
+  {% include "ops/_field.html" with field=filter_form.q %}
+  {% include "ops/_field.html" with field=filter_form.state %}
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:vendor_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+{% if object_list %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Vendor</th><th scope="col">Code</th><th scope="col">GSTIN</th><th scope="col">Contact</th><th scope="col">Status</th><th scope="col" class="num">POs</th></tr></thead>
+    <tbody>
+      {% for vendor in object_list %}
+      <tr>
+        <td data-label="Vendor"><a class="link-strong" href="{% url 'ops:vendor_detail' vendor.vendor_code %}">{{ vendor.name }}</a>{% if vendor.legal_name %}<br><small class="muted">{{ vendor.legal_name }}</small>{% endif %}</td>
+        <td data-label="Code" class="nowrap"><code>{{ vendor.vendor_code }}</code></td>
+        <td data-label="GSTIN">{{ vendor.gstin|default:"—" }}</td>
+        <td data-label="Contact">{{ vendor.contact_person|default:"" }}{% if vendor.phone %}<br><small class="muted">{{ vendor.phone }}</small>{% endif %}</td>
+        <td data-label="Status">{% if vendor.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}</td>
+        <td data-label="POs" class="num">{{ vendor.po_count }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% include "ops/_pagination.html" %}
+{% else %}
+<section class="empty card"><h2>No vendors found</h2></section>
+{% endif %}
+{% endblock %}

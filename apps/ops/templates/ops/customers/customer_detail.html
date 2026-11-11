@@ -1,0 +1,89 @@
+{% extends ops_layout|default:"ops/base.html" %}
+{% block title %}{{ customer.full_name|default:"Customer" }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:customer_list' %}">{% include "ops/_icon.html" with name="back" %}Customers</a>{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>{{ customer.full_name|default:"No name" }}</h1>
+  <p class="muted">Customer since {{ customer.date_joined|date:"d M Y" }} · {{ order_count }} order{{ order_count|pluralize }}</p>
+  <div class="badges">{% if customer.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}</div>
+</div>
+{% if can_view_orders and orders_search %}<a class="button" href="{% url 'ops:order_list' %}?q={{ orders_search|urlencode }}">All orders</a>{% endif %}
+</div>
+
+<section class="card">
+  <dl class="dl">
+    <dt>Mobile</dt><dd>{{ customer.mobile_number|default:"—" }}</dd>
+    <dt>Email</dt><dd>{{ customer.email|default:"—" }}</dd>
+    <dt>Last sign-in</dt><dd>{{ customer.last_login|date:"d M Y, H:i"|default:"—" }}</dd>
+    {% if profile %}
+    <dt>Saved contact</dt><dd>{{ profile }}{% if profile.mobile %} · {{ profile.mobile }}{% endif %}{% if profile.email %} · {{ profile.email }}{% endif %}</dd>
+    {% endif %}
+  </dl>
+</section>
+
+{% if can_view_orders %}
+<section class="card card--flush">
+  <h2 class="card__title">Order history</h2>
+  {% if orders %}
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Order</th><th scope="col">Date</th><th scope="col">Status</th><th scope="col" class="num">Total</th><th scope="col" class="num">Paid</th><th scope="col" class="num">Balance</th><th scope="col">Payment</th></tr></thead>
+    <tbody>
+      {% for row in orders %}
+      <tr>
+        <td data-label="Order" class="nowrap"><a href="{% url 'ops:order_detail' row.order.order_number %}">{{ row.order.order_number }}</a></td>
+        <td data-label="Date">{{ row.order.created_at|date:"d M Y" }}</td>
+        <td data-label="Status"><span class="badge badge--{{ row.status_tone }}">{{ row.order.get_status_display }}</span></td>
+        <td data-label="Total" class="num">₹{{ row.order.total }}</td>
+        <td data-label="Paid" class="num">₹{{ row.order.total_paid }}</td>
+        <td data-label="Balance" class="num">₹{{ row.order.balance_due }}</td>
+        <td data-label="Payment"><span class="badge badge--{{ row.payment_status_tone }}">{{ row.payment_status_label }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if order_count > orders|length %}<p class="card__body muted">Showing the latest {{ orders|length }}.</p>{% endif %}
+  {% else %}<p class="card__body muted">No orders yet.</p>{% endif %}
+</section>
+{% endif %}
+
+<div class="grid">
+{% if can_view_returns %}
+<section class="card card--flush">
+  <h2 class="card__title">Returns</h2>
+  {% if returns %}
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Order</th><th scope="col">Requested</th><th scope="col">Status</th></tr></thead>
+    <tbody>
+      {% for ret in returns %}
+      <tr>
+        <td data-label="Order" class="nowrap"><a href="{% url 'ops:return_detail' ret.public_id %}">{{ ret.order.order_number }}</a></td>
+        <td data-label="Requested">{{ ret.created_at|date:"d M Y" }}</td>
+        <td data-label="Status"><span class="badge">{{ ret.get_status_display }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="card__body muted">No returns.</p>{% endif %}
+</section>
+{% endif %}
+{% if can_view_refunds %}
+<section class="card card--flush">
+  <h2 class="card__title">Refunds</h2>
+  {% if refunds %}
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Order</th><th scope="col" class="num">Amount</th><th scope="col">Status</th></tr></thead>
+    <tbody>
+      {% for refund in refunds %}
+      <tr>
+        <td data-label="Order" class="nowrap"><a href="{% url 'ops:refund_detail' refund.public_id %}">{{ refund.return_request.order.order_number }}</a></td>
+        <td data-label="Amount" class="num">₹{{ refund.refund_amount }}</td>
+        <td data-label="Status"><span class="badge">{{ refund.get_refund_status_display }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="card__body muted">No refunds.</p>{% endif %}
+</section>
+{% endif %}
+</div>
+{% endblock %}

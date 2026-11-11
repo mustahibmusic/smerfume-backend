@@ -244,20 +244,19 @@ class HomeAndNavigationTests(TestCase):
         implemented = [item["key"] for item in items if item["implemented"]]
         self.assertEqual(implemented, [
             "orders", "in_store_sale", "returns", "refunds",
+            "products", "editions", "variants", "brands", "perfume_notes",
             "stock", "partial_bottles", "stock_movements", "reservations", "warehouses",
             "vendors", "purchase_orders", "goods_receipts", "supplier_payments", "paid_through",
-            "receipt_discrepancies", "booked_quantity_history",
+            "receipt_discrepancies", "booked_quantity_history", "customers", "users",
         ])
+        self.assertEqual(len(implemented), len(items))  # every planned page is live
         for item in items:
             if not item["implemented"]:
                 self.assertIsNone(item["url"], item["key"])
                 self.assertFalse(item["active"], item["key"])
         html = response.content.decode()
-        self.assertEqual(html.count("Coming soon"), len(items) - 16)
-        self.assertEqual(html.count("data-coming-soon="), len(items) - 16)
-        self.assertIn('data-coming-soon="products"', html)
-        # Coming-soon items are not links.
-        self.assertNotRegex(html, r'<a [^>]*data-coming-soon')
+        self.assertNotIn("Coming soon", html)
+        self.assertNotIn("data-coming-soon=", html)
         # Home cards list implemented pages only.
         home = self.client.get(HOME_URL)
         self.assertEqual([link["key"] for link in home.context["quick_links"]], implemented)

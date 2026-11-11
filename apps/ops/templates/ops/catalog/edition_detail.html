@@ -1,0 +1,45 @@
+{% extends ops_layout|default:"ops/base.html" %}
+{% block title %}{{ edition }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:edition_list' %}">{% include "ops/_icon.html" with name="back" %}Editions</a>{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>{{ edition }}</h1>
+  <p class="muted">
+    {% if can_view_product %}<a href="{% url 'ops:product_detail' edition.product.slug %}">{{ edition.product }}</a>{% else %}{{ edition.product }}{% endif %}
+    · {{ edition.get_concentration_display }} · {{ edition.get_gender_display }}{% if edition.release_year %} · {{ edition.release_year }}{% endif %}
+  </p>
+  <div class="badges">
+    {% if edition.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}
+    {% if edition.is_best_seller %}<span class="badge badge--info">Best seller</span>{% endif %}
+    {% if edition.is_new_arrival %}<span class="badge badge--info">New arrival</span>{% endif %}
+    {% if not edition.is_indexable %}<span class="badge">Noindex</span>{% endif %}
+  </div>
+</div>
+{% if edition.image %}<img class="thumb thumb--lg" src="{{ edition.image.url }}" alt="">{% endif %}
+</div>
+<div class="grid">
+  <section class="card">
+    <h2>Notes</h2>
+    <dl class="dl">
+      {% for label, notes in note_groups %}
+      <dt>{{ label }}</dt>
+      <dd>{% for note in notes %}{% if can_view_note %}<a href="{% url 'ops:note_detail' note.public_id %}">{{ note.name }}</a>{% else %}{{ note.name }}{% endif %}{% if not forloop.last %}, {% endif %}{% empty %}—{% endfor %}</dd>
+      {% endfor %}
+    </dl>
+  </section>
+  <section class="card">
+    <h2>SEO</h2>
+    <dl class="dl">
+      <dt>Slug</dt><dd>{% if edition.slug %}<code>{{ edition.slug }}</code>{% else %}—{% endif %}</dd>
+      <dt>Title</dt><dd>{{ edition.seo_title|default:"Auto" }}</dd>
+      <dt>Meta description</dt><dd>{{ edition.meta_description|default:"—" }}</dd>
+      <dt>OG title</dt><dd>{{ edition.og_title|default:"Auto" }}</dd>
+      <dt>OG description</dt><dd>{{ edition.og_description|default:"—" }}</dd>
+    </dl>
+  </section>
+</div>
+<section class="card card--flush">
+  <h2 class="card__title">Variants</h2>
+  {% include "ops/catalog/_variant_rows.html" %}
+</section>
+{% endblock %}

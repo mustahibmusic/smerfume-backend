@@ -54,11 +54,26 @@ NAV_GROUPS = (
         ),
     )),
     NavGroup("catalog", "Catalog", (
-        NavItem("products", "Products", "catalog.view_product"),
-        NavItem("editions", "Editions", "catalog.view_productedition"),
-        NavItem("variants", "Variants", "catalog.view_productvariant"),
-        NavItem("brands", "Brands", "catalog.view_brand"),
-        NavItem("perfume_notes", "Perfume Notes", "catalog.view_perfumenote"),
+        NavItem(
+            "products", "Products", "catalog.view_product", "ops:product_list", icon="tag",
+            description="Products with their editions and variants.",
+        ),
+        NavItem(
+            "editions", "Editions", "catalog.view_productedition", "ops:edition_list", icon="tag",
+            description="Editions: notes, gender, concentration and SEO.",
+        ),
+        NavItem(
+            "variants", "Variants", "catalog.view_productvariant", "ops:variant_list", icon="bottle",
+            description="Sizes and decants: SKU, prices and image gallery.",
+        ),
+        NavItem(
+            "brands", "Brands", "catalog.view_brand", "ops:brand_list", icon="vendor",
+            description="Brands and their products.",
+        ),
+        NavItem(
+            "perfume_notes", "Perfume Notes", "catalog.view_perfumenote", "ops:note_list", icon="dot",
+            description="Notes and the editions that use them.",
+        ),
     )),
     NavGroup("inventory", "Inventory", (
         NavItem(
@@ -113,8 +128,14 @@ NAV_GROUPS = (
         ),
     )),
     NavGroup("customers", "Customers", (
-        NavItem("customers", "Customers", "accounts.view_customerprofile"),
-        NavItem("users", "Users", "accounts.view_user"),
+        NavItem(
+            "customers", "Customers", "accounts.view_customerprofile", "ops:customer_list", icon="user",
+            description="Customer contacts, orders, returns and refunds.",
+        ),
+        NavItem(
+            "users", "Users", "accounts.view_user", "ops:user_list", icon="user",
+            description="Accounts, roles and access (read-only).",
+        ),
     )),
 )
 

@@ -1,6 +1,7 @@
 from django import forms
 from django.utils import timezone
 
+from apps.accounts.models import User
 from apps.catalog.models import ProductVariant
 from apps.inventory.models import InventoryStock, StockMovement, StockReservation, Supplier, Warehouse
 from apps.orders import payments as order_payments
@@ -223,3 +224,22 @@ class DiscrepancyFilterForm(forms.Form):
 
 class BookedChangeFilterForm(forms.Form):
     q = forms.CharField(required=False, max_length=100, strip=True, label="PO, SKU or note")
+
+
+# ── Customers and users ──────────────────────────────────────────────────────
+
+ACCOUNT_STATE_CHOICES = [("", "All"), ("active", "Active"), ("inactive", "Inactive")]
+
+
+class CustomerFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="Name, mobile or email")
+    state = forms.ChoiceField(required=False, choices=ACCOUNT_STATE_CHOICES)
+
+
+class UserFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="Name, mobile, email or username")
+    role = forms.ChoiceField(required=False, choices=_with_all(User.ROLE_CHOICES))
+    staff = forms.ChoiceField(
+        required=False, label="Admin staff", choices=[("", "All"), ("yes", "Staff"), ("no", "Not staff")],
+    )
+    state = forms.ChoiceField(required=False, choices=ACCOUNT_STATE_CHOICES)

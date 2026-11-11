@@ -341,3 +341,11 @@ form.inline { display: inline; }
 }
 
 @media (prefers-reduced-motion: reduce) { .sidebar { transition: none; } }
+
+/* Catalog images */
+.thumb { width: 44px; height: 44px; object-fit: cover; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-2); }
+.thumb--lg { width: 96px; height: 96px; }
+.gallery { list-style: none; margin: 12px 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 220px), 1fr)); gap: 12px; }
+.gallery__item { display: flex; flex-direction: column; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); min-width: 0; }
+.gallery__item img { width: 100%; aspect-ratio: 1; object-fit: contain; border-radius: 6px; background: var(--surface-2); }
+.gallery__item .inline-form .field { min-width: 0; flex: 1 1 120px; }

@@ -1,0 +1,44 @@
+{% extends "ops/base.html" %}
+{% block title %}Editions{% endblock %}
+{% block page_title %}Editions{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Editions</h1>
+  <p class="muted">{{ paginator.count }} edition{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %}</p>
+</div></div>
+<form method="get" class="filters" role="search">
+  {% include "ops/_field.html" with field=filter_form.q %}
+  {% include "ops/_field.html" with field=filter_form.gender %}
+  {% include "ops/_field.html" with field=filter_form.concentration %}
+  {% include "ops/_field.html" with field=filter_form.state %}
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:edition_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+{% if object_list %}
+{% include "ops/_bulk_bar.html" %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr>{% include "ops/_list_select_all.html" %}<th scope="col">Edition</th><th scope="col">Concentration</th><th scope="col">Gender</th><th scope="col">Status</th><th scope="col" class="num">Variants</th><th scope="col" class="actions-col">Actions</th></tr></thead>
+    <tbody>
+      {% for edition in object_list %}
+      <tr>
+        {% include "ops/_list_select_row.html" with obj=edition %}
+        <td data-label="Edition"><a class="link-strong" href="{% url 'ops:edition_detail' edition.public_id %}">{{ edition }}</a></td>
+        <td data-label="Concentration">{{ edition.get_concentration_display }}</td>
+        <td data-label="Gender">{{ edition.get_gender_display }}</td>
+        <td data-label="Status">{% if edition.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}{% if not edition.is_indexable %} <span class="badge">Noindex</span>{% endif %}</td>
+        <td data-label="Variants" class="num">{{ edition.variant_count }}</td>
+        {% include "ops/_row_actions.html" with obj=edition %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% include "ops/_pagination.html" %}
+{% else %}
+<section class="empty card"><h2>No editions found</h2></section>
+{% endif %}
+{% include "ops/_quick_drawer.html" %}
+{% endblock %}

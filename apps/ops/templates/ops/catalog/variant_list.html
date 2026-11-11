@@ -1,0 +1,46 @@
+{% extends "ops/base.html" %}
+{% block title %}Variants{% endblock %}
+{% block page_title %}Variants{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Variants</h1>
+  <p class="muted">{{ paginator.count }} variant{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %}</p>
+</div></div>
+<form method="get" class="filters" role="search">
+  {% include "ops/_field.html" with field=filter_form.q %}
+  {% include "ops/_field.html" with field=filter_form.brand %}
+  {% include "ops/_field.html" with field=filter_form.kind %}
+  {% include "ops/_field.html" with field=filter_form.state %}
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:variant_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+{% if object_list %}
+{% include "ops/_bulk_bar.html" %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr>{% include "ops/_list_select_all.html" %}<th scope="col"><span class="visually-hidden">Image</span></th><th scope="col">Variant</th><th scope="col">SKU</th><th scope="col" class="num">MRP</th><th scope="col" class="num">Selling price</th><th scope="col">Status</th><th scope="col" class="num">Images</th><th scope="col" class="actions-col">Actions</th></tr></thead>
+    <tbody>
+      {% for variant in object_list %}
+      <tr>
+        {% include "ops/_list_select_row.html" with obj=variant %}
+        <td data-label="Image">{% with primary=variant.primary_images|first %}{% if primary %}<img class="thumb" src="{{ primary.image.url }}" alt="" loading="lazy">{% elif variant.image %}<img class="thumb" src="{{ variant.image.url }}" alt="" loading="lazy">{% else %}<span class="muted">—</span>{% endif %}{% endwith %}</td>
+        <td data-label="Variant"><a class="link-strong" href="{% url 'ops:variant_detail' variant.sku %}">{{ variant }}</a></td>
+        <td data-label="SKU" class="nowrap"><code>{{ variant.sku }}</code>{% if variant.barcode %}<br><small class="muted">{{ variant.barcode }}</small>{% endif %}</td>
+        <td data-label="MRP" class="num">₹{{ variant.mrp }}</td>
+        <td data-label="Selling price" class="num">₹{{ variant.selling_price }}</td>
+        <td data-label="Status">{% if variant.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}{% if variant.is_decant %} <span class="badge badge--info">Decant</span>{% endif %}</td>
+        <td data-label="Images" class="num">{{ variant.image_count }}</td>
+        {% include "ops/_row_actions.html" with obj=variant %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% include "ops/_pagination.html" %}
+{% else %}
+<section class="empty card"><h2>No variants found</h2></section>
+{% endif %}
+{% include "ops/_quick_drawer.html" %}
+{% endblock %}

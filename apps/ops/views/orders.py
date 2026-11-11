@@ -11,6 +11,7 @@ from django.urls import reverse
 from django.views.generic import ListView, TemplateView
 
 from apps.ops import presenters
+from apps.ops.access import has_admin_access
 from apps.ops.forms import OrderFilterForm
 from apps.ops.mixins import OpsAccessMixin
 from apps.orders import payments as order_payments
@@ -86,9 +87,8 @@ class OrderDetailView(OpsAccessMixin, TemplateView):
             order_number=kwargs["order_number"],
         )
         summary = order_payments.payment_summary(order)
-        user = self.request.user
         admin_url = None
-        if user.is_staff and user.has_perm(VIEW_ORDER):
+        if has_admin_access(self.request) and self.request.user.has_perm(VIEW_ORDER):
             # Django Admin's own object URL: the only place a PK appears.
             admin_url = reverse("admin:orders_order_change", args=[order.pk])
         context.update({

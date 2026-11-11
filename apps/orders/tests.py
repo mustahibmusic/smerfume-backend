@@ -35,6 +35,8 @@ Test groups:
     InStoreSaleServiceTests       — DEC-008: create_in_store_order stock/financial/customer rules
     InStoreSaleAPITests           — DEC-008: staff POST /api/orders/in-store/
     InStoreSaleAdminTests         — DEC-008: admin 'New in-store sale' page
+    OrderItemIdentitySnapshotTests — DEC-018: sale-time product identity snapshot
+    OrderItemIdentityBackfillMigrationTests — DEC-018: 0017 backfill of existing lines
 """
 
 import re
@@ -5515,3 +5517,189 @@ class OrderPaymentBackfillMigrationTests(TransactionTestCase):
     def test_sequence_continues_after_backfill(self):
         self._migrate()
         self.assertEqual(order_payments.next_payment_number(), "CPAY-000004")
+
+
+# ── DEC-018: OrderItem customer-visible identity snapshot ────────────────────
+
+class OrderItemIdentitySnapshotTests(TestCase):
+    """Snapshots are taken when the line is created and never follow later
+    catalogue edits; financial snapshots are unaffected."""
+
+    def setUp(self):
+        self.variant = _make_variant(selling_price="500.00", size_ml=50)
+        self.edition = self.variant.edition
+        self.product = self.edition.product
+        self.brand = self.product.brand
+        self.original_sku = self.variant.sku
+
+    def _assert_original_identity(self, item):
+        self.assertEqual(item.product_name_snapshot, "OrderBrand OrderProduct")
+        self.assertEqual(item.edition_name_snapshot, "EDP")
+        self.assertEqual(item.variant_name_snapshot, "OrderBrand OrderProduct EDP 50ml")
+        self.assertEqual(item.sku_snapshot, self.original_sku)
+        self.assertEqual(item.size_ml_snapshot, 50)
+        self.assertIs(item.is_decant_snapshot, False)
+        self.assertEqual(item.concentration_snapshot, "Eau de Parfum")
+        self.assertFalse(item.identity_backfilled)
+
+    def _checkout(self, quantity=2):
+        user = _make_user()
+        client = APIClient()
+        client.credentials(**_auth_header(user))
+        cart = Cart.objects.create(user=user)
+        CartItem.objects.create(cart=cart, variant=self.variant, quantity=quantity)
+        resp = client.post(CHECKOUT_URL, {"shipping_address": _SHIPPING}, format="json")
+        self.assertEqual(resp.status_code, 201)
+        return Order.objects.get(order_number=resp.data["order_number"])
+
+    def test_checkout_line_gets_snapshot(self):
+        self._assert_original_identity(self._checkout().items.get())
+
+    def test_in_store_line_gets_snapshot(self):
+        order = order_services.create_in_store_order(
+            lines=[(self.variant, 1)], staff_user=_make_staff(), customer_mobile="9811100001",
+        )
+        self._assert_original_identity(order.items.get())
+
+    def test_decant_flag_in_snapshot(self):
+        self.variant.is_decant = True
+        self.variant.save(update_fields=["is_decant"])
+        order = _plain_order(901, Order.STATUS_PENDING)
+        item = OrderItem.objects.create(
+            order=order, variant=self.variant, quantity=1, unit_price=Decimal("500.00"),
+        )
+        self.assertIs(item.is_decant_snapshot, True)
+        self.assertEqual(item.variant_name_snapshot, "OrderBrand OrderProduct EDP 50ml (Decant)")
+
+    def test_catalogue_rename_and_sku_change_do_not_change_snapshot(self):
+        order = self._checkout()
+        self.brand.name = "RenamedBrand"
+        self.brand.save()
+        self.product.name = "RenamedProduct"
+        self.product.save()
+        self.edition.name = "Intense"
+        self.edition.concentration = "extrait"
+        self.edition.save()
+        self.variant.sku = "SKU-CHANGED-001"
+        self.variant.size_ml = 75
+        self.variant.save()
+
+        item = order.items.get()
+        self._assert_original_identity(item)
+        # The operational link still follows the live catalogue.
+        self.assertEqual(item.variant.sku, "SKU-CHANGED-001")
+        self.assertIn("RenamedProduct", str(item.variant))
+
+    def test_resave_does_not_refresh_snapshot(self):
+        item = self._checkout().items.get()
+        self.variant.sku = "SKU-CHANGED-002"
+        self.variant.save()
+        item.save()
+        item.refresh_from_db()
+        self.assertEqual(item.sku_snapshot, self.original_sku)
+
+    def test_financial_snapshots_unchanged(self):
+        self.variant.shipping_surcharge = Decimal("50.00")
+        self.variant.save(update_fields=["shipping_surcharge"])
+        order = self._checkout(quantity=3)
+        item = order.items.get()
+        self.assertEqual(
+            (item.unit_price, item.line_total, item.gross_line_amount, item.discount_allocated,
+             item.net_line_amount, item.tax_amount, item.final_paid_line_amount, item.shipping_surcharge),
+            (Decimal("500.00"), Decimal("1500.00"), Decimal("1500.00"), Decimal("0.00"),
+             Decimal("1500.00"), Decimal("0.00"), Decimal("1500.00"), Decimal("150.00")),
+        )
+        self.assertEqual((order.subtotal, order.shipping_charge, order.total),
+                         (Decimal("1500.00"), Decimal("150.00"), Decimal("1650.00")))
+
+    def test_identity_snapshot_helper_matches_migration_backfill(self):
+        import importlib
+
+        from apps.orders.models import identity_snapshot
+
+        migration = importlib.import_module("apps.orders.migrations.0017_orderitem_identity_snapshot")
+        for is_decant, edition_name in ((False, "EDP"), (True, None)):
+            self.variant.is_decant = is_decant
+            self.edition.name = edition_name
+            expected = identity_snapshot(self.variant)
+            backfilled = migration._snapshot_values(self.variant)
+            self.assertTrue(backfilled.pop("identity_backfilled"))
+            self.assertEqual(backfilled, expected)
+
+
+class OrderItemIdentityBackfillMigrationTests(TransactionTestCase):
+    """0017 fills existing lines from the current catalogue and marks them."""
+
+    migrate_from = [("orders", "0016_in_store_payment_separation")]
+    migrate_to = [("orders", "0017_orderitem_identity_snapshot")]
+
+    def setUp(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(self.migrate_from)
+        old = executor.loader.project_state(self.migrate_from).apps
+        OldOrder = old.get_model("orders", "Order")
+        OldOrderItem = old.get_model("orders", "OrderItem")
+
+        brand = Brand.objects.create(name="MigBrand", slug="migbrand")
+        category = Category.objects.create(name="MigCat", slug="migcat")
+        product = Product.objects.create(
+            name="MigProduct", slug="migproduct", brand=brand, category=category,
+        )
+        edition = ProductEdition.objects.create(
+            product=product, name="Elixir", slug="migproduct-elixir", concentration="edt", gender="unisex",
+        )
+        retail = ProductVariant.objects.create(
+            edition=edition, size_ml=100, sku="MIG-100", selling_price="900.00", mrp="1000.00",
+        )
+        decant = ProductVariant.objects.create(
+            edition=edition, size_ml=10, is_decant=True, sku="MIG-10D", selling_price="200.00", mrp="200.00",
+        )
+        order = OldOrder.objects.create(
+            user_id=_make_user(mobile="+919690000001", username="migsnap").pk,
+            order_number="SMR-MIG-SNAP01", subtotal=Decimal("1100.00"), total=Decimal("1100.00"),
+        )
+        self.retail_item = OldOrderItem.objects.create(
+            order=order, variant_id=retail.pk, quantity=1,
+            unit_price=Decimal("900.00"), line_total=Decimal("900.00"),
+        ).pk
+        self.decant_item = OldOrderItem.objects.create(
+            order=order, variant_id=decant.pk, quantity=1,
+            unit_price=Decimal("200.00"), line_total=Decimal("200.00"),
+        ).pk
+        # Renamed after the sale but before the migration: the backfill can
+        # only see the current catalogue value.
+        product.name = "MigProductRenamed"
+        product.save()
+
+    def tearDown(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        MigrationExecutor(connection).migrate(MigrationExecutor(connection).loader.graph.leaf_nodes())
+
+    def _migrate(self):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(self.migrate_to)
+        executor.loader.build_graph()
+        return executor.loader.project_state(self.migrate_to).apps
+
+    def test_backfill_fills_existing_lines_from_current_catalogue(self):
+        historical = self._migrate()
+        items = historical.get_model("orders", "OrderItem").objects
+        retail = items.get(pk=self.retail_item)
+        self.assertEqual(
+            (retail.product_name_snapshot, retail.edition_name_snapshot, retail.variant_name_snapshot,
+             retail.sku_snapshot, retail.size_ml_snapshot, retail.is_decant_snapshot,
+             retail.concentration_snapshot, retail.identity_backfilled),
+            ("MigBrand MigProductRenamed", "Elixir", "MigBrand MigProductRenamed Elixir 100ml",
+             "MIG-100", 100, False, "Eau de Toilette", True),
+        )
+        decant = items.get(pk=self.decant_item)
+        self.assertEqual(decant.variant_name_snapshot, "MigBrand MigProductRenamed Elixir 10ml (Decant)")
+        self.assertEqual((decant.sku_snapshot, decant.is_decant_snapshot), ("MIG-10D", True))
+        # Financial snapshot untouched.
+        self.assertEqual((retail.unit_price, retail.line_total), (Decimal("900.00"), Decimal("900.00")))

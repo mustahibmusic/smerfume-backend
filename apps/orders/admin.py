@@ -103,6 +103,7 @@ class OrderItemInline(admin.TabularInline):
         "variant", "quantity", "unit_price", "line_total",
         "shipping_surcharge", "discount_allocated", "net_line_amount",
         "tax_amount", "final_paid_line_amount",
+        "variant_name_snapshot", "sku_snapshot",
     )
     can_delete = False
 

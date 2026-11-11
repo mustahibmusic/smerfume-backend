@@ -1,11 +1,19 @@
-{% if is_paginated %}
+{% load ops_tags %}{% if is_paginated %}
+{% page_links page_obj as pages %}
 <nav class="pagination" aria-label="Pages">
-  {% if page_obj.has_previous %}
-    <a class="button button--ghost" href="?{% if query_string %}{{ query_string }}&amp;{% endif %}page={{ page_obj.previous_page_number }}">Previous</a>
-  {% endif %}
-  <span class="muted">Page {{ page_obj.number }} of {{ paginator.num_pages }}</span>
-  {% if page_obj.has_next %}
-    <a class="button button--ghost" href="?{% if query_string %}{{ query_string }}&amp;{% endif %}page={{ page_obj.next_page_number }}">Next</a>
-  {% endif %}
+  <p class="pagination__summary">Showing {{ page_obj.start_index }}–{{ page_obj.end_index }} of {{ paginator.count }}</p>
+  <div class="pagination__pages">
+    {% if page_obj.has_previous %}
+      <a class="pagination__link pagination__link--step" href="?{% if query_string %}{{ query_string }}&amp;{% endif %}page={{ page_obj.previous_page_number }}" rel="prev">{% include "ops/_icon.html" with name="back" %}<span>Previous</span></a>
+    {% endif %}
+    {% for number in pages %}
+      {% if number == paginator.ELLIPSIS %}<span class="pagination__gap" aria-hidden="true">…</span>
+      {% elif number == page_obj.number %}<a class="pagination__link" href="?{% if query_string %}{{ query_string }}&amp;{% endif %}page={{ number }}" aria-current="page" aria-label="Page {{ number }}, current page">{{ number }}</a>
+      {% else %}<a class="pagination__link" href="?{% if query_string %}{{ query_string }}&amp;{% endif %}page={{ number }}" aria-label="Page {{ number }}">{{ number }}</a>{% endif %}
+    {% endfor %}
+    {% if page_obj.has_next %}
+      <a class="pagination__link pagination__link--step" href="?{% if query_string %}{{ query_string }}&amp;{% endif %}page={{ page_obj.next_page_number }}" rel="next"><span>Next</span>{% include "ops/_icon.html" with name="next" %}</a>
+    {% endif %}
+  </div>
 </nav>
 {% endif %}

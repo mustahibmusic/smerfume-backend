@@ -7,6 +7,11 @@
     <h1>Orders</h1>
     <p class="muted">{{ paginator.count }} order{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %}</p>
   </div>
+  {% if perms.orders.add_order %}
+  <div class="page-actions">
+    <a class="button button--primary" href="{% url 'ops:in_store_sale' %}">{% include "ops/_icon.html" with name="sale" %}<span>New in-store sale</span></a>
+  </div>
+  {% endif %}
 </div>
 
 <form method="get" class="filters" role="search">
@@ -66,17 +71,7 @@
   </table>
 </div>
 
-{% if is_paginated %}
-<nav class="pagination" aria-label="Pages">
-  {% if page_obj.has_previous %}
-    <a class="button button--ghost" href="?{% if query_string %}{{ query_string }}&amp;{% endif %}page={{ page_obj.previous_page_number }}">Previous</a>
-  {% endif %}
-  <span class="muted">Page {{ page_obj.number }} of {{ paginator.num_pages }}</span>
-  {% if page_obj.has_next %}
-    <a class="button button--ghost" href="?{% if query_string %}{{ query_string }}&amp;{% endif %}page={{ page_obj.next_page_number }}">Next</a>
-  {% endif %}
-</nav>
-{% endif %}
+{% include "ops/_pagination.html" %}
 {% else %}
 <section class="empty card">
   <h2>No orders found</h2>

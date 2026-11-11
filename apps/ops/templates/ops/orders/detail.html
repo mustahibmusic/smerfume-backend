@@ -20,7 +20,7 @@
       <a class="button button--primary" href="{% url 'ops:order_record_payment' order.order_number %}">Record payment</a>
     {% endif %}
     {% if can_create_return %}
-      <a class="button button--primary" href="{% url 'ops:order_create_return' order.order_number %}">{% include "ops/_icon.html" with name="returns" %}<span>Create return</span></a>
+      <a class="button" href="{% url 'ops:order_create_return' order.order_number %}">{% include "ops/_icon.html" with name="returns" %}<span>Create return</span></a>
     {% endif %}
     {% if admin_url %}
       <a class="button button--ghost" href="{{ admin_url }}">{% include "ops/_icon.html" with name="external" %}<span>Open in Django Admin</span></a>
@@ -31,7 +31,7 @@
 <div class="stats">
   <div class="stat"><span class="stat__label">Order total</span><span class="stat__value">₹{{ order.total|floatformat:"2g" }}</span></div>
   <div class="stat"><span class="stat__label">Paid</span><span class="stat__value">₹{{ summary.total_paid|floatformat:"2g" }}</span></div>
-  <div class="stat"><span class="stat__label">Balance due</span><span class="stat__value">₹{{ summary.balance_due|floatformat:"2g" }}</span></div>
+  <div class="stat stat--emphasis {% if summary.balance_due > 0 %}stat--due{% else %}stat--settled{% endif %}"><span class="stat__label">Balance due</span><span class="stat__value">₹{{ summary.balance_due|floatformat:"2g" }}</span></div>
   <div class="stat"><span class="stat__label">Payment status</span><span class="stat__value stat__value--text"><span class="badge badge--{{ payment_status_tone }}">{{ payment_status_label }}</span></span></div>
   <div class="stat"><span class="stat__label">Refunded</span><span class="stat__value">₹{{ summary.refunded|floatformat:"2g" }}</span></div>
 </div>

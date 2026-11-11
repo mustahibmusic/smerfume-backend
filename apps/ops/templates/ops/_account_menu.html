@@ -1,0 +1,20 @@
+{% comment %}Top-bar account menu. Keyboard: Enter/Space opens, Escape closes. Display only; no permissions decided here.{% endcomment %}
+{% with display_name=user.full_name|default:user.email|default:user.mobile_number %}
+<details class="menu account" data-menu>
+  <summary class="account__trigger" aria-label="Account menu for {{ display_name }}">
+    <span class="avatar" aria-hidden="true">{{ user.first_name|default:user.email|default:"?"|first|upper }}</span>
+    <span class="account__name">{{ display_name }}</span>
+    {% include "ops/_icon.html" with name="chevron" %}
+  </summary>
+  <div class="menu__panel">
+    <div class="menu__header">
+      <span class="avatar" aria-hidden="true">{{ user.first_name|default:user.email|default:"?"|first|upper }}</span>
+      <span class="sidebar__user">
+        <strong>{{ display_name }}</strong>
+        <small>{{ user.email|default:user.mobile_number }}</small>
+      </span>
+    </div>
+    {% include "ops/_account_items.html" with theme_id="top" %}
+  </div>
+</details>
+{% endwith %}

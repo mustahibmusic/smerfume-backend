@@ -1,0 +1,6 @@
+<p class="menu__label" id="theme-label-{{ theme_id|default:'menu' }}">Theme</p>
+<div class="theme-switch" role="group" aria-labelledby="theme-label-{{ theme_id|default:'menu' }}" data-theme-switch>
+  <button type="button" data-theme-set="light" aria-pressed="false">{% include "ops/_icon.html" with name="sun" %}<span>Light</span></button>
+  <button type="button" data-theme-set="dark" aria-pressed="false">{% include "ops/_icon.html" with name="moon" %}<span>Dark</span></button>
+  <button type="button" data-theme-set="system" aria-pressed="true">{% include "ops/_icon.html" with name="monitor" %}<span>System</span></button>
+</div>

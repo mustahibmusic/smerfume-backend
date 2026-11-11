@@ -13,7 +13,7 @@
 <div class="stats">
   <div class="stat"><span class="stat__label">Order total</span><span class="stat__value">₹{{ order.total|floatformat:"2g" }}</span></div>
   <div class="stat"><span class="stat__label">Paid</span><span class="stat__value">₹{{ summary.total_paid|floatformat:"2g" }}</span></div>
-  <div class="stat"><span class="stat__label">Balance due</span><span class="stat__value">₹{{ summary.balance_due|floatformat:"2g" }}</span></div>
+  <div class="stat stat--emphasis {% if summary.balance_due > 0 %}stat--due{% else %}stat--settled{% endif %}"><span class="stat__label">Balance due</span><span class="stat__value">₹{{ summary.balance_due|floatformat:"2g" }}</span></div>
 </div>
 
 <section class="card">

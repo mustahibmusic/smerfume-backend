@@ -1,13 +1,18 @@
 <aside class="sidebar" id="ops-sidebar" aria-label="Main navigation">
   <div class="sidebar__brand">
-    <span class="brand-mark" aria-hidden="true">S</span>
-    <span class="brand-text">
-      <strong>Smerfume</strong>
-      <small>Panel</small>
-    </span>
+    <a class="sidebar__brand-link" href="{% url 'ops:home' %}">
+      <span class="brand-mark" aria-hidden="true">S</span>
+      <span class="brand-text">
+        <strong>Smerfume</strong>
+        <small>Panel</small>
+      </span>
+    </a>
+    <button type="button" class="icon-button sidebar__close" data-nav-close aria-label="Close navigation">
+      {% include "ops/_icon.html" with name="close" %}
+    </button>
   </div>
   {% if ops_nav %}
-    <nav class="sidebar__nav">
+    <nav class="sidebar__nav" aria-label="Sections">
       <ul class="nav">
         <li>
           <a class="nav__link{% if ops_nav.home.active %} is-active{% endif %}" href="{{ ops_nav.home.url }}"{% if ops_nav.home.active %} aria-current="page"{% endif %}>
@@ -24,7 +29,7 @@
             {% for item in group.items %}
               <li>
                 {% if item.implemented %}
-                  <a class="nav__link{% if item.active %} is-active{% endif %}" href="{{ item.url }}"{% if item.active %} aria-current="page"{% endif %}>
+                  <a class="nav__link{% if item.active %} is-active{% endif %}" href="{{ item.url }}"{% if item.active %} aria-current="page"{% endif %} title="{{ item.label }}">
                     {% include "ops/_icon.html" with name=item.icon %}<span>{{ item.label }}</span>
                   </a>
                 {% else %}
@@ -49,13 +54,19 @@
       </div>
     {% endif %}
     {% if user.is_authenticated %}
-      <div class="sidebar__footer">
-        <span class="avatar" aria-hidden="true">{{ user.first_name|default:user.email|default:"?"|first|upper }}</span>
-        <span class="sidebar__user">
-          <strong>{{ user.full_name|default:user.email|default:user.mobile_number }}</strong>
-          <small>{{ user.email|default:user.mobile_number }}</small>
-        </span>
-      </div>
+      <details class="menu menu--up" data-menu>
+        <summary class="sidebar__footer" aria-label="Account menu">
+          <span class="avatar" aria-hidden="true">{{ user.first_name|default:user.email|default:"?"|first|upper }}</span>
+          <span class="sidebar__user">
+            <strong>{{ user.full_name|default:user.email|default:user.mobile_number }}</strong>
+            <small>{{ user.email|default:user.mobile_number }}</small>
+          </span>
+          {% include "ops/_icon.html" with name="selector" %}
+        </summary>
+        <div class="menu__panel">
+          {% include "ops/_account_items.html" with theme_id="side" %}
+        </div>
+      </details>
     {% endif %}
   </div>
 </aside>

@@ -5,19 +5,33 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow">
   <title>{% block title %}Smerfume Panel{% endblock %} · Smerfume Panel</title>
+  {% comment %}Apply the saved theme before first paint (no flash). "system" or nothing: follow the OS.{% endcomment %}
+  <script>(function(){try{var t=localStorage.getItem("ops-theme");if(t==="light"||t==="dark"){document.documentElement.setAttribute("data-theme",t);}}catch(e){}})();</script>
   <link rel="stylesheet" href="{% static 'ops/ops.css' %}">
   <script src="{% static 'ops/ops.js' %}" defer></script>
 </head>
 <body>
 {% block shell %}
+<a class="skip-link" href="#content">Skip to content</a>
 <div class="shell" data-shell>
   {% include "ops/_sidebar.html" %}
   <div class="shell__backdrop" data-nav-close></div>
   <div class="shell__main">
-    {% include "ops/_topbar.html" %}
-    <main class="content" id="content">
+    <header class="topbar">
+      <button type="button" class="icon-button topbar__menu" data-nav-toggle aria-controls="ops-sidebar" aria-expanded="false" aria-label="Open navigation">
+        {% include "ops/_icon.html" with name="menu" %}
+      </button>
+      <div class="topbar__title">
+        <nav class="crumbs" aria-label="Breadcrumb">
+          {% for group in ops_nav.groups %}{% if group.open %}<span class="crumbs__section">{{ group.label }}</span><span class="crumbs__sep" aria-hidden="true">/</span>{% endif %}{% endfor %}
+          <span class="crumbs__current">{% block page_title %}{% endblock %}</span>
+        </nav>
+      </div>
+      {% if user.is_authenticated %}{% include "ops/_account_menu.html" %}{% endif %}
+    </header>
+    <main class="content" id="content" tabindex="-1">
       {% if messages %}
-        <ul class="messages">
+        <ul class="messages" role="status">
           {% for message in messages %}<li class="message message--{{ message.tags|default:'info' }}">{{ message }}</li>{% endfor %}
         </ul>
       {% endif %}

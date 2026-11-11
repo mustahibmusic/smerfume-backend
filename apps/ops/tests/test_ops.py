@@ -598,3 +598,98 @@ class StaffGroupsTests(TestCase):
                 ).exists(),
                 name,
             )
+
+
+class ShellAndProfileTests(TestCase):
+    """Layout chrome shared by every page: top-bar account menu, theme
+    switch, pagination bar, and the read-only own-profile page."""
+
+    def test_profile_shows_only_own_account(self):
+        user = _ops_user()
+        other = _staff("someoneelse", OPS_ACCESS_PERMISSION)
+        group = Group.objects.create(name="Profile QA Group")
+        user.groups.add(group)
+        self.client.force_login(user)
+        response = self.client.get(reverse("ops:profile"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, user.email)
+        self.assertContains(response, "Profile QA Group")
+        self.assertNotContains(response, other.email)
+        self.assertContains(response, 'data-theme-set="system"')
+
+    def test_profile_needs_login_and_ops_access(self):
+        response = self.client.get(reverse("ops:profile"))
+        self.assertRedirects(response, f"{LOGIN_URL}?next={reverse('ops:profile')}", fetch_redirect_response=False)
+        self.client.force_login(_staff("noaccess"))
+        self.assertEqual(self.client.get(reverse("ops:profile")).status_code, 403)
+
+    def test_account_menu_has_profile_theme_and_logout(self):
+        self.client.force_login(_ops_user())
+        response = self.client.get(LIST_URL)
+        self.assertContains(response, "data-menu")
+        self.assertContains(response, f'href="{reverse("ops:profile")}"')
+        for theme in ("light", "dark", "system"):
+            self.assertContains(response, f'data-theme-set="{theme}"')
+        self.assertContains(response, f'action="{LOGOUT_URL}"')
+
+    def test_page_title_and_section_render_in_top_bar(self):
+        self.client.force_login(_ops_user())
+        response = self.client.get(LIST_URL)
+        self.assertContains(response, '<span class="crumbs__section">Sales</span>')
+        self.assertContains(response, '<span class="crumbs__current">Orders</span>')
+
+    def test_pagination_shows_page_numbers(self):
+        self.client.force_login(_ops_user())
+        for n in range(26):
+            _order(200 + n)
+        response = self.client.get(LIST_URL, {"page": 2})
+        self.assertContains(response, 'aria-current="page"')
+        self.assertContains(response, "Showing 26–26 of 26")
+        self.assertContains(response, 'rel="prev"')
+
+    def test_sidebar_user_menu_matches_account_menu(self):
+        self.client.force_login(_ops_user())
+        html = self.client.get(LIST_URL).content.decode()
+        self.assertIn('class="menu menu--up" data-menu', html)
+        # Sidebar and top-bar menus each carry the full set of items.
+        self.assertEqual(html.count(f'href="{reverse("ops:password_change")}"'), 2)
+        self.assertEqual(html.count('data-theme-set="system"'), 2)
+        self.assertEqual(html.count(f'action="{LOGOUT_URL}"'), 2)
+        self.assertIn("View site", html)
+
+    @override_settings(ADMIN_SITE_URL="https://shop.example.com")
+    def test_view_site_links_to_storefront(self):
+        self.client.force_login(_ops_user())
+        self.assertContains(self.client.get(LIST_URL), 'href="https://shop.example.com" target="_blank" rel="noopener"')
+
+
+class PasswordChangeTests(TestCase):
+    URL = reverse("ops:password_change")
+
+    def test_changes_own_password_and_keeps_session(self):
+        user = _ops_user()
+        self.client.force_login(user)
+        response = self.client.post(self.URL, {
+            "old_password": PASSWORD, "new_password1": "N3w-ops-pass-xyz", "new_password2": "N3w-ops-pass-xyz",
+        })
+        self.assertRedirects(response, reverse("ops:profile"))
+        user.refresh_from_db()
+        self.assertTrue(user.check_password("N3w-ops-pass-xyz"))
+        self.assertEqual(self.client.get(LIST_URL).status_code, 200)  # still signed in
+
+    def test_wrong_old_password_is_refused(self):
+        user = _ops_user()
+        self.client.force_login(user)
+        response = self.client.post(self.URL, {
+            "old_password": "wrong", "new_password1": "N3w-ops-pass-xyz", "new_password2": "N3w-ops-pass-xyz",
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.context["form"].errors)
+        user.refresh_from_db()
+        self.assertTrue(user.check_password(PASSWORD))
+
+    def test_needs_login_and_ops_access(self):
+        response = self.client.get(self.URL)
+        self.assertRedirects(response, f"{LOGIN_URL}?next={self.URL}", fetch_redirect_response=False)
+        self.client.force_login(_staff("nopanel"))
+        self.assertEqual(self.client.get(self.URL).status_code, 403)

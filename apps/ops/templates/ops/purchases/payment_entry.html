@@ -13,7 +13,7 @@
   <div class="stat"><span class="stat__label">Payment status</span><span class="stat__value stat__value--text"><span class="badge">{{ summary.status }}</span></span></div>
   <div class="stat"><span class="stat__label">Ordered gross total</span><span class="stat__value">{% if summary.ordered is not None %}₹{{ summary.ordered|floatformat:"2g" }}{% else %}—{% endif %}</span></div>
   <div class="stat"><span class="stat__label">Net paid (posted)</span><span class="stat__value">₹{{ summary.net_paid|floatformat:"2g" }}</span></div>
-  <div class="stat"><span class="stat__label">Remaining against PO</span><span class="stat__value">{% if summary.remaining is not None %}₹{{ summary.remaining|floatformat:"2g" }}{% else %}—{% endif %}</span></div>
+  <div class="stat stat--emphasis"><span class="stat__label">Remaining against PO</span><span class="stat__value">{% if summary.remaining is not None %}₹{{ summary.remaining|floatformat:"2g" }}{% else %}—{% endif %}</span></div>
 </div>
 <p class="muted">Drafts (not counted): {{ summary.draft_count }} totalling ₹{{ summary.draft_total|floatformat:"2g" }}. Operational tracking only; Zoho Books is authoritative.</p>
 

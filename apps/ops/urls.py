@@ -1,8 +1,8 @@
 from django.urls import path, re_path
 
 from apps.ops.views import catalog, customers, inventory, list_pages, payments, purchase_drafts, purchases, refunds, returns, sales
-from apps.ops.views.auth import OpsLoginView, OpsLogoutView
-from apps.ops.views.home import OpsHomeView, OpsNotFoundView
+from apps.ops.views.auth import OpsLoginView, OpsLogoutView, OpsPasswordChangeView
+from apps.ops.views.home import OpsHomeView, OpsNotFoundView, OpsProfileView
 from apps.ops.views.orders import OrderDetailView
 
 app_name = "ops"
@@ -11,6 +11,8 @@ urlpatterns = [
     path("", OpsHomeView.as_view(), name="home"),
     path("login/", OpsLoginView.as_view(), name="login"),
     path("logout/", OpsLogoutView.as_view(), name="logout"),
+    path("profile/", OpsProfileView.as_view(), name="profile"),
+    path("profile/password/", OpsPasswordChangeView.as_view(), name="password_change"),
     # Catalog
     path("catalog/products/", list_pages.ProductListPage.as_view(), name="product_list"),
     path("catalog/products/<slug:slug>/", catalog.ProductDetailView.as_view(), name="product_detail"),

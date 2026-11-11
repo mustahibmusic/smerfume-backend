@@ -23,7 +23,7 @@
     {% if actions.reverse_payment_entry %}<a class="button" href="{% url 'ops:po_reverse_entry' po.po_number %}">Reverse entry</a>{% endif %}
     {% if actions.set_tax_treatment %}<a class="button" href="{% url 'ops:po_tax_treatment' po.po_number %}">Set tax treatment</a>{% endif %}
     {% if actions.close %}<a class="button button--ghost" href="{% url 'ops:po_close' po.po_number %}">Close</a>{% endif %}
-    {% if actions.cancel %}<a class="button button--ghost" href="{% url 'ops:po_cancel' po.po_number %}">Cancel</a>{% endif %}
+    {% if actions.cancel %}<a class="button button--ghost button--danger-ghost" href="{% url 'ops:po_cancel' po.po_number %}">Cancel PO</a>{% endif %}
   </div>
 </div>
 
@@ -61,7 +61,7 @@
   <div class="stats card__body">
     <div class="stat"><span class="stat__label">Status</span><span class="stat__value stat__value--text"><span class="badge">{{ payments.status }}</span></span></div>
     <div class="stat"><span class="stat__label">Net paid</span><span class="stat__value">₹{{ payments.summary.net_paid|floatformat:"2g" }}</span></div>
-    <div class="stat"><span class="stat__label">Remaining against PO</span><span class="stat__value">{% if payments.remaining is not None %}₹{{ payments.remaining|floatformat:"2g" }}{% else %}—{% endif %}</span></div>
+    <div class="stat stat--emphasis"><span class="stat__label">Remaining against PO</span><span class="stat__value">{% if payments.remaining is not None %}₹{{ payments.remaining|floatformat:"2g" }}{% else %}—{% endif %}</span></div>
   </div>
   {% if payments.entries %}
   <table class="table table--responsive">

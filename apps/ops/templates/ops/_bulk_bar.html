@@ -1,0 +1,11 @@
+{% comment %}Bulk-action bar: hidden until one or more rows on this page are selected. Selection is current-page only. Actions are the ones this list registers and this user may run; each runs through its service row by row.{% endcomment %}
+<form id="bulk-form" method="post" action="{{ ops_bulk_url }}" class="bulk-bar" data-bulk-bar hidden>
+  {% csrf_token %}
+  <input type="hidden" name="next" value="{{ request.get_full_path }}">
+  <span class="bulk-bar__count"><strong data-bulk-count>0</strong> selected on this page</span>
+  {% for action in ops_bulk_actions %}
+    <button type="submit" name="action" value="{{ action.key }}" class="button{% if action.danger %} button--danger{% endif %}"{% if action.confirm %} data-confirm-button="{{ action.confirm }}"{% endif %}>{{ action.label }}</button>
+  {% endfor %}
+  <button type="button" class="button button--ghost" data-bulk-export>Export selected (CSV)</button>
+  <button type="button" class="button button--ghost" data-bulk-clear>Clear</button>
+</form>

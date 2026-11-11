@@ -189,11 +189,122 @@
     });
   }
 
+  // List pages: current-page multi-select, bulk bar and CSV export.
+  function initListSelection() {
+    var bar = document.querySelector("[data-bulk-bar]");
+    var all = document.querySelector("[data-select-all]");
+    var boxes = Array.prototype.slice.call(document.querySelectorAll("[data-select-row]"));
+    if (!bar || !boxes.length) {
+      return;
+    }
+    var count = bar.querySelector("[data-bulk-count]");
+    function selected() {
+      return boxes.filter(function (box) { return box.checked; });
+    }
+    function refresh() {
+      var n = selected().length;
+      count.textContent = String(n);
+      bar.hidden = n === 0;
+      if (all) {
+        all.checked = n > 0 && n === boxes.length;
+        all.indeterminate = n > 0 && n < boxes.length;
+      }
+    }
+    boxes.forEach(function (box) { box.addEventListener("change", refresh); });
+    if (all) {
+      all.addEventListener("change", function () {
+        boxes.forEach(function (box) { box.checked = all.checked; });
+        refresh();
+      });
+    }
+    bar.querySelector("[data-bulk-clear]").addEventListener("click", function () {
+      boxes.forEach(function (box) { box.checked = false; });
+      refresh();
+    });
+    bar.querySelector("[data-bulk-export]").addEventListener("click", function () {
+      var table = boxes[0].closest("table");
+      var heads = Array.prototype.slice.call(table.querySelectorAll("thead th"))
+        .filter(function (th) { return !th.classList.contains("select-col") && !th.classList.contains("actions-col"); })
+        .map(function (th) { return th.textContent.trim(); });
+      var lines = [heads];
+      selected().forEach(function (box) {
+        var cells = Array.prototype.slice.call(box.closest("tr").children)
+          .filter(function (td) { return !td.classList.contains("select-col") && !td.classList.contains("actions-col"); });
+        lines.push(cells.map(function (td) { return td.innerText.replace(/\s+/g, " ").trim(); }));
+      });
+      var csv = lines.map(function (row) {
+        return row.map(function (value) { return '"' + value.replace(/"/g, '""') + '"'; }).join(",");
+      }).join("\r\n");
+      var link = document.createElement("a");
+      link.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+      link.download = "selection.csv";
+      link.click();
+      URL.revokeObjectURL(link.href);
+    });
+    refresh();
+  }
+
+  // Quick view drawer: a detail page rendered read-only (?quick=1), or the
+  // row's own cells for lists without a detail page. The list stays put.
+  function initQuickView() {
+    var drawer = document.querySelector("[data-quick-drawer]");
+    if (!drawer) {
+      return;
+    }
+    var body = drawer.querySelector("[data-quick-body]");
+    function open() {
+      if (typeof drawer.showModal === "function") { drawer.showModal(); } else { drawer.setAttribute("open", ""); }
+    }
+    function fromRow(row) {
+      var list = document.createElement("dl");
+      list.className = "dl";
+      Array.prototype.slice.call(row.children).forEach(function (td) {
+        if (td.classList.contains("select-col") || td.classList.contains("actions-col")) {
+          return;
+        }
+        var dt = document.createElement("dt");
+        dt.textContent = td.getAttribute("data-label") || "";
+        var dd = document.createElement("dd");
+        dd.textContent = td.innerText.replace(/\s+/g, " ").trim() || "—";
+        list.appendChild(dt);
+        list.appendChild(dd);
+      });
+      return list;
+    }
+    document.addEventListener("click", function (event) {
+      var trigger = event.target.closest("[data-quick-view]");
+      if (!trigger) {
+        return;
+      }
+      var url = trigger.getAttribute("data-quick-view");
+      var menu = trigger.closest("details");
+      if (menu) { menu.open = false; }
+      body.innerHTML = "";
+      if (!url) {
+        body.appendChild(fromRow(trigger.closest("tr")));
+        open();
+        return;
+      }
+      body.textContent = "Loading…";
+      open();
+      fetch(url + (url.indexOf("?") === -1 ? "?" : "&") + "quick=1", { credentials: "same-origin" })
+        .then(function (response) { return response.ok ? response.text() : Promise.reject(response.status); })
+        .then(function (html) { body.innerHTML = html; })
+        .catch(function () { body.textContent = "This record could not be loaded."; });
+    });
+    drawer.querySelector("[data-quick-close]").addEventListener("click", function () { drawer.close(); });
+    drawer.addEventListener("click", function (event) {
+      if (event.target === drawer) { drawer.close(); }
+    });
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     initSidebar();
     initForms();
     initSale();
     initFormsets();
+    initListSelection();
+    initQuickView();
     document.querySelectorAll("form[data-items-url]").forEach(bindSkuInputs);
   });
 })();

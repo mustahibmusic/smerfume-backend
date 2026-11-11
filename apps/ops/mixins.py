@@ -54,6 +54,10 @@ class OpsAccessMixin:
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         context.update(ops_context(self.request, self.nav_active))
+        # ?quick=1 renders a detail page as a read-only quick view (drawer
+        # content); templates extend ``ops_layout``.
+        if self.request.GET.get("quick") == "1":
+            context["ops_layout"] = "ops/quick.html"
         return context
 
 

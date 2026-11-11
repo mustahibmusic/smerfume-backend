@@ -1,4 +1,4 @@
-{% extends "ops/base.html" %}
+{% extends ops_layout|default:"ops/base.html" %}
 {% block title %}{{ vendor.name }}{% endblock %}
 {% block page_title %}<a class="crumb" href="{% url 'ops:vendor_list' %}">{% include "ops/_icon.html" with name="back" %}Vendors</a>{% endblock %}
 {% block content %}

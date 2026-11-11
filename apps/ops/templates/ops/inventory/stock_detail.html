@@ -1,4 +1,4 @@
-{% extends "ops/base.html" %}
+{% extends ops_layout|default:"ops/base.html" %}
 {% block title %}{{ stock.variant.sku }} · {{ stock.get_stock_type_display }}{% endblock %}
 {% block page_title %}<a class="crumb" href="{% url 'ops:stock_list' %}">{% include "ops/_icon.html" with name="back" %}Stock</a>{% endblock %}
 {% block content %}

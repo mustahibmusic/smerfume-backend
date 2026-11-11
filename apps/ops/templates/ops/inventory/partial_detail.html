@@ -1,4 +1,4 @@
-{% extends "ops/base.html" %}
+{% extends ops_layout|default:"ops/base.html" %}
 {% block title %}Partial bottle · {{ lot.variant.sku }}{% endblock %}
 {% block page_title %}<a class="crumb" href="{% url 'ops:partial_lot_list' %}">{% include "ops/_icon.html" with name="back" %}Partial bottles</a>{% endblock %}
 {% block content %}

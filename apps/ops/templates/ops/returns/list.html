@@ -19,16 +19,19 @@
 </form>
 
 {% if object_list %}
+{% include "ops/_bulk_bar.html" %}
 <div class="card card--flush">
   <table class="table table--responsive">
-    <thead><tr><th scope="col">Requested</th><th scope="col">Order</th><th scope="col">Status</th><th scope="col" class="num">Lines</th></tr></thead>
+    <thead><tr>{% include "ops/_list_select_all.html" %}<th scope="col">Requested</th><th scope="col">Order</th><th scope="col">Status</th><th scope="col" class="num">Lines</th><th scope="col" class="actions-col">Actions</th></tr></thead>
     <tbody>
       {% for return in object_list %}
       <tr>
+        {% include "ops/_list_select_row.html" with obj=return %}
         <td data-label="Requested" class="nowrap"><a class="link-strong" href="{% url 'ops:return_detail' return.public_id %}">{{ return.created_at|date:"d M Y, H:i" }}</a></td>
         <td data-label="Order" class="nowrap">{{ return.order.order_number }}</td>
         <td data-label="Status"><span class="badge">{{ return.get_status_display }}</span></td>
         <td data-label="Lines" class="num">{{ return.line_count }}</td>
+        {% include "ops/_row_actions.html" with obj=return %}
       </tr>
       {% endfor %}
     </tbody>
@@ -41,4 +44,5 @@
   <p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Returns appear here once requested.{% endif %}</p>
 </section>
 {% endif %}
+{% include "ops/_quick_drawer.html" %}
 {% endblock %}

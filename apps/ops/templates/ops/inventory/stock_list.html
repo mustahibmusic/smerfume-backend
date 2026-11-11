@@ -21,12 +21,14 @@
 </form>
 
 {% if object_list %}
+{% include "ops/_bulk_bar.html" %}
 <div class="card card--flush">
   <table class="table table--responsive">
-    <thead><tr><th scope="col">Item</th><th scope="col">Type</th><th scope="col">Warehouse</th><th scope="col" class="num">On hand</th><th scope="col" class="num">Reserved</th><th scope="col" class="num">Available</th><th scope="col" class="num">Reorder at</th></tr></thead>
+    <thead><tr>{% include "ops/_list_select_all.html" %}<th scope="col">Item</th><th scope="col">Type</th><th scope="col">Warehouse</th><th scope="col" class="num">On hand</th><th scope="col" class="num">Reserved</th><th scope="col" class="num">Available</th><th scope="col" class="num">Reorder at</th><th scope="col" class="actions-col">Actions</th></tr></thead>
     <tbody>
       {% for stock in object_list %}
       <tr>
+        {% include "ops/_list_select_row.html" with obj=stock %}
         <td data-label="Item"><a class="link-strong" href="{% url 'ops:stock_detail' stock.public_id %}">{{ stock.variant }}</a><br><code>{{ stock.variant.sku }}</code></td>
         <td data-label="Type"><span class="badge">{{ stock.get_stock_type_display }}</span></td>
         <td data-label="Warehouse">{{ stock.warehouse }}</td>
@@ -34,6 +36,7 @@
         <td data-label="Reserved" class="num">{{ stock.quantity_reserved|floatformat:"-2" }}</td>
         <td data-label="Available" class="num">{{ stock.available|floatformat:"-2" }}</td>
         <td data-label="Reorder at" class="num">{{ stock.reorder_level|floatformat:"-2"|default:"—" }}</td>
+        {% include "ops/_row_actions.html" with obj=stock %}
       </tr>
       {% endfor %}
     </tbody>
@@ -43,4 +46,5 @@
 {% else %}
 <section class="empty card"><h2>No stock found</h2><p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Stock rows appear once goods are received.{% endif %}</p></section>
 {% endif %}
+{% include "ops/_quick_drawer.html" %}
 {% endblock %}

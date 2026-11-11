@@ -22,12 +22,14 @@
 </form>
 
 {% if object_list %}
+{% include "ops/_bulk_bar.html" %}
 <div class="card card--flush">
   <table class="table table--responsive">
-    <thead><tr><th scope="col">When</th><th scope="col">Item</th><th scope="col">Type</th><th scope="col">Movement</th><th scope="col">Reason</th><th scope="col">Warehouse</th><th scope="col">By</th><th scope="col" class="num">Change</th></tr></thead>
+    <thead><tr>{% include "ops/_list_select_all.html" %}<th scope="col">When</th><th scope="col">Item</th><th scope="col">Type</th><th scope="col">Movement</th><th scope="col">Reason</th><th scope="col">Warehouse</th><th scope="col">By</th><th scope="col" class="num">Change</th><th scope="col" class="actions-col">Actions</th></tr></thead>
     <tbody>
       {% for movement in object_list %}
       <tr>
+        {% include "ops/_list_select_row.html" with obj=movement %}
         <td data-label="When" class="nowrap">{{ movement.created_at|date:"d M Y, H:i" }}</td>
         <td data-label="Item">{{ movement.variant }}<br><code>{{ movement.variant.sku }}</code></td>
         <td data-label="Type">{{ movement.get_stock_type_display }}</td>
@@ -36,6 +38,7 @@
         <td data-label="Warehouse">{{ movement.warehouse }}</td>
         <td data-label="By">{{ movement.performed_by|person }}</td>
         <td data-label="Change" class="num">{% if movement.quantity_delta > 0 %}+{% endif %}{{ movement.quantity_delta|floatformat:"-2" }}</td>
+        {% include "ops/_row_actions.html" with obj=movement %}
       </tr>
       {% endfor %}
     </tbody>
@@ -45,4 +48,5 @@
 {% else %}
 <section class="empty card"><h2>No movements found</h2><p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Every stock change appears here.{% endif %}</p></section>
 {% endif %}
+{% include "ops/_quick_drawer.html" %}
 {% endblock %}

@@ -21,18 +21,21 @@
 </form>
 
 {% if object_list %}
+{% include "ops/_bulk_bar.html" %}
 <div class="card card--flush">
   <table class="table table--responsive">
-    <thead><tr><th scope="col">Created</th><th scope="col">Order</th><th scope="col">Item</th><th scope="col">Purpose</th><th scope="col">Status</th><th scope="col" class="num">Quantity</th></tr></thead>
+    <thead><tr>{% include "ops/_list_select_all.html" %}<th scope="col">Created</th><th scope="col">Order</th><th scope="col">Item</th><th scope="col">Purpose</th><th scope="col">Status</th><th scope="col" class="num">Quantity</th><th scope="col" class="actions-col">Actions</th></tr></thead>
     <tbody>
       {% for reservation in object_list %}
       <tr>
+        {% include "ops/_list_select_row.html" with obj=reservation %}
         <td data-label="Created" class="nowrap"><a class="link-strong" href="{% url 'ops:reservation_detail' reservation.public_id %}">{{ reservation.created_at|date:"d M Y, H:i" }}</a></td>
         <td data-label="Order" class="nowrap">{{ reservation.order_item.order.order_number }}</td>
         <td data-label="Item">{{ reservation.variant }}<br><code>{{ reservation.variant.sku }}</code></td>
         <td data-label="Purpose">{{ reservation.get_purpose_display }}</td>
         <td data-label="Status"><span class="badge">{{ reservation.get_status_display }}</span></td>
         <td data-label="Quantity" class="num">{{ reservation.quantity|floatformat:"-2" }}</td>
+        {% include "ops/_row_actions.html" with obj=reservation %}
       </tr>
       {% endfor %}
     </tbody>
@@ -42,4 +45,5 @@
 {% else %}
 <section class="empty card"><h2>No reservations found</h2><p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Reservations appear when orders hold stock.{% endif %}</p></section>
 {% endif %}
+{% include "ops/_quick_drawer.html" %}
 {% endblock %}

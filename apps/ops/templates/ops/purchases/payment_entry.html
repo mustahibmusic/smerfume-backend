@@ -1,4 +1,4 @@
-{% extends "ops/base.html" %}
+{% extends ops_layout|default:"ops/base.html" %}
 {% load ops_tags %}
 {% block title %}{% if entry %}{{ entry.payment_number|default:"Draft payment" }}{% else %}Record payment{% endif %} · {{ po.po_number }}{% endblock %}
 {% block page_title %}<a class="crumb" href="{% url 'ops:po_detail' po.po_number %}">{% include "ops/_icon.html" with name="back" %}{{ po.po_number }}</a>{% endblock %}

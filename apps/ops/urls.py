@@ -1,9 +1,9 @@
 from django.urls import path, re_path
 
-from apps.ops.views import inventory, payments, purchase_drafts, purchases, refunds, returns, sales
+from apps.ops.views import inventory, list_pages, payments, purchase_drafts, purchases, refunds, returns, sales
 from apps.ops.views.auth import OpsLoginView, OpsLogoutView
 from apps.ops.views.home import OpsHomeView, OpsNotFoundView
-from apps.ops.views.orders import OrderDetailView, OrderListView
+from apps.ops.views.orders import OrderDetailView
 
 app_name = "ops"
 
@@ -12,7 +12,7 @@ urlpatterns = [
     path("login/", OpsLoginView.as_view(), name="login"),
     path("logout/", OpsLogoutView.as_view(), name="logout"),
     # Sales
-    path("orders/", OrderListView.as_view(), name="order_list"),
+    path("orders/", list_pages.OrderListPage.as_view(), name="order_list"),
     path("orders/<str:order_number>/", OrderDetailView.as_view(), name="order_detail"),
     path(
         "orders/<str:order_number>/return/", returns.OrderCreateReturnView.as_view(),
@@ -24,7 +24,8 @@ urlpatterns = [
     ),
     path("sales/new/", sales.InStoreSaleView.as_view(), name="in_store_sale"),
     path("sales/items/", sales.InStoreItemSearchView.as_view(), name="in_store_items"),
-    path("returns/", returns.ReturnListView.as_view(), name="return_list"),
+    path("returns/", list_pages.ReturnListPage.as_view(), name="return_list"),
+    path("returns/bulk/", list_pages.ReturnBulkView.as_view(), name="return_bulk"),
     path("returns/<uuid:public_id>/", returns.ReturnDetailView.as_view(), name="return_detail"),
     path(
         "returns/<uuid:public_id>/received-quantities/", returns.ReturnReceivedQuantitiesView.as_view(),
@@ -38,7 +39,8 @@ urlpatterns = [
         "returns/<uuid:public_id>/<slug:action>/", returns.ReturnActionView.as_view(),
         name="return_action",
     ),
-    path("refunds/", refunds.RefundListView.as_view(), name="refund_list"),
+    path("refunds/", list_pages.RefundListPage.as_view(), name="refund_list"),
+    path("refunds/bulk/", list_pages.RefundBulkView.as_view(), name="refund_bulk"),
     path("refunds/<uuid:public_id>/", refunds.RefundDetailView.as_view(), name="refund_detail"),
     path("refunds/<uuid:public_id>/method/", refunds.RefundMethodView.as_view(), name="refund_method"),
     path(
@@ -52,7 +54,7 @@ urlpatterns = [
         name="refund_adjustment",
     ),
     # Inventory
-    path("inventory/stock/", inventory.StockListView.as_view(), name="stock_list"),
+    path("inventory/stock/", list_pages.StockListPage.as_view(), name="stock_list"),
     path("inventory/stock/<uuid:public_id>/", inventory.StockDetailView.as_view(), name="stock_detail"),
     path("inventory/stock/<uuid:public_id>/adjust/", inventory.StockAdjustView.as_view(), name="stock_adjust"),
     path(
@@ -63,7 +65,7 @@ urlpatterns = [
         "inventory/stock/<uuid:public_id>/transfer/", inventory.StockTransferView.as_view(),
         name="stock_transfer",
     ),
-    path("inventory/partial-bottles/", inventory.PartialLotListView.as_view(), name="partial_lot_list"),
+    path("inventory/partial-bottles/", list_pages.PartialLotListPage.as_view(), name="partial_lot_list"),
     path(
         "inventory/partial-bottles/<uuid:public_id>/", inventory.PartialLotDetailView.as_view(),
         name="partial_lot_detail",
@@ -72,8 +74,8 @@ urlpatterns = [
         "inventory/partial-bottles/<uuid:public_id>/adjust/", inventory.PartialLotAdjustView.as_view(),
         name="partial_lot_adjust",
     ),
-    path("inventory/movements/", inventory.MovementListView.as_view(), name="movement_list"),
-    path("inventory/reservations/", inventory.ReservationListView.as_view(), name="reservation_list"),
+    path("inventory/movements/", list_pages.MovementListPage.as_view(), name="movement_list"),
+    path("inventory/reservations/", list_pages.ReservationListPage.as_view(), name="reservation_list"),
     path(
         "inventory/reservations/<uuid:public_id>/", inventory.ReservationDetailView.as_view(),
         name="reservation_detail",
@@ -82,16 +84,16 @@ urlpatterns = [
         "inventory/allocations/<uuid:public_id>/reallocate/", inventory.AllocationReallocateView.as_view(),
         name="allocation_reallocate",
     ),
-    path("inventory/warehouses/", inventory.WarehouseListView.as_view(), name="warehouse_list"),
+    path("inventory/warehouses/", list_pages.WarehouseListPage.as_view(), name="warehouse_list"),
     # Purchases
-    path("purchases/vendors/", purchases.VendorListView.as_view(), name="vendor_list"),
+    path("purchases/vendors/", list_pages.VendorListPage.as_view(), name="vendor_list"),
     path("purchases/vendors/new/", purchase_drafts.VendorFormView.as_view(), name="vendor_new"),
     path(
         "purchases/vendors/<str:vendor_code>/edit/", purchase_drafts.VendorFormView.as_view(),
         name="vendor_edit",
     ),
     path("purchases/vendors/<str:vendor_code>/", purchases.VendorDetailView.as_view(), name="vendor_detail"),
-    path("purchases/orders/", purchases.PurchaseOrderListView.as_view(), name="po_list"),
+    path("purchases/orders/", list_pages.PurchaseOrderListPage.as_view(), name="po_list"),
     path("purchases/orders/new/", purchase_drafts.PurchaseOrderFormView.as_view(), name="po_new"),
     path("purchases/items/", purchase_drafts.PurchaseItemSearchView.as_view(), name="purchase_items"),
     path(
@@ -126,19 +128,21 @@ urlpatterns = [
         "purchases/orders/<str:po_number>/reverse-entry/", purchases.PurchaseOrderReverseEntryView.as_view(),
         name="po_reverse_entry",
     ),
-    path("purchases/payments/", purchases.PaymentLedgerView.as_view(), name="payment_list"),
+    path("purchases/payments/", list_pages.PaymentLedgerPage.as_view(), name="payment_list"),
+    path("purchases/payments/bulk/", list_pages.PaymentBulkView.as_view(), name="payment_bulk"),
     path("purchases/payments/<uuid:public_id>/", purchases.PaymentEntryView.as_view(), name="payment_entry"),
     path(
         "purchases/attachments/<uuid:public_id>/", purchases.PaymentAttachmentDownloadView.as_view(),
         name="payment_attachment",
     ),
-    path("purchases/paid-through/", purchases.PaymentAccountListView.as_view(), name="account_list"),
+    path("purchases/paid-through/", list_pages.PaymentAccountListPage.as_view(), name="account_list"),
     path("purchases/paid-through/new/", purchase_drafts.PaymentAccountFormView.as_view(), name="account_new"),
     path(
         "purchases/paid-through/<uuid:public_id>/edit/", purchase_drafts.PaymentAccountFormView.as_view(),
         name="account_edit",
     ),
-    path("purchases/receipts/", purchases.GoodsReceiptListView.as_view(), name="grn_list"),
+    path("purchases/receipts/", list_pages.GoodsReceiptListPage.as_view(), name="grn_list"),
+    path("purchases/receipts/bulk/", list_pages.GoodsReceiptBulkView.as_view(), name="grn_bulk"),
     path("purchases/opening/new/", purchase_drafts.OpeningReceiptStartView.as_view(), name="opening_new"),
     path(
         "purchases/receipts/<str:grn_number>/edit/", purchase_drafts.GoodsReceiptEditView.as_view(),
@@ -154,7 +158,7 @@ urlpatterns = [
         "purchases/receipts/<str:grn_number>/reverse/", purchases.GoodsReceiptReverseView.as_view(),
         name="grn_reverse",
     ),
-    path("purchases/discrepancies/", purchases.DiscrepancyListView.as_view(), name="discrepancy_list"),
+    path("purchases/discrepancies/", list_pages.DiscrepancyListPage.as_view(), name="discrepancy_list"),
     path(
         "purchases/discrepancies/<uuid:public_id>/", purchases.DiscrepancyDetailView.as_view(),
         name="discrepancy_detail",
@@ -163,7 +167,7 @@ urlpatterns = [
         "purchases/discrepancies/<uuid:public_id>/resolve/", purchases.DiscrepancyResolveView.as_view(),
         name="discrepancy_resolve",
     ),
-    path("purchases/booked-history/", purchases.BookedChangeListView.as_view(), name="booked_list"),
+    path("purchases/booked-history/", list_pages.BookedChangeListPage.as_view(), name="booked_list"),
     # Must stay last: branded 404 for any other /ops/ path.
     re_path(r"^.*$", OpsNotFoundView.as_view(), name="not_found"),
 ]

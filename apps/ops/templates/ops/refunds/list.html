@@ -20,18 +20,21 @@
 </form>
 
 {% if object_list %}
+{% include "ops/_bulk_bar.html" %}
 <div class="card card--flush">
   <table class="table table--responsive">
-    <thead><tr><th scope="col">Created</th><th scope="col">Order</th><th scope="col">Status</th><th scope="col">Method</th><th scope="col">Reference</th><th scope="col" class="num">Amount</th></tr></thead>
+    <thead><tr>{% include "ops/_list_select_all.html" %}<th scope="col">Created</th><th scope="col">Order</th><th scope="col">Status</th><th scope="col">Method</th><th scope="col">Reference</th><th scope="col" class="num">Amount</th><th scope="col" class="actions-col">Actions</th></tr></thead>
     <tbody>
       {% for refund in object_list %}
       <tr>
+        {% include "ops/_list_select_row.html" with obj=refund %}
         <td data-label="Created" class="nowrap"><a class="link-strong" href="{% url 'ops:refund_detail' refund.public_id %}">{{ refund.created_at|date:"d M Y, H:i" }}</a></td>
         <td data-label="Order" class="nowrap">{{ refund.return_request.order.order_number }}</td>
         <td data-label="Status"><span class="badge">{{ refund.get_refund_status_display }}</span></td>
         <td data-label="Method">{{ refund.get_refund_method_display|default:"—" }}</td>
         <td data-label="Reference">{{ refund.refund_reference|default:"—" }}</td>
         <td data-label="Amount" class="num">₹{{ refund.refund_amount|floatformat:"2g" }}</td>
+        {% include "ops/_row_actions.html" with obj=refund %}
       </tr>
       {% endfor %}
     </tbody>
@@ -44,4 +47,5 @@
   <p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Refunds appear here once created from a completed return.{% endif %}</p>
 </section>
 {% endif %}
+{% include "ops/_quick_drawer.html" %}
 {% endblock %}

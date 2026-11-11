@@ -32,10 +32,11 @@
 {% endif %}
 
 {% if rows %}
+{% include "ops/_bulk_bar.html" %}
 <div class="card card--flush">
   <table class="table table--responsive">
     <thead>
-      <tr>
+      <tr>{% include "ops/_list_select_all.html" %}
         <th scope="col">Order</th>
         <th scope="col">Date</th>
         <th scope="col">Customer</th>
@@ -44,11 +45,12 @@
         <th scope="col">Payment</th>
         <th scope="col" class="num">Total</th>
         <th scope="col" class="num">Balance due</th>
-      </tr>
+      <th scope="col" class="actions-col">Actions</th></tr>
     </thead>
     <tbody>
       {% for row in rows %}{% with order=row.order %}
       <tr>
+        {% include "ops/_list_select_row.html" with obj=row.order %}
         <td data-label="Order" class="nowrap"><a class="link-strong" href="{% url 'ops:order_detail' order.order_number %}">{{ order.order_number }}</a></td>
         <td data-label="Date" class="nowrap">{{ order.created_at|date:"d M Y" }}<br><small class="muted">{{ order.created_at|date:"H:i" }}</small></td>
         <td data-label="Customer">{{ row.customer }}{% if row.contact %}<br><small class="muted">{{ row.contact }}</small>{% endif %}</td>
@@ -57,6 +59,7 @@
         <td data-label="Payment"><span class="badge badge--{{ row.payment_status_tone }}">{{ row.payment_status_label }}</span></td>
         <td data-label="Total" class="num">₹{{ order.total|floatformat:"2g" }}</td>
         <td data-label="Balance due" class="num">₹{{ order.balance_due|floatformat:"2g" }}</td>
+        {% include "ops/_row_actions.html" with obj=row.order %}
       </tr>
       {% endwith %}{% endfor %}
     </tbody>
@@ -80,4 +83,5 @@
   <p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Orders appear here once placed.{% endif %}</p>
 </section>
 {% endif %}
+{% include "ops/_quick_drawer.html" %}
 {% endblock %}

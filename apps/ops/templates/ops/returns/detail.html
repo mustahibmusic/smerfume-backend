@@ -1,4 +1,4 @@
-{% extends "ops/base.html" %}
+{% extends ops_layout|default:"ops/base.html" %}
 {% block title %}Return · {{ return.order.order_number }}{% endblock %}
 {% block page_title %}<a class="crumb" href="{% url 'ops:return_list' %}">{% include "ops/_icon.html" with name="back" %}Returns</a>{% endblock %}
 {% block content %}

@@ -1,0 +1,16 @@
+{% comment %}Row actions for obj.ops_actions: inline buttons on wide screens, a three-dot menu on narrow screens (CSS picks one). POST actions are forms with a confirmation; nothing here decides permissions, the view does.{% endcomment %}
+<td class="actions-col" data-label="Actions">
+  {% if obj.ops_actions %}
+  <div class="row-actions">
+    <div class="row-actions__inline">
+      {% for action in obj.ops_actions %}{% include "ops/_row_action.html" %}{% endfor %}
+    </div>
+    <details class="row-menu">
+      <summary class="icon-button" aria-label="Actions for {{ obj.ops_key }}">&#8943;</summary>
+      <div class="row-menu__list">
+        {% for action in obj.ops_actions %}{% include "ops/_row_action.html" %}{% endfor %}
+      </div>
+    </details>
+  </div>
+  {% endif %}
+</td>

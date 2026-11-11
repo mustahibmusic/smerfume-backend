@@ -1,4 +1,4 @@
-{% extends "ops/base.html" %}
+{% extends ops_layout|default:"ops/base.html" %}
 {% load ops_tags %}
 {% block title %}{{ receipt.grn_number }}{% endblock %}
 {% block page_title %}<a class="crumb" href="{% url 'ops:grn_list' %}">{% include "ops/_icon.html" with name="back" %}Goods receipts</a>{% endblock %}

@@ -1,4 +1,4 @@
-{% extends "ops/base.html" %}
+{% extends ops_layout|default:"ops/base.html" %}
 {% load ops_tags %}
 {% block title %}Refund · {{ order.order_number }}{% endblock %}
 {% block page_title %}<a class="crumb" href="{% url 'ops:refund_list' %}">{% include "ops/_icon.html" with name="back" %}Refunds</a>{% endblock %}

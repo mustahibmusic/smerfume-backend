@@ -1,4 +1,4 @@
-{% extends "ops/base.html" %}
+{% extends ops_layout|default:"ops/base.html" %}
 {% block title %}Reservation · {{ reservation.order_item.order.order_number }}{% endblock %}
 {% block page_title %}<a class="crumb" href="{% url 'ops:reservation_list' %}">{% include "ops/_icon.html" with name="back" %}Reservations</a>{% endblock %}
 {% block content %}

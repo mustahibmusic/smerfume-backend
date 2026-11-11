@@ -16,12 +16,14 @@
   </div>
 </form>
 {% if object_list %}
+{% include "ops/_bulk_bar.html" %}
 <div class="card card--flush">
   <table class="table table--responsive">
-    <thead><tr><th scope="col">Reported</th><th scope="col">GRN</th><th scope="col">PO</th><th scope="col">Type</th><th scope="col">Item</th><th scope="col" class="num">Qty</th><th scope="col">Status</th></tr></thead>
+    <thead><tr>{% include "ops/_list_select_all.html" %}<th scope="col">Reported</th><th scope="col">GRN</th><th scope="col">PO</th><th scope="col">Type</th><th scope="col">Item</th><th scope="col" class="num">Qty</th><th scope="col">Status</th><th scope="col" class="actions-col">Actions</th></tr></thead>
     <tbody>
       {% for d in object_list %}
       <tr>
+        {% include "ops/_list_select_row.html" with obj=d %}
         <td data-label="Reported" class="nowrap"><a class="link-strong" href="{% url 'ops:discrepancy_detail' d.public_id %}">{{ d.created_at|date:"d M Y" }}</a></td>
         <td data-label="GRN" class="nowrap">{{ d.receipt.grn_number }}</td>
         <td data-label="PO" class="nowrap">{{ d.receipt.purchase_order.po_number|default:"—" }}</td>
@@ -29,6 +31,7 @@
         <td data-label="Item">{{ d.item_label }}</td>
         <td data-label="Qty" class="num">{{ d.quantity }}</td>
         <td data-label="Status"><span class="badge{% if d.status == 'open' %} badge--warn{% else %} badge--ok{% endif %}">{{ d.get_status_display }}</span></td>
+        {% include "ops/_row_actions.html" with obj=d %}
       </tr>
       {% endfor %}
     </tbody>
@@ -38,4 +41,5 @@
 {% else %}
 <section class="empty card"><h2>No discrepancies</h2></section>
 {% endif %}
+{% include "ops/_quick_drawer.html" %}
 {% endblock %}

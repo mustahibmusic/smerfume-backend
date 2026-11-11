@@ -18,12 +18,14 @@
   </div>
 </form>
 {% if object_list %}
+{% include "ops/_bulk_bar.html" %}
 <div class="card card--flush">
   <table class="table table--responsive">
-    <thead><tr><th scope="col">Entry</th><th scope="col">Date</th><th scope="col">PO</th><th scope="col">Vendor</th><th scope="col">Type</th><th scope="col">Status</th><th scope="col">Mode</th><th scope="col">Paid through</th><th scope="col" class="num">Amount</th></tr></thead>
+    <thead><tr>{% include "ops/_list_select_all.html" %}<th scope="col">Entry</th><th scope="col">Date</th><th scope="col">PO</th><th scope="col">Vendor</th><th scope="col">Type</th><th scope="col">Status</th><th scope="col">Mode</th><th scope="col">Paid through</th><th scope="col" class="num">Amount</th><th scope="col" class="actions-col">Actions</th></tr></thead>
     <tbody>
       {% for entry in object_list %}
       <tr>
+        {% include "ops/_list_select_row.html" with obj=entry %}
         <td data-label="Entry" class="nowrap"><a class="link-strong" href="{% url 'ops:payment_entry' entry.public_id %}">{{ entry.payment_number|default:"Draft" }}</a></td>
         <td data-label="Date" class="nowrap">{{ entry.entry_date|date:"d M Y" }}</td>
         <td data-label="PO" class="nowrap">{{ entry.purchase_order.po_number }}</td>
@@ -33,6 +35,7 @@
         <td data-label="Mode">{{ entry.get_method_display }}</td>
         <td data-label="Paid through">{{ entry.paid_through|default:"—" }}</td>
         <td data-label="Amount" class="num">₹{{ entry.amount|floatformat:"2g" }}</td>
+        {% include "ops/_row_actions.html" with obj=entry %}
       </tr>
       {% endfor %}
     </tbody>
@@ -42,4 +45,5 @@
 {% else %}
 <section class="empty card"><h2>No payment entries</h2></section>
 {% endif %}
+{% include "ops/_quick_drawer.html" %}
 {% endblock %}

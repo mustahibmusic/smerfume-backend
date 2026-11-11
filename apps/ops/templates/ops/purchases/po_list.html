@@ -20,12 +20,14 @@
   </div>
 </form>
 {% if object_list %}
+{% include "ops/_bulk_bar.html" %}
 <div class="card card--flush">
   <table class="table table--responsive">
-    <thead><tr><th scope="col">PO</th><th scope="col">Vendor</th><th scope="col">Ordered</th><th scope="col">Expected</th><th scope="col">Status</th><th scope="col" class="num">Lines</th><th scope="col" class="num">Ordered total</th>{% if can_view_payments %}<th scope="col" class="num">Net paid</th><th scope="col">Payment</th>{% endif %}</tr></thead>
+    <thead><tr>{% include "ops/_list_select_all.html" %}<th scope="col">PO</th><th scope="col">Vendor</th><th scope="col">Ordered</th><th scope="col">Expected</th><th scope="col">Status</th><th scope="col" class="num">Lines</th><th scope="col" class="num">Ordered total</th>{% if can_view_payments %}<th scope="col" class="num">Net paid</th><th scope="col">Payment</th>{% endif %}<th scope="col" class="actions-col">Actions</th></tr></thead>
     <tbody>
       {% for po in object_list %}
       <tr>
+        {% include "ops/_list_select_row.html" with obj=po %}
         <td data-label="PO" class="nowrap"><a class="link-strong" href="{% url 'ops:po_detail' po.po_number %}">{{ po.po_number }}</a></td>
         <td data-label="Vendor">{{ po.supplier }}</td>
         <td data-label="Ordered" class="nowrap">{{ po.order_date|date:"d M Y" }}</td>
@@ -37,6 +39,7 @@
         <td data-label="Net paid" class="num">₹{{ po.net_paid_db|floatformat:"2g" }}</td>
         <td data-label="Payment">{% for key, label in payment_status_labels.items %}{% if key == po.payment_status_db %}<span class="badge">{{ label }}</span>{% endif %}{% endfor %}</td>
         {% endif %}
+        {% include "ops/_row_actions.html" with obj=po %}
       </tr>
       {% endfor %}
     </tbody>
@@ -46,4 +49,5 @@
 {% else %}
 <section class="empty card"><h2>No purchase orders found</h2><p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Create the first purchase order.{% endif %}</p></section>
 {% endif %}
+{% include "ops/_quick_drawer.html" %}
 {% endblock %}

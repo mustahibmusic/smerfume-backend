@@ -9,17 +9,20 @@
 {% if can_add_account %}<a class="button button--primary" href="{% url 'ops:account_new' %}">New account</a>{% endif %}
 </div>
 {% if object_list %}
+{% include "ops/_bulk_bar.html" %}
 <div class="card card--flush">
   <table class="table table--responsive">
-    <thead><tr><th scope="col">Account</th><th scope="col">Kind</th><th scope="col">Status</th><th scope="col" class="num">Posted payments</th>{% if can_change_account %}<th scope="col"><span class="visually-hidden">Edit</span></th>{% endif %}</tr></thead>
+    <thead><tr>{% include "ops/_list_select_all.html" %}<th scope="col">Account</th><th scope="col">Kind</th><th scope="col">Status</th><th scope="col" class="num">Posted payments</th>{% if can_change_account %}<th scope="col"><span class="visually-hidden">Edit</span></th>{% endif %}<th scope="col" class="actions-col">Actions</th></tr></thead>
     <tbody>
       {% for account in object_list %}
       <tr>
+        {% include "ops/_list_select_row.html" with obj=account %}
         <td data-label="Account"><strong>{{ account.name }}</strong></td>
         <td data-label="Kind">{{ account.get_kind_display }}</td>
         <td data-label="Status">{% if account.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}</td>
         <td data-label="Posted payments" class="num">{{ account.posted_count }}</td>
         {% if can_change_account %}<td data-label=""><a href="{% url 'ops:account_edit' account.public_id %}">Edit</a></td>{% endif %}
+        {% include "ops/_row_actions.html" with obj=account %}
       </tr>
       {% endfor %}
     </tbody>
@@ -28,4 +31,5 @@
 {% else %}
 <section class="empty card"><h2>No accounts yet</h2></section>
 {% endif %}
+{% include "ops/_quick_drawer.html" %}
 {% endblock %}

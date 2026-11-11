@@ -15,12 +15,14 @@
   </div>
 </form>
 {% if object_list %}
+{% include "ops/_bulk_bar.html" %}
 <div class="card card--flush">
   <table class="table table--responsive">
-    <thead><tr><th scope="col">When</th><th scope="col">PO</th><th scope="col">Item</th><th scope="col" class="num">From</th><th scope="col" class="num">To</th><th scope="col">Note</th><th scope="col">By</th></tr></thead>
+    <thead><tr>{% include "ops/_list_select_all.html" %}<th scope="col">When</th><th scope="col">PO</th><th scope="col">Item</th><th scope="col" class="num">From</th><th scope="col" class="num">To</th><th scope="col">Note</th><th scope="col">By</th><th scope="col" class="actions-col">Actions</th></tr></thead>
     <tbody>
       {% for change in object_list %}
       <tr>
+        {% include "ops/_list_select_row.html" with obj=change %}
         <td data-label="When" class="nowrap">{{ change.created_at|date:"d M Y, H:i" }}</td>
         <td data-label="PO" class="nowrap"><a href="{% url 'ops:po_detail' change.purchase_order_line.purchase_order.po_number %}">{{ change.purchase_order_line.purchase_order.po_number }}</a></td>
         <td data-label="Item">{{ change.purchase_order_line.variant }}<br><code>{{ change.purchase_order_line.variant.sku }}</code></td>
@@ -28,6 +30,7 @@
         <td data-label="To" class="num">{{ change.new_quantity }}</td>
         <td data-label="Note">{{ change.note }}</td>
         <td data-label="By">{{ change.performed_by|person }}</td>
+        {% include "ops/_row_actions.html" with obj=change %}
       </tr>
       {% endfor %}
     </tbody>
@@ -37,4 +40,5 @@
 {% else %}
 <section class="empty card"><h2>No changes recorded</h2></section>
 {% endif %}
+{% include "ops/_quick_drawer.html" %}
 {% endblock %}

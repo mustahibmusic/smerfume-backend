@@ -1,0 +1,24 @@
+{% extends "ops/base.html" %}
+{% block title %}Create return{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:order_detail' order.order_number %}">{% include "ops/_icon.html" with name="back" %}{{ order.order_number }}</a>{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Create return for {{ order.order_number }}</h1>
+    <p class="muted">The same rules as a customer return apply: delivered orders only, within the return window, up to the quantity bought.</p>
+  </div>
+</div>
+<section class="card">
+  <form method="post" class="stack" novalidate>
+    {% csrf_token %}
+    {% include "ops/_form_errors.html" %}
+    <div class="form-grid form-grid--three">
+      {% for field in form %}{% include "ops/_field.html" with field=field %}{% endfor %}
+    </div>
+    <div class="form-actions">
+      <a class="button button--ghost" href="{% url 'ops:order_detail' order.order_number %}">Cancel</a>
+      <button type="submit" class="button button--primary" data-once>Create return</button>
+    </div>
+  </form>
+</section>
+{% endblock %}

@@ -1,0 +1,47 @@
+{% extends "ops/base.html" %}
+{% block title %}Refunds{% endblock %}
+{% block page_title %}Refunds{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Refunds</h1>
+    <p class="muted">{{ paginator.count }} refund{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %}</p>
+  </div>
+</div>
+
+<form method="get" class="filters filters--three" role="search">
+  {% include "ops/_field.html" with field=filter_form.q %}
+  {% include "ops/_field.html" with field=filter_form.refund_status %}
+  {% include "ops/_field.html" with field=filter_form.refund_method %}
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:refund_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+
+{% if object_list %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Created</th><th scope="col">Order</th><th scope="col">Status</th><th scope="col">Method</th><th scope="col">Reference</th><th scope="col" class="num">Amount</th></tr></thead>
+    <tbody>
+      {% for refund in object_list %}
+      <tr>
+        <td data-label="Created" class="nowrap"><a class="link-strong" href="{% url 'ops:refund_detail' refund.public_id %}">{{ refund.created_at|date:"d M Y, H:i" }}</a></td>
+        <td data-label="Order" class="nowrap">{{ refund.return_request.order.order_number }}</td>
+        <td data-label="Status"><span class="badge">{{ refund.get_refund_status_display }}</span></td>
+        <td data-label="Method">{{ refund.get_refund_method_display|default:"—" }}</td>
+        <td data-label="Reference">{{ refund.refund_reference|default:"—" }}</td>
+        <td data-label="Amount" class="num">₹{{ refund.refund_amount|floatformat:"2g" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% include "ops/_pagination.html" %}
+{% else %}
+<section class="empty card">
+  <h2>No refunds found</h2>
+  <p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Refunds appear here once created from a completed return.{% endif %}</p>
+</section>
+{% endif %}
+{% endblock %}

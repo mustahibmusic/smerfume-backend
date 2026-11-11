@@ -641,6 +641,40 @@ def mark_return_in_transit(return_request):
     return return_request
 
 
+# Statuses in which received_quantity may still be recorded before
+# mark_return_received(); afterwards only finalize_return_item() changes it.
+RECEIVED_QUANTITY_EDITABLE_STATUSES = ("approved", "in_transit")
+
+
+@transaction.atomic
+def record_return_received_quantities(return_request, quantities):
+    """Record how many units arrived for each line of a return, before
+    mark_return_received(). `quantities` maps ReturnItem -> int >= 0.
+
+    The same write the Django Admin return page makes through its inline
+    (received_quantity is a plain field while the return is approved or in
+    transit), done under the Return lock so the status cannot move
+    underneath it. No stock or status effect: finalize_return_item() still
+    validates the quantity against approved_quantity at inspection."""
+    from .models import Return
+
+    return_request = Return.objects.select_for_update().get(pk=return_request.pk)
+    if return_request.status not in RECEIVED_QUANTITY_EDITABLE_STATUSES:
+        raise ReturnTransitionError(
+            f"Cannot record received quantities on a return in status={return_request.status}."
+        )
+    items = {item.pk: item for item in return_request.items.select_for_update()}
+    for return_item, quantity in quantities.items():
+        item = items.get(return_item.pk)
+        if item is None:
+            raise ReturnTransitionError("That item does not belong to this return.")
+        if quantity is None or quantity < 0:
+            raise ReturnTransitionError("Received quantity must be zero or more.")
+        item.received_quantity = quantity
+        item.save(update_fields=["received_quantity", "updated_at"])
+    return return_request
+
+
 @transaction.atomic
 def mark_return_received(return_request):
     """in_transit -> received. Requires every ReturnItem on this Return to

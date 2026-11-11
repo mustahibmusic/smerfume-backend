@@ -1,0 +1,58 @@
+{% extends "ops/base.html" %}
+{% block title %}New in-store sale{% endblock %}
+{% block page_title %}New in-store sale{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>New in-store sale</h1>
+    <p class="muted">Records the sale and takes the stock. Payment is recorded separately.</p>
+  </div>
+</div>
+
+<form method="post" class="stack" data-sale-form data-items-url="{% url 'ops:in_store_items' %}" novalidate>
+  {% csrf_token %}
+  {{ form.submission_key }}
+  {% include "ops/_form_errors.html" %}
+  {% if formset.non_form_errors %}
+    <div class="alert alert--danger" role="alert">{% for error in formset.non_form_errors %}<p>{{ error }}</p>{% endfor %}</div>
+  {% endif %}
+
+  <section class="card">
+    <h2>Customer</h2>
+    <div class="form-grid">
+      {% include "ops/_field.html" with field=form.customer_mobile %}
+      {% include "ops/_field.html" with field=form.customer_name %}
+      {% include "ops/_field.html" with field=form.warehouse %}
+    </div>
+  </section>
+
+  <section class="card card--flush">
+    <h2 class="card__title">Items</h2>
+    {{ formset.management_form }}
+    <datalist id="sale-item-options"></datalist>
+    <div class="sale-lines" data-sale-lines>
+      {% for line in formset %}
+        {% include "ops/sales/_line.html" with line=line %}
+      {% endfor %}
+    </div>
+    <template data-sale-empty>{% include "ops/sales/_line.html" with line=formset.empty_form %}</template>
+    <div class="card__body">
+      <button type="button" class="button" data-sale-add>+ Add item</button>
+      <p class="field__help">Prices are the current selling prices. The sale total is calculated when the sale is recorded.</p>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Discount and notes</h2>
+    <div class="form-grid">
+      {% include "ops/_field.html" with field=form.discount_amount %}
+      {% include "ops/_field.html" with field=form.notes %}
+    </div>
+  </section>
+
+  <div class="form-actions">
+    <a class="button button--ghost" href="{% url 'ops:order_list' %}">Cancel</a>
+    <button type="submit" class="button button--primary" data-once>Record sale</button>
+  </div>
+</form>
+{% endblock %}

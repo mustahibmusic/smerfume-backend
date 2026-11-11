@@ -14,6 +14,8 @@ from apps.ops import presenters
 from apps.ops.access import has_admin_access
 from apps.ops.forms import OrderFilterForm
 from apps.ops.mixins import OpsAccessMixin
+from apps.ops.views.payments import can_record_payment
+from apps.ops.views.returns import order_can_create_return
 from apps.orders import payments as order_payments
 from apps.orders.models import Order
 
@@ -106,5 +108,9 @@ class OrderDetailView(OpsAccessMixin, TemplateView):
             "payments": order.payments.select_related("recorded_by").order_by("payment_date", "id"),
             "returns": order.returns.prefetch_related("refunds").order_by("created_at", "id"),
             "admin_url": admin_url,
+            "can_create_return": order_can_create_return(order, self.request.user),
+            "can_record_payment": can_record_payment(order, self.request.user),
+            "can_view_returns": self.request.user.has_perm("orders.view_return"),
+            "can_view_refunds": self.request.user.has_perm("orders.view_refund"),
         })
         return context

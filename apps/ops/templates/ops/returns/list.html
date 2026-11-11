@@ -1,0 +1,44 @@
+{% extends "ops/base.html" %}
+{% block title %}Returns{% endblock %}
+{% block page_title %}Returns{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Returns</h1>
+    <p class="muted">{{ paginator.count }} return{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %}</p>
+  </div>
+</div>
+
+<form method="get" class="filters filters--two" role="search">
+  {% include "ops/_field.html" with field=filter_form.q %}
+  {% include "ops/_field.html" with field=filter_form.status %}
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:return_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+
+{% if object_list %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Requested</th><th scope="col">Order</th><th scope="col">Status</th><th scope="col" class="num">Lines</th></tr></thead>
+    <tbody>
+      {% for return in object_list %}
+      <tr>
+        <td data-label="Requested" class="nowrap"><a class="link-strong" href="{% url 'ops:return_detail' return.public_id %}">{{ return.created_at|date:"d M Y, H:i" }}</a></td>
+        <td data-label="Order" class="nowrap">{{ return.order.order_number }}</td>
+        <td data-label="Status"><span class="badge">{{ return.get_status_display }}</span></td>
+        <td data-label="Lines" class="num">{{ return.line_count }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% include "ops/_pagination.html" %}
+{% else %}
+<section class="empty card">
+  <h2>No returns found</h2>
+  <p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Returns appear here once requested.{% endif %}</p>
+</section>
+{% endif %}
+{% endblock %}

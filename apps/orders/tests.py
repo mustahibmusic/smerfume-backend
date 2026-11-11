@@ -4727,7 +4727,7 @@ class InStoreLineFormsetTests(TestCase):
 
     def test_race_after_the_check_still_fails_safely(self):
         InventoryStock.objects.filter(variant=self.a).update(quantity=Decimal("1"))
-        with patch("apps.orders.admin.in_store_available", return_value={self.a.pk: 99}):
+        with patch("apps.orders.forms.in_store_available", return_value={self.a.pk: 99}):
             resp = self._post([(self.a.sku, 2, False)])
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.context["form"].non_field_errors())

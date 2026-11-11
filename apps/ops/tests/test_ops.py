@@ -9,7 +9,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.core.management import call_command
 from django.db import connection
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 
@@ -210,10 +210,67 @@ class HomeAndNavigationTests(TestCase):
             self.assertTrue(sales["open"], url)
             self.assertEqual([(i["key"], i["active"]) for i in sales["items"]], [("orders", True)])
             self.assertContains(response, 'data-nav-group="sales" open')
-            for hidden in ("Catalog", "Inventory", "Purchases", "Customers"):
+            # No permission for any other area: those groups stay hidden.
+            for hidden in ("Catalog", "Inventory", "Purchases", "Customers", "Returns"):
                 self.assertNotContains(response, f"<span>{hidden}</span>")
         self.assertContains(response, "Smerfume")
         self.assertContains(response, "<small>Panel</small>")
+
+    def test_full_planned_navigation_for_permitted_user(self):
+        superuser = User.objects.create_superuser(
+            username="navroot", email="navroot@example.com", password=PASSWORD,
+        )
+        self.client.force_login(superuser)
+        response = self.client.get(LIST_URL)
+        nav = response.context["ops_nav"]
+        expected = {
+            "sales": ["Orders", "New In-store Sale", "Returns", "Refunds"],
+            "catalog": ["Products", "Editions", "Variants", "Brands", "Perfume Notes"],
+            "inventory": ["Stock", "Partial Bottles", "Stock Movements", "Reservations", "Warehouses"],
+            "purchases": [
+                "Vendors", "Purchase Orders", "Goods Receipts", "Supplier Payments",
+                "Paid Through Accounts", "Receipt Discrepancies", "Booked Quantity History",
+            ],
+            "customers": ["Customers", "Users"],
+        }
+        self.assertEqual(
+            {group["key"]: [item["label"] for item in group["items"]] for group in nav["groups"]},
+            expected,
+        )
+        self.assertEqual([group["key"] for group in nav["groups"]], list(expected))
+        self.assertEqual([group["open"] for group in nav["groups"]], [True, False, False, False, False])
+
+        items = [item for group in nav["groups"] for item in group["items"]]
+        implemented = [item["key"] for item in items if item["implemented"]]
+        self.assertEqual(implemented, ["orders", "in_store_sale", "returns", "refunds"])
+        for item in items:
+            if not item["implemented"]:
+                self.assertIsNone(item["url"], item["key"])
+                self.assertFalse(item["active"], item["key"])
+        html = response.content.decode()
+        self.assertEqual(html.count("Coming soon"), len(items) - 4)
+        self.assertEqual(html.count("data-coming-soon="), len(items) - 4)
+        self.assertIn('data-coming-soon="products"', html)
+        # Coming-soon items are not links.
+        self.assertNotRegex(html, r'<a [^>]*data-coming-soon')
+        # Home cards list implemented pages only.
+        home = self.client.get(HOME_URL)
+        self.assertEqual(
+            [link["key"] for link in home.context["quick_links"]],
+            ["orders", "in_store_sale", "returns", "refunds"],
+        )
+
+    def test_permissions_hide_planned_items(self):
+        user = _staff(
+            "partialnav", OPS_ACCESS_PERMISSION, "orders.view_order", "orders.view_refund",
+            "inventory.view_inventorystock",
+        )
+        self.client.force_login(user)
+        nav = self.client.get(HOME_URL).context["ops_nav"]
+        self.assertEqual(
+            {group["key"]: [item["key"] for item in group["items"]] for group in nav["groups"]},
+            {"sales": ["orders", "refunds"], "inventory": ["stock"]},
+        )
 
 
 class AdminSwitchTests(TestCase):
@@ -270,6 +327,30 @@ class LoginLogoutTests(TestCase):
             "/ops/../admin/", "/ops/%2e%2e/admin/", "/opsx/", LOGIN_URL, LOGOUT_URL, "",
         ):
             self.assertRedirects(self._login_next(unsafe), HOME_URL, msg_prefix=unsafe)
+
+    def test_absolute_and_query_next_follow_same_rule(self):
+        _ops_user()
+        self.assertRedirects(
+            self._login_next("http://testserver/ops/orders/"), "http://testserver/ops/orders/",
+        )
+        for unsafe in ("http://testserver/admin/", "http://testserver/ops/../admin/"):
+            self.assertRedirects(self._login_next(unsafe), HOME_URL, msg_prefix=unsafe)
+        # next only in the query string (the form posts to /ops/login/?next=...).
+        self.client.logout()
+        response = self.client.post(
+            f"{LOGIN_URL}?next=/admin/", {"username": "opsuser@example.com", "password": PASSWORD},
+        )
+        self.assertRedirects(response, HOME_URL)
+
+    @override_settings(LOGIN_REDIRECT_URL="/admin/")
+    def test_login_redirect_url_setting_never_applies(self):
+        _ops_user()
+        User.objects.create_superuser(username="root3", email="root3@example.com", password=PASSWORD)
+        for username in ("opsuser@example.com", "root3@example.com"):
+            self.assertRedirects(self._login_next("", username), HOME_URL, msg_prefix=username)
+            self.client.logout()
+            response = self.client.post(LOGIN_URL, {"username": username, "password": PASSWORD})
+            self.assertRedirects(response, HOME_URL, msg_prefix=username)
 
     def test_superuser_ops_login_lands_on_ops(self):
         User.objects.create_superuser(username="root2", email="root2@example.com", password=PASSWORD)

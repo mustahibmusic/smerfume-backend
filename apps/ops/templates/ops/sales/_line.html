@@ -1,0 +1,17 @@
+<div class="sale-line{% if line.errors %} sale-line--error{% endif %}" data-sale-line>
+  <div class="field field--grow">
+    <label for="{{ line.sku.id_for_label }}">Item</label>
+    <input type="text" name="{{ line.sku.html_name }}" id="{{ line.sku.id_for_label }}" value="{{ line.sku.value|default:'' }}" list="sale-item-options" autocomplete="off" maxlength="64" placeholder="Scan barcode, or type SKU / product name" data-sale-item>
+    <p class="field__help" data-sale-item-info>{{ line.item_label|default:"" }}</p>
+    {% for error in line.sku.errors %}<p class="field__error">{{ error }}</p>{% endfor %}
+  </div>
+  <div class="field field--qty">
+    <label for="{{ line.quantity.id_for_label }}">Qty</label>
+    <input type="number" name="{{ line.quantity.html_name }}" id="{{ line.quantity.id_for_label }}" value="{{ line.quantity.value|default:'' }}" min="1" max="1000" inputmode="numeric">
+    {% for error in line.quantity.errors %}<p class="field__error">{{ error }}</p>{% endfor %}
+  </div>
+  <div class="sale-line__remove">
+    <input type="checkbox" name="{{ line.DELETE.html_name }}" id="{{ line.DELETE.id_for_label }}" hidden{% if line.DELETE.value %} checked{% endif %} data-sale-delete>
+    <button type="button" class="icon-button" aria-label="Remove item" data-sale-remove>&times;</button>
+  </div>
+</div>

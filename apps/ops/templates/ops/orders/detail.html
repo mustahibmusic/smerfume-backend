@@ -14,15 +14,24 @@
       <span class="badge badge--{{ payment_status_tone }}">{{ payment_status_label }}</span>
     </div>
   </div>
-  {% if admin_url %}
-    <a class="button button--ghost" href="{{ admin_url }}">{% include "ops/_icon.html" with name="external" %}<span>Open in Django Admin</span></a>
-  {% endif %}
+  <div class="page-actions">
+    {% if can_record_payment %}
+      <a class="button button--primary" href="{% url 'ops:order_record_payment' order.order_number %}">Record payment</a>
+    {% endif %}
+    {% if can_create_return %}
+      <a class="button button--primary" href="{% url 'ops:order_create_return' order.order_number %}">{% include "ops/_icon.html" with name="returns" %}<span>Create return</span></a>
+    {% endif %}
+    {% if admin_url %}
+      <a class="button button--ghost" href="{{ admin_url }}">{% include "ops/_icon.html" with name="external" %}<span>Open in Django Admin</span></a>
+    {% endif %}
+  </div>
 </div>
 
 <div class="stats">
   <div class="stat"><span class="stat__label">Order total</span><span class="stat__value">₹{{ order.total|floatformat:"2g" }}</span></div>
   <div class="stat"><span class="stat__label">Paid</span><span class="stat__value">₹{{ summary.total_paid|floatformat:"2g" }}</span></div>
   <div class="stat"><span class="stat__label">Balance due</span><span class="stat__value">₹{{ summary.balance_due|floatformat:"2g" }}</span></div>
+  <div class="stat"><span class="stat__label">Payment status</span><span class="stat__value stat__value--text"><span class="badge badge--{{ payment_status_tone }}">{{ payment_status_label }}</span></span></div>
   <div class="stat"><span class="stat__label">Refunded</span><span class="stat__value">₹{{ summary.refunded|floatformat:"2g" }}</span></div>
 </div>
 
@@ -118,10 +127,10 @@
     <tbody>
       {% for return in returns %}
       <tr>
-        <td data-label="Requested">{{ return.created_at|date:"d M Y" }}</td>
+        <td data-label="Requested">{% if can_view_returns %}<a href="{% url 'ops:return_detail' return.public_id %}">{{ return.created_at|date:"d M Y" }}</a>{% else %}{{ return.created_at|date:"d M Y" }}{% endif %}</td>
         <td data-label="Return status">{{ return.get_status_display }}</td>
         <td data-label="Refunds">
-          {% for refund in return.refunds.all %}₹{{ refund.refund_amount|floatformat:"2g" }} ({{ refund.get_refund_status_display }}){% if not forloop.last %}<br>{% endif %}{% empty %}<span class="muted">None</span>{% endfor %}
+          {% for refund in return.refunds.all %}{% if can_view_refunds %}<a href="{% url 'ops:refund_detail' refund.public_id %}">₹{{ refund.refund_amount|floatformat:"2g" }}</a>{% else %}₹{{ refund.refund_amount|floatformat:"2g" }}{% endif %} ({{ refund.get_refund_status_display }}){% if not forloop.last %}<br>{% endif %}{% empty %}<span class="muted">None</span>{% endfor %}
         </td>
       </tr>
       {% endfor %}

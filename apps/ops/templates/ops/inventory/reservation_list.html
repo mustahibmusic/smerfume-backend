@@ -1,0 +1,45 @@
+{% extends "ops/base.html" %}
+{% block title %}Reservations{% endblock %}
+{% block page_title %}Reservations{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Reservations</h1>
+    <p class="muted">{{ paginator.count }} reservation{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %}</p>
+  </div>
+</div>
+
+<form method="get" class="filters filters--four" role="search">
+  {% include "ops/_field.html" with field=filter_form.q %}
+  {% include "ops/_field.html" with field=filter_form.status %}
+  {% include "ops/_field.html" with field=filter_form.purpose %}
+  {% include "ops/_field.html" with field=filter_form.warehouse %}
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:reservation_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+
+{% if object_list %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Created</th><th scope="col">Order</th><th scope="col">Item</th><th scope="col">Purpose</th><th scope="col">Status</th><th scope="col" class="num">Quantity</th></tr></thead>
+    <tbody>
+      {% for reservation in object_list %}
+      <tr>
+        <td data-label="Created" class="nowrap"><a class="link-strong" href="{% url 'ops:reservation_detail' reservation.public_id %}">{{ reservation.created_at|date:"d M Y, H:i" }}</a></td>
+        <td data-label="Order" class="nowrap">{{ reservation.order_item.order.order_number }}</td>
+        <td data-label="Item">{{ reservation.variant }}<br><code>{{ reservation.variant.sku }}</code></td>
+        <td data-label="Purpose">{{ reservation.get_purpose_display }}</td>
+        <td data-label="Status"><span class="badge">{{ reservation.get_status_display }}</span></td>
+        <td data-label="Quantity" class="num">{{ reservation.quantity|floatformat:"-2" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% include "ops/_pagination.html" %}
+{% else %}
+<section class="empty card"><h2>No reservations found</h2><p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Reservations appear when orders hold stock.{% endif %}</p></section>
+{% endif %}
+{% endblock %}

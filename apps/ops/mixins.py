@@ -55,3 +55,31 @@ class OpsAccessMixin:
         context = super().get_context_data(**kwargs)
         context.update(ops_context(self.request, self.nav_active))
         return context
+
+
+class FilteredListMixin:
+    """GET-filtered, paginated list: ``filter_form_class`` validates the
+    query string; ``filter_queryset(queryset, data)`` applies only cleaned
+    values (invalid ones are reported by the form and ignored)."""
+
+    filter_form_class = None
+    paginate_by = 25
+
+    def get_queryset(self):
+        self.filter_form = self.filter_form_class(self.request.GET or None)
+        queryset = self.base_queryset()
+        if self.filter_form.is_bound:
+            self.filter_form.is_valid()
+            queryset = self.filter_queryset(queryset, self.filter_form.cleaned_data)
+        return queryset
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        params = self.request.GET.copy()
+        params.pop("page", None)
+        context.update({
+            "filter_form": self.filter_form,
+            "query_string": params.urlencode(),
+            "is_filtered": any(value for value in params.values()),
+        })
+        return context

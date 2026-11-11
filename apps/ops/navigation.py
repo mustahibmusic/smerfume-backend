@@ -61,11 +61,26 @@ NAV_GROUPS = (
         NavItem("perfume_notes", "Perfume Notes", "catalog.view_perfumenote"),
     )),
     NavGroup("inventory", "Inventory", (
-        NavItem("stock", "Stock", "inventory.view_inventorystock"),
-        NavItem("partial_bottles", "Partial Bottles", "inventory.view_partialbottlelot"),
-        NavItem("stock_movements", "Stock Movements", "inventory.view_stockmovement"),
-        NavItem("reservations", "Reservations", "inventory.view_stockreservation"),
-        NavItem("warehouses", "Warehouses", "inventory.view_warehouse"),
+        NavItem(
+            "stock", "Stock", "inventory.view_inventorystock", "ops:stock_list", icon="stock",
+            description="Stock by item, type and warehouse; adjust and transfer.",
+        ),
+        NavItem(
+            "partial_bottles", "Partial Bottles", "inventory.view_partialbottlelot", "ops:partial_lot_list",
+            icon="bottle", description="Open bottles used for decants.",
+        ),
+        NavItem(
+            "stock_movements", "Stock Movements", "inventory.view_stockmovement", "ops:movement_list",
+            icon="movements", description="Every stock change, newest first.",
+        ),
+        NavItem(
+            "reservations", "Reservations", "inventory.view_stockreservation", "ops:reservation_list",
+            icon="reservations", description="Stock held for orders.",
+        ),
+        NavItem(
+            "warehouses", "Warehouses", "inventory.view_warehouse", "ops:warehouse_list", icon="warehouse",
+            description="Stock locations (read-only).",
+        ),
     )),
     NavGroup("purchases", "Purchases", (
         NavItem("vendors", "Vendors", "inventory.view_supplier"),

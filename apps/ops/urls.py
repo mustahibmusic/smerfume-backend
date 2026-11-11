@@ -1,6 +1,6 @@
 from django.urls import path, re_path
 
-from apps.ops.views import payments, refunds, returns, sales
+from apps.ops.views import inventory, payments, refunds, returns, sales
 from apps.ops.views.auth import OpsLoginView, OpsLogoutView
 from apps.ops.views.home import OpsHomeView, OpsNotFoundView
 from apps.ops.views.orders import OrderDetailView, OrderListView
@@ -51,6 +51,38 @@ urlpatterns = [
         "refunds/<uuid:public_id>/adjustments/", refunds.RefundAdjustmentView.as_view(),
         name="refund_adjustment",
     ),
+    # Inventory
+    path("inventory/stock/", inventory.StockListView.as_view(), name="stock_list"),
+    path("inventory/stock/<uuid:public_id>/", inventory.StockDetailView.as_view(), name="stock_detail"),
+    path("inventory/stock/<uuid:public_id>/adjust/", inventory.StockAdjustView.as_view(), name="stock_adjust"),
+    path(
+        "inventory/stock/<uuid:public_id>/reorder-level/", inventory.StockReorderLevelView.as_view(),
+        name="stock_reorder_level",
+    ),
+    path(
+        "inventory/stock/<uuid:public_id>/transfer/", inventory.StockTransferView.as_view(),
+        name="stock_transfer",
+    ),
+    path("inventory/partial-bottles/", inventory.PartialLotListView.as_view(), name="partial_lot_list"),
+    path(
+        "inventory/partial-bottles/<uuid:public_id>/", inventory.PartialLotDetailView.as_view(),
+        name="partial_lot_detail",
+    ),
+    path(
+        "inventory/partial-bottles/<uuid:public_id>/adjust/", inventory.PartialLotAdjustView.as_view(),
+        name="partial_lot_adjust",
+    ),
+    path("inventory/movements/", inventory.MovementListView.as_view(), name="movement_list"),
+    path("inventory/reservations/", inventory.ReservationListView.as_view(), name="reservation_list"),
+    path(
+        "inventory/reservations/<uuid:public_id>/", inventory.ReservationDetailView.as_view(),
+        name="reservation_detail",
+    ),
+    path(
+        "inventory/allocations/<uuid:public_id>/reallocate/", inventory.AllocationReallocateView.as_view(),
+        name="allocation_reallocate",
+    ),
+    path("inventory/warehouses/", inventory.WarehouseListView.as_view(), name="warehouse_list"),
     # Must stay last: branded 404 for any other /ops/ path.
     re_path(r"^.*$", OpsNotFoundView.as_view(), name="not_found"),
 ]

@@ -1,0 +1,32 @@
+{% extends "ops/base.html" %}
+{% block title %}Partial bottle · {{ lot.variant.sku }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:partial_lot_list' %}">{% include "ops/_icon.html" with name="back" %}Partial bottles</a>{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ lot.variant }}</h1>
+    <p class="muted"><code>{{ lot.variant.sku }}</code> · {{ lot.warehouse }} · opened {{ lot.opened_at|date:"d M Y, H:i" }}</p>
+    <div class="badges">{% if lot.is_depleted %}<span class="badge">Depleted</span>{% else %}<span class="badge badge--ok">Open</span>{% endif %}{% if lot.source_return_item %}<span class="badge badge--info">From a customer return</span>{% endif %}</div>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat"><span class="stat__label">Remaining</span><span class="stat__value">{{ lot.remaining_ml|floatformat:"-2" }} ml</span></div>
+  <div class="stat"><span class="stat__label">Reserved</span><span class="stat__value">{{ lot.reserved_ml|floatformat:"-2" }} ml</span></div>
+  <div class="stat"><span class="stat__label">Available</span><span class="stat__value">{{ lot.available_ml|floatformat:"-2" }} ml</span></div>
+</div>
+
+{% if adjust_form %}
+<section class="card">
+  <h2>Adjust remaining ml</h2>
+  <p class="muted">Records a stock movement. Cannot go below the reserved ml; reaching zero marks the lot depleted.</p>
+  <form method="post" action="{% url 'ops:partial_lot_adjust' lot.public_id %}" class="stack" data-confirm="Record this adjustment?">
+    {% csrf_token %}
+    <div class="form-grid">{% for field in adjust_form %}{% include "ops/_field.html" with field=field %}{% endfor %}</div>
+    <div class="form-actions"><button type="submit" class="button button--primary" data-once>Adjust</button></div>
+  </form>
+</section>
+{% endif %}
+
+{% include "ops/inventory/_movements.html" %}
+{% endblock %}

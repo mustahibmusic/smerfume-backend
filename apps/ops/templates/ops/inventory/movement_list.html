@@ -1,0 +1,48 @@
+{% extends "ops/base.html" %}
+{% load ops_tags %}
+{% block title %}Stock movements{% endblock %}
+{% block page_title %}Stock movements{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Stock movements</h1>
+    <p class="muted">{{ paginator.count }} movement{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %} · read-only ledger</p>
+  </div>
+</div>
+
+<form method="get" class="filters filters--four" role="search">
+  {% include "ops/_field.html" with field=filter_form.q %}
+  {% include "ops/_field.html" with field=filter_form.movement_type %}
+  {% include "ops/_field.html" with field=filter_form.reason %}
+  {% include "ops/_field.html" with field=filter_form.warehouse %}
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:movement_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+
+{% if object_list %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">When</th><th scope="col">Item</th><th scope="col">Type</th><th scope="col">Movement</th><th scope="col">Reason</th><th scope="col">Warehouse</th><th scope="col">By</th><th scope="col" class="num">Change</th></tr></thead>
+    <tbody>
+      {% for movement in object_list %}
+      <tr>
+        <td data-label="When" class="nowrap">{{ movement.created_at|date:"d M Y, H:i" }}</td>
+        <td data-label="Item">{{ movement.variant }}<br><code>{{ movement.variant.sku }}</code></td>
+        <td data-label="Type">{{ movement.get_stock_type_display }}</td>
+        <td data-label="Movement">{{ movement.get_movement_type_display }}</td>
+        <td data-label="Reason">{{ movement.get_reason_display }}{% if movement.notes %}<br><small class="muted">{{ movement.notes|truncatechars:80 }}</small>{% endif %}</td>
+        <td data-label="Warehouse">{{ movement.warehouse }}</td>
+        <td data-label="By">{{ movement.performed_by|person }}</td>
+        <td data-label="Change" class="num">{% if movement.quantity_delta > 0 %}+{% endif %}{{ movement.quantity_delta|floatformat:"-2" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% include "ops/_pagination.html" %}
+{% else %}
+<section class="empty card"><h2>No movements found</h2><p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Every stock change appears here.{% endif %}</p></section>
+{% endif %}
+{% endblock %}

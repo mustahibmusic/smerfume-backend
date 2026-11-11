@@ -1,0 +1,31 @@
+{% extends "ops/base.html" %}
+{% block title %}Warehouses{% endblock %}
+{% block page_title %}Warehouses{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Warehouses</h1>
+    <p class="muted">Stock locations. Read-only here; warehouse settings are managed in Django Admin.</p>
+  </div>
+</div>
+{% if object_list %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Name</th><th scope="col">Location</th><th scope="col">Status</th><th scope="col" class="num">Stock rows</th><th scope="col" class="num">Open bottles</th></tr></thead>
+    <tbody>
+      {% for warehouse in object_list %}
+      <tr>
+        <td data-label="Name"><strong>{{ warehouse.name }}</strong>{% if warehouse.is_default %} <span class="badge badge--info">Default</span>{% endif %}</td>
+        <td data-label="Location">{{ warehouse.city|default:"—" }}{% if warehouse.state %}, {{ warehouse.state }}{% endif %}{% if warehouse.pincode %} {{ warehouse.pincode }}{% endif %}</td>
+        <td data-label="Status">{% if warehouse.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}</td>
+        <td data-label="Stock rows" class="num">{{ warehouse.stock_rows }}</td>
+        <td data-label="Open bottles" class="num">{{ warehouse.open_lots }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<section class="empty card"><h2>No warehouses</h2></section>
+{% endif %}
+{% endblock %}

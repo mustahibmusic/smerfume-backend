@@ -1,0 +1,45 @@
+{% extends "ops/base.html" %}
+{% block title %}Partial bottles{% endblock %}
+{% block page_title %}Partial bottles{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Partial bottles</h1>
+    <p class="muted">{{ paginator.count }} lot{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %}</p>
+  </div>
+</div>
+
+<form method="get" class="filters filters--three" role="search">
+  {% include "ops/_field.html" with field=filter_form.q %}
+  {% include "ops/_field.html" with field=filter_form.warehouse %}
+  {% include "ops/_field.html" with field=filter_form.state %}
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:partial_lot_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+
+{% if object_list %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead><tr><th scope="col">Item</th><th scope="col">Warehouse</th><th scope="col">Opened</th><th scope="col">State</th><th scope="col" class="num">Remaining ml</th><th scope="col" class="num">Reserved ml</th><th scope="col" class="num">Available ml</th></tr></thead>
+    <tbody>
+      {% for lot in object_list %}
+      <tr>
+        <td data-label="Item"><a class="link-strong" href="{% url 'ops:partial_lot_detail' lot.public_id %}">{{ lot.variant }}</a><br><code>{{ lot.variant.sku }}</code></td>
+        <td data-label="Warehouse">{{ lot.warehouse }}</td>
+        <td data-label="Opened" class="nowrap">{{ lot.opened_at|date:"d M Y" }}</td>
+        <td data-label="State">{% if lot.is_depleted %}<span class="badge">Depleted</span>{% else %}<span class="badge badge--ok">Open</span>{% endif %}</td>
+        <td data-label="Remaining ml" class="num">{{ lot.remaining_ml|floatformat:"-2" }}</td>
+        <td data-label="Reserved ml" class="num">{{ lot.reserved_ml|floatformat:"-2" }}</td>
+        <td data-label="Available ml" class="num">{{ lot.available_ml|floatformat:"-2" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% include "ops/_pagination.html" %}
+{% else %}
+<section class="empty card"><h2>No partial bottles</h2><p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Lots appear when a bottle is opened for decants.{% endif %}</p></section>
+{% endif %}
+{% endblock %}

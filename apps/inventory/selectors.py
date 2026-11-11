@@ -2,7 +2,7 @@
 
 from decimal import ROUND_FLOOR, Decimal
 
-from django.db.models import Sum
+from django.db.models import F, Sum
 
 from . import models as inv_models
 from .services.reservation import decant_capacity_ml
@@ -58,3 +58,23 @@ def in_store_available(variant_ids, warehouse):
             units = capacity / source.decant_volume_ml
         result[variant_id] = int(units.to_integral_value(rounding=ROUND_FLOOR))
     return result
+
+
+ACTIVE_RESERVATION_STATUSES = (
+    inv_models.StockReservation.STATUS_HELD,
+    inv_models.StockReservation.STATUS_CONFIRMED,
+)
+
+
+def low_stock(queryset):
+    """InventoryStock rows with a reorder level whose free stock
+    (quantity - reserved) is at or below it."""
+    return queryset.filter(
+        reorder_level__isnull=False,
+        quantity__lte=F("quantity_reserved") + F("reorder_level"),
+    )
+
+
+def active_reservations(queryset):
+    """Reservations still holding stock (held or confirmed)."""
+    return queryset.filter(status__in=ACTIVE_RESERVATION_STATUSES)

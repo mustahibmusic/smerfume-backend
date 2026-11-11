@@ -2,7 +2,7 @@ from django import forms
 from django.utils import timezone
 
 from apps.catalog.models import ProductVariant
-from apps.inventory.models import Warehouse
+from apps.inventory.models import InventoryStock, StockMovement, StockReservation, Warehouse
 from apps.orders import payments as order_payments
 from apps.orders.forms import (
     BaseInStoreLineFormSet,
@@ -108,3 +108,51 @@ class OpsRecordPaymentForm(RecordPaymentForm):
         self.fields["method"].widget = forms.Select(choices=self.fields["method"].choices)
         self.fields["reference"].widget = forms.TextInput(attrs={"maxlength": 100, "autocomplete": "off"})
         self.fields["notes"].widget = forms.Textarea(attrs={"rows": 3})
+
+
+# ── Inventory filters ───────────────────────────────────────────────────────
+# Warehouses are chosen by public id, never by database id.
+
+
+def _warehouse_filter():
+    return forms.ModelChoiceField(
+        queryset=Warehouse.objects.order_by("name"), to_field_name="public_id",
+        required=False, empty_label="All",
+    )
+
+
+class StockFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="Search")
+    stock_type = forms.ChoiceField(
+        required=False, choices=_with_all(InventoryStock.STOCK_TYPE_CHOICES), label="Stock type",
+    )
+    warehouse = _warehouse_filter()
+    low_stock = forms.BooleanField(required=False, label="At or below reorder level")
+
+
+class PartialLotFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="SKU")
+    warehouse = _warehouse_filter()
+    state = forms.ChoiceField(
+        required=False, label="State",
+        choices=[("", "All"), ("open", "Open"), ("depleted", "Depleted")],
+    )
+
+
+class MovementFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="SKU or notes")
+    movement_type = forms.ChoiceField(
+        required=False, choices=_with_all(StockMovement.MOVEMENT_TYPE_CHOICES), label="Movement",
+    )
+    reason = forms.ChoiceField(required=False, choices=_with_all(StockMovement.REASON_CHOICES))
+    warehouse = _warehouse_filter()
+
+
+class ReservationFilterForm(forms.Form):
+    q = forms.CharField(required=False, max_length=100, strip=True, label="Order number or SKU")
+    status = forms.ChoiceField(
+        required=False, label="Status",
+        choices=[("", "All"), ("active", "Active (held or confirmed)")] + list(StockReservation.STATUS_CHOICES),
+    )
+    purpose = forms.ChoiceField(required=False, choices=_with_all(StockReservation.PURPOSE_CHOICES))
+    warehouse = _warehouse_filter()

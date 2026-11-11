@@ -146,3 +146,16 @@ def transfer_stock_type(stock, to_type, quantity, reason, notes="", performed_by
             reason=reason, notes=notes, performed_by=performed_by,
         )
     return transaction_group
+
+
+@transaction.atomic
+def set_reorder_level(stock, reorder_level):
+    """Set or clear an InventoryStock row's reorder level. Configuration
+    only: no quantity change and no StockMovement (the same write the
+    Django Admin stock page makes), done under the row lock."""
+    if reorder_level is not None and reorder_level < 0:
+        raise InventoryAdjustmentError("Reorder level cannot be negative.")
+    stock = InventoryStock.objects.select_for_update().get(pk=stock.pk)
+    stock.reorder_level = reorder_level
+    stock.save(update_fields=["reorder_level", "updated_at"])
+    return stock

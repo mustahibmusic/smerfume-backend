@@ -1,0 +1,63 @@
+{% extends "ops/base.html" %}
+{% block title %}{{ stock.variant.sku }} · {{ stock.get_stock_type_display }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:stock_list' %}">{% include "ops/_icon.html" with name="back" %}Stock</a>{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ stock.variant }}</h1>
+    <p class="muted"><code>{{ stock.variant.sku }}</code> · {{ stock.warehouse }}</p>
+    <div class="badges">
+      <span class="badge badge--info">{{ stock.get_stock_type_display }}</span>
+      {% if is_low %}<span class="badge badge--warn">At or below reorder level</span>{% endif %}
+    </div>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat"><span class="stat__label">On hand</span><span class="stat__value">{{ stock.quantity|floatformat:"-2" }}</span></div>
+  <div class="stat"><span class="stat__label">Reserved</span><span class="stat__value">{{ stock.quantity_reserved|floatformat:"-2" }}</span></div>
+  <div class="stat"><span class="stat__label">Available</span><span class="stat__value">{{ stock.available|floatformat:"-2" }}</span></div>
+  <div class="stat"><span class="stat__label">Reorder level</span><span class="stat__value">{{ stock.reorder_level|floatformat:"-2"|default:"—" }}</span></div>
+</div>
+
+{% if adjust_form or transfer_form or reorder_form %}
+<div class="grid">
+  {% if adjust_form %}
+  <section class="card">
+    <h2>Adjust quantity</h2>
+    <p class="muted">Records a stock movement. Purchases are received through goods receipts, not here.</p>
+    <form method="post" action="{% url 'ops:stock_adjust' stock.public_id %}" class="stack" data-confirm="Record this stock adjustment?">
+      {% csrf_token %}
+      {% for field in adjust_form %}{% include "ops/_field.html" with field=field %}{% endfor %}
+      <div class="form-actions"><button type="submit" class="button button--primary" data-once>Adjust</button></div>
+    </form>
+  </section>
+  {% endif %}
+  {% if transfer_form %}
+  <section class="card">
+    <h2>Transfer stock type</h2>
+    <p class="muted">Moves free units ({{ stock.available|floatformat:"-2" }} now). Reserved units never move; damaged stock cannot move back.</p>
+    <form method="post" action="{% url 'ops:stock_transfer' stock.public_id %}" class="stack" data-confirm="Move these units to another stock type?">
+      {% csrf_token %}
+      {% for field in transfer_form %}{% include "ops/_field.html" with field=field %}{% endfor %}
+      <div class="form-actions"><button type="submit" class="button" data-once>Transfer</button></div>
+    </form>
+  </section>
+  {% endif %}
+  {% if reorder_form %}
+  <section class="card">
+    <h2>Reorder level</h2>
+    <p class="muted">Configuration only; no stock movement.</p>
+    <form method="post" action="{% url 'ops:stock_reorder_level' stock.public_id %}" class="stack">
+      {% csrf_token %}
+      {% include "ops/_field.html" with field=reorder_form.reorder_level %}
+      <div class="form-actions"><button type="submit" class="button" data-once>Save</button></div>
+    </form>
+  </section>
+  {% endif %}
+</div>
+{% endif %}
+
+{% include "ops/inventory/_movements.html" %}
+{% if can_view_movements %}<p><a href="{% url 'ops:movement_list' %}?q={{ stock.variant.sku|urlencode }}">All movements for {{ stock.variant.sku }}</a></p>{% endif %}
+{% endblock %}

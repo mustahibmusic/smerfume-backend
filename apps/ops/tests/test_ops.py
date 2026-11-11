@@ -242,23 +242,23 @@ class HomeAndNavigationTests(TestCase):
 
         items = [item for group in nav["groups"] for item in group["items"]]
         implemented = [item["key"] for item in items if item["implemented"]]
-        self.assertEqual(implemented, ["orders", "in_store_sale", "returns", "refunds"])
+        self.assertEqual(implemented, [
+            "orders", "in_store_sale", "returns", "refunds",
+            "stock", "partial_bottles", "stock_movements", "reservations", "warehouses",
+        ])
         for item in items:
             if not item["implemented"]:
                 self.assertIsNone(item["url"], item["key"])
                 self.assertFalse(item["active"], item["key"])
         html = response.content.decode()
-        self.assertEqual(html.count("Coming soon"), len(items) - 4)
-        self.assertEqual(html.count("data-coming-soon="), len(items) - 4)
+        self.assertEqual(html.count("Coming soon"), len(items) - 9)
+        self.assertEqual(html.count("data-coming-soon="), len(items) - 9)
         self.assertIn('data-coming-soon="products"', html)
         # Coming-soon items are not links.
         self.assertNotRegex(html, r'<a [^>]*data-coming-soon')
         # Home cards list implemented pages only.
         home = self.client.get(HOME_URL)
-        self.assertEqual(
-            [link["key"] for link in home.context["quick_links"]],
-            ["orders", "in_store_sale", "returns", "refunds"],
-        )
+        self.assertEqual([link["key"] for link in home.context["quick_links"]], implemented)
 
     def test_permissions_hide_planned_items(self):
         user = _staff(

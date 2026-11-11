@@ -4,8 +4,10 @@
 {% block content %}
 <div class="page-head"><div>
   <h1>Goods receipts</h1>
-  <p class="muted">{{ paginator.count }} receipt{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %}</p>
-</div></div>
+  <p class="muted">{{ paginator.count }} receipt{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %} · receive goods from a purchase order</p>
+</div>
+{% if can_create_opening %}<a class="button" href="{% url 'ops:opening_new' %}">New opening stock receipt</a>{% endif %}
+</div>
 <form method="get" class="filters filters--three" role="search">
   {% include "ops/_field.html" with field=filter_form.q %}
   {% include "ops/_field.html" with field=filter_form.status %}

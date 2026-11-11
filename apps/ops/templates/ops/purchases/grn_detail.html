@@ -14,6 +14,7 @@
     <div class="badges"><span class="badge badge--info">{{ receipt.get_status_display }}</span></div>
   </div>
   <div class="page-actions">
+    {% if can_edit %}<a class="button" href="{% url 'ops:grn_edit' receipt.grn_number %}">{% if receipt.receipt_type == "opening" %}Edit lines{% else %}Enter received goods{% endif %}</a>{% endif %}
     {% if can_post %}
     <form method="post" action="{% url 'ops:grn_post' receipt.grn_number %}" data-confirm="Post {{ receipt.grn_number }}? Stock increases now and the receipt can no longer be changed.">
       {% csrf_token %}<button type="submit" class="button button--primary" data-once>Post receipt</button>
@@ -22,8 +23,6 @@
     {% if can_reverse %}<a class="button button--ghost" href="{% url 'ops:grn_reverse' receipt.grn_number %}">Reverse receipt</a>{% endif %}
   </div>
 </div>
-
-{% if receipt.status == "draft" %}<p class="alert alert--info">Lines of a draft receipt are entered in Django Admin for now. Posting and cancelling work here.</p>{% endif %}
 
 <section class="card card--flush">
   <h2 class="card__title">Lines</h2>

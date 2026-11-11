@@ -98,4 +98,46 @@ def po_actions(user, po):
         "record_vendor_refund": can_record_vendor_refund(user, po),
         "reverse_payment_entry": can_reverse_payment_entry(user, po),
         "set_tax_treatment": can_set_tax_treatment(user, po),
+        "edit": can_edit_po(user, po),
     }
+
+
+# Draft editing and master data (Smerfume Panel; Django Admin uses its own
+# model permissions for the same rows).
+
+
+def can_create_po(user):
+    return user.has_perm("purchases.add_purchaseorder")
+
+
+def can_edit_po(user, po):
+    return user.has_perm("purchases.change_purchaseorder") and po.status == PurchaseOrder.STATUS_DRAFT
+
+
+def can_edit_receipt(user, receipt):
+    return (
+        user.has_perm("purchases.change_goodsreceipt")
+        and user.has_perm("purchases.change_goodsreceiptline")
+        and receipt.status == GoodsReceipt.STATUS_DRAFT
+        and receipt.receipt_type in (GoodsReceipt.TYPE_STANDARD, GoodsReceipt.TYPE_OPENING)
+    )
+
+
+def can_create_opening(user):
+    return user.has_perm("purchases.add_goodsreceipt")
+
+
+def can_add_vendor(user):
+    return user.has_perm("inventory.add_supplier")
+
+
+def can_change_vendor(user):
+    return user.has_perm("inventory.change_supplier")
+
+
+def can_add_account(user):
+    return user.has_perm("purchases.add_paymentaccount")
+
+
+def can_change_account(user):
+    return user.has_perm("purchases.change_paymentaccount")

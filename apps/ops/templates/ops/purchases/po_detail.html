@@ -14,6 +14,8 @@
     </div>
   </div>
   <div class="page-actions">
+    {% if actions.edit %}<a class="button" href="{% url 'ops:po_edit' po.po_number %}">Edit draft</a>{% endif %}
+    {% if actions.receive %}<a class="button button--primary" href="{% url 'ops:po_receive' po.po_number %}">Receive goods</a>{% endif %}
     {% if actions.issue %}<a class="button button--primary" href="{% url 'ops:po_issue' po.po_number %}">Issue</a>{% endif %}
     {% if actions.confirm_booked %}<a class="button" href="{% url 'ops:po_confirm_booked' po.po_number %}">Confirm booked quantity</a>{% endif %}
     {% if actions.record_payment %}<a class="button button--primary" href="{% url 'ops:po_payment_new' po.po_number %}">Record payment</a>{% endif %}
@@ -24,10 +26,6 @@
     {% if actions.cancel %}<a class="button button--ghost" href="{% url 'ops:po_cancel' po.po_number %}">Cancel</a>{% endif %}
   </div>
 </div>
-
-{% if actions.receive or po.status == "draft" %}
-<p class="alert alert--info">{% if po.status == "draft" %}Draft purchase orders are edited in Django Admin for now.{% else %}Receiving goods (entering received lines) is done in Django Admin for now; posting, cancelling and reversing receipts work here.{% endif %}</p>
-{% endif %}
 
 <section class="card card--flush">
   <h2 class="card__title">Lines</h2>

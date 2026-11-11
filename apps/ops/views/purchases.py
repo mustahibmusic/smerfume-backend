@@ -109,6 +109,11 @@ class VendorListView(OpsAccessMixin, FilteredListMixin, ListView):
     def base_queryset(self):
         return Supplier.objects.annotate(po_count=Count("purchase_orders")).order_by("name")
 
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["can_add_vendor"] = rules.can_add_vendor(self.request.user)
+        return context
+
     def filter_queryset(self, queryset, data):
         if data.get("q"):
             q = data["q"]
@@ -133,6 +138,7 @@ class VendorDetailView(OpsAccessMixin, TemplateView):
         vendor = get_object_or_404(Supplier, vendor_code=kwargs["vendor_code"])
         can_view_pos = self.request.user.has_perm(VIEW_PO)
         context.update({
+            "can_change_vendor": rules.can_change_vendor(self.request.user),
             "vendor": vendor,
             "can_view_pos": can_view_pos,
             "orders": vendor.purchase_orders.select_related("warehouse").order_by("-order_date", "-id")[:20]
@@ -181,6 +187,7 @@ class PurchaseOrderListView(OpsAccessMixin, FilteredListMixin, ListView):
         context = super().get_context_data(**kwargs)
         context["can_view_payments"] = self.request.user.has_perm(VIEW_PAYMENTS)
         context["payment_status_labels"] = PAYMENT_STATUS_LABELS
+        context["can_create_po"] = rules.can_create_po(self.request.user)
         return context
 
 
@@ -650,11 +657,17 @@ class PaymentLedgerView(OpsAccessMixin, FilteredListMixin, ListView):
 
 
 class PaymentAccountListView(OpsAccessMixin, ListView):
-    """GET /ops/purchases/paid-through/ (read-only; managed in Django Admin)."""
+    """GET /ops/purchases/paid-through/ (create/edit through the account services)."""
 
     permission_required = ("purchases.view_paymentaccount",)
     nav_active = "paid_through"
     template_name = "ops/purchases/account_list.html"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["can_add_account"] = rules.can_add_account(self.request.user)
+        context["can_change_account"] = rules.can_change_account(self.request.user)
+        return context
 
     def get_queryset(self):
         return PaymentAccount.objects.annotate(
@@ -675,6 +688,11 @@ class GoodsReceiptListView(OpsAccessMixin, FilteredListMixin, ListView):
         return GoodsReceipt.objects.select_related("supplier", "warehouse", "purchase_order").annotate(
             line_count=Count("lines"), total_units=Sum("lines__quantity"),
         ).order_by("-received_date", "-id")
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["can_create_opening"] = rules.can_create_opening(self.request.user)
+        return context
 
     def filter_queryset(self, queryset, data):
         if data.get("q"):
@@ -713,6 +731,7 @@ class GoodsReceiptDetailView(OpsAccessMixin, TemplateView):
             "can_post": rules.can_post_receipt(user, receipt),
             "can_cancel": rules.can_cancel_receipt(user, receipt),
             "can_reverse": rules.can_reverse_receipt(user, receipt),
+            "can_edit": rules.can_edit_receipt(user, receipt),
             "cancel_form": CancelPurchaseOrderForm() if rules.can_cancel_receipt(user, receipt) else None,
         })
         return context

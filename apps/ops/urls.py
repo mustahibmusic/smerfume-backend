@@ -1,6 +1,6 @@
 from django.urls import path, re_path
 
-from apps.ops.views import inventory, payments, purchases, refunds, returns, sales
+from apps.ops.views import inventory, payments, purchase_drafts, purchases, refunds, returns, sales
 from apps.ops.views.auth import OpsLoginView, OpsLogoutView
 from apps.ops.views.home import OpsHomeView, OpsNotFoundView
 from apps.ops.views.orders import OrderDetailView, OrderListView
@@ -85,8 +85,23 @@ urlpatterns = [
     path("inventory/warehouses/", inventory.WarehouseListView.as_view(), name="warehouse_list"),
     # Purchases
     path("purchases/vendors/", purchases.VendorListView.as_view(), name="vendor_list"),
+    path("purchases/vendors/new/", purchase_drafts.VendorFormView.as_view(), name="vendor_new"),
+    path(
+        "purchases/vendors/<str:vendor_code>/edit/", purchase_drafts.VendorFormView.as_view(),
+        name="vendor_edit",
+    ),
     path("purchases/vendors/<str:vendor_code>/", purchases.VendorDetailView.as_view(), name="vendor_detail"),
     path("purchases/orders/", purchases.PurchaseOrderListView.as_view(), name="po_list"),
+    path("purchases/orders/new/", purchase_drafts.PurchaseOrderFormView.as_view(), name="po_new"),
+    path("purchases/items/", purchase_drafts.PurchaseItemSearchView.as_view(), name="purchase_items"),
+    path(
+        "purchases/orders/<str:po_number>/edit/", purchase_drafts.PurchaseOrderFormView.as_view(),
+        name="po_edit",
+    ),
+    path(
+        "purchases/orders/<str:po_number>/receive/", purchase_drafts.ReceiveGoodsView.as_view(),
+        name="po_receive",
+    ),
     path("purchases/orders/<str:po_number>/", purchases.PurchaseOrderDetailView.as_view(), name="po_detail"),
     path("purchases/orders/<str:po_number>/issue/", purchases.PurchaseOrderIssueView.as_view(), name="po_issue"),
     path("purchases/orders/<str:po_number>/close/", purchases.PurchaseOrderCloseView.as_view(), name="po_close"),
@@ -118,7 +133,17 @@ urlpatterns = [
         name="payment_attachment",
     ),
     path("purchases/paid-through/", purchases.PaymentAccountListView.as_view(), name="account_list"),
+    path("purchases/paid-through/new/", purchase_drafts.PaymentAccountFormView.as_view(), name="account_new"),
+    path(
+        "purchases/paid-through/<uuid:public_id>/edit/", purchase_drafts.PaymentAccountFormView.as_view(),
+        name="account_edit",
+    ),
     path("purchases/receipts/", purchases.GoodsReceiptListView.as_view(), name="grn_list"),
+    path("purchases/opening/new/", purchase_drafts.OpeningReceiptStartView.as_view(), name="opening_new"),
+    path(
+        "purchases/receipts/<str:grn_number>/edit/", purchase_drafts.GoodsReceiptEditView.as_view(),
+        name="grn_edit",
+    ),
     path("purchases/receipts/<str:grn_number>/", purchases.GoodsReceiptDetailView.as_view(), name="grn_detail"),
     path("purchases/receipts/<str:grn_number>/post/", purchases.GoodsReceiptPostView.as_view(), name="grn_post"),
     path(

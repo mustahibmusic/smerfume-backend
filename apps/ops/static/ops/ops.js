@@ -131,9 +131,69 @@
     form.querySelector("[data-sale-add]").addEventListener("click", addLine);
   }
 
+  // Generic formset tables: "+ Add row" copies the empty form.
+  function initFormsets() {
+    document.querySelectorAll("[data-formset]").forEach(function (box) {
+      var prefix = box.getAttribute("data-prefix");
+      var total = box.querySelector("input[name='" + prefix + "-TOTAL_FORMS']");
+      var body = box.querySelector("[data-formset-body]");
+      var template = box.querySelector("template[data-formset-empty]");
+      var add = box.querySelector("[data-formset-add]");
+      if (!total || !body || !template || !add) {
+        return;
+      }
+      add.addEventListener("click", function () {
+        var index = parseInt(total.value, 10);
+        var holder = document.createElement("tbody");
+        holder.innerHTML = template.innerHTML.replace(/__prefix__/g, String(index)).trim();
+        var row = holder.firstElementChild;
+        body.appendChild(row);
+        total.value = String(index + 1);
+        bindSkuInputs(row);
+      });
+    });
+  }
+
+  // SKU boxes on purchase forms: suggestions from the form's data-items-url.
+  function bindSkuInputs(root) {
+    var form = root.closest ? root.closest("form[data-items-url]") : null;
+    var options = document.getElementById("sku-options");
+    if (!form || !options) {
+      return;
+    }
+    var url = form.getAttribute("data-items-url");
+    var timer = null;
+    root.querySelectorAll("input[data-sku-search]").forEach(function (input) {
+      input.setAttribute("list", "sku-options");
+      input.addEventListener("input", function () {
+        window.clearTimeout(timer);
+        var query = input.value.trim();
+        if (query.length < 2) {
+          return;
+        }
+        timer = window.setTimeout(function () {
+          fetch(url + "?" + new URLSearchParams({ q: query }).toString(), { credentials: "same-origin" })
+            .then(function (response) { return response.ok ? response.json() : { results: [] }; })
+            .then(function (data) {
+              options.innerHTML = "";
+              (data.results || []).forEach(function (row) {
+                var option = document.createElement("option");
+                option.value = row.sku;
+                option.label = row.text;
+                options.appendChild(option);
+              });
+            })
+            .catch(function () { /* the server validates the SKU on save */ });
+        }, 250);
+      });
+    });
+  }
+
   document.addEventListener("DOMContentLoaded", function () {
     initSidebar();
     initForms();
     initSale();
+    initFormsets();
+    document.querySelectorAll("form[data-items-url]").forEach(bindSkuInputs);
   });
 })();

@@ -1,0 +1,26 @@
+{% extends "ops/base.html" %}
+{% block title %}{% if po %}Edit {{ po.po_number }}{% else %}New purchase order{% endif %}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% if po %}{% url 'ops:po_detail' po.po_number %}{% else %}{% url 'ops:po_list' %}{% endif %}">{% include "ops/_icon.html" with name="back" %}{% if po %}{{ po.po_number }}{% else %}Purchase orders{% endif %}</a>{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>{% if po %}Edit draft {{ po.po_number }}{% else %}New purchase order{% endif %}</h1>
+  <p class="muted">Saved as a draft. Totals are calculated from the lines. Issuing checks every line against the tax treatment.</p>
+</div></div>
+<form method="post" class="stack" novalidate data-items-url="{% url 'ops:purchase_items' %}">
+  {% csrf_token %}
+  {% include "ops/_form_errors.html" with form=header %}
+  <section class="card">
+    <h2>Order</h2>
+    <div class="form-grid">{% for field in header %}{% include "ops/_field.html" with field=field %}{% endfor %}</div>
+  </section>
+  <section>
+    <h2 class="section-title">Lines</h2>
+    {% include "ops/purchases/_formset_table.html" with formset=lines %}
+  </section>
+  <datalist id="sku-options"></datalist>
+  <div class="form-actions">
+    <a class="button button--ghost" href="{% if po %}{% url 'ops:po_detail' po.po_number %}{% else %}{% url 'ops:po_list' %}{% endif %}">Cancel</a>
+    <button type="submit" class="button button--primary" data-once>Save draft</button>
+  </div>
+</form>
+{% endblock %}

@@ -1070,3 +1070,261 @@ def reverse_po_payment_entry(entry, reason, user):
         **_posted_audit(user),
     )
 
+
+
+# ── Draft editing (purchase orders, goods receipts, opening stock) ──────────
+# The write paths the Smerfume Panel uses instead of editing rows directly.
+# Draft-only; issued/posted documents change only through the services
+# above. Validation reuses the model rules and the same problem checks the
+# issue/post services run, so a draft is refused early for the same
+# reasons posting would refuse it later.
+
+PO_HEADER_FIELDS = PurchaseOrder.EDITABLE_DRAFT_FIELDS
+PO_LINE_FIELDS = ("variant", "quantity_ordered", "unit_price", "line_discount_amount", "tax_rate", "hsn_code")
+RECEIPT_HEADER_FIELDS = ("received_date", "vendor_document_reference", "notes")
+
+
+def _messages(exc, prefix=""):
+    return [f"{prefix}{message}" for message in exc.messages]
+
+
+def _unknown(fields, allowed, error_cls):
+    extra = set(fields) - set(allowed)
+    if extra:
+        raise error_cls(f"Unknown fields: {', '.join(sorted(extra))}.")
+
+
+def _build_po_lines(po, lines):
+    """Unsaved, validated PurchaseOrderLine objects, plus any problems."""
+    built, problems = [], []
+    for number, data in enumerate(lines, start=1):
+        _unknown(data, PO_LINE_FIELDS, PurchaseOrderError)
+        values = {"line_discount_amount": 0, "hsn_code": "", **data}
+        if values["line_discount_amount"] is None:
+            values["line_discount_amount"] = 0
+        line = PurchaseOrderLine(purchase_order=po, **values)
+        label = f"Line {number}: "
+        try:
+            line.full_clean(exclude=["purchase_order", "confirmed_booked_quantity"])
+        except ValidationError as exc:
+            problems += _messages(exc, label)
+            continue
+        if not line.variant.is_active:
+            problems.append(f"{label}{line.variant.sku} is inactive.")
+        built.append(line)
+    return built, problems
+
+
+def _po_header_problems(po, previous_supplier_id=None, previous_warehouse_id=None):
+    problems = []
+    try:
+        po.full_clean(exclude=["created_by", "issued_by", "cancelled_by", "closed_by"])
+    except ValidationError as exc:
+        problems += _messages(exc)
+    # DEC-010: the purchase tax treatment is chosen explicitly (no default).
+    if not po.purchase_tax_treatment:
+        problems.append("Choose the purchase tax treatment (GST invoice or no GST invoice).")
+    # New choices must be active; a PO may keep a vendor deactivated later.
+    if po.supplier_id and po.supplier_id != previous_supplier_id and not po.supplier.is_active:
+        problems.append(f"Vendor {po.supplier} is inactive.")
+    if po.warehouse_id and po.warehouse_id != previous_warehouse_id and not po.warehouse.is_active:
+        problems.append(f"Warehouse {po.warehouse} is inactive.")
+    return problems
+
+
+@transaction.atomic
+def create_purchase_order(*, user, lines=(), **header):
+    """New draft purchase order with its lines. Totals are never taken
+    from the caller: they are computed from the lines. Issue it later with
+    issue_purchase_order(), which re-checks every DEC-010 rule."""
+    _unknown(header, PO_HEADER_FIELDS, PurchaseOrderError)
+    po = PurchaseOrder(created_by=user, status=PurchaseOrder.STATUS_DRAFT, **header)
+    problems = _po_header_problems(po)
+    built, line_problems = _build_po_lines(po, lines)
+    problems += line_problems
+    if problems:
+        raise PurchaseOrderError(" ".join(problems))
+    po.save()
+    for line in built:
+        line.purchase_order = po
+        line.save()
+    return po
+
+
+@transaction.atomic
+def update_draft_purchase_order(po, *, user, lines=None, **header):
+    """Change a draft purchase order (header, and all lines when ``lines``
+    is given). Refused once issued: issued, received and closed purchase
+    orders change only through their own services."""
+    _unknown(header, PO_HEADER_FIELDS, PurchaseOrderError)
+    po = _lock(po)
+    if po.status != PurchaseOrder.STATUS_DRAFT:
+        raise PurchaseOrderError(f"{po.po_number} is {po.get_status_display().lower()} and cannot be edited.")
+    previous_supplier_id, previous_warehouse_id = po.supplier_id, po.warehouse_id
+    for field, value in header.items():
+        setattr(po, field, value)
+    problems = _po_header_problems(po, previous_supplier_id, previous_warehouse_id)
+    built = None
+    if lines is not None:
+        built, line_problems = _build_po_lines(po, lines)
+        problems += line_problems
+    if problems:
+        raise PurchaseOrderError(" ".join(problems))
+    po.save(update_fields=[*header, "updated_at"])
+    if built is not None:
+        # Draft lines have no receipts, bookings or allocations yet.
+        po.lines.all().delete()
+        for line in built:
+            line.save()
+    return po
+
+
+def _lock_draft_receipt(receipt, receipt_type):
+    receipt = GoodsReceipt.objects.select_for_update().get(pk=receipt.pk)
+    if receipt.status != GoodsReceipt.STATUS_DRAFT:
+        raise GoodsReceiptError(
+            f"{receipt.grn_number} is {receipt.get_status_display().lower()} and cannot be edited."
+        )
+    if receipt.receipt_type != receipt_type:
+        raise GoodsReceiptError(f"{receipt.grn_number} is not a {receipt_type} receipt.")
+    return receipt
+
+
+def _apply_receipt_header(receipt, header):
+    _unknown(header, RECEIPT_HEADER_FIELDS, GoodsReceiptError)
+    for field, value in header.items():
+        setattr(receipt, field, value if field == "received_date" else (value or "").strip())
+    if header:
+        if receipt.received_date is None:
+            raise GoodsReceiptError("Enter the received date.")
+        receipt.save(update_fields=[*header, "updated_at"])
+
+
+@transaction.atomic
+def update_goods_receipt_lines(receipt, *, user, lines, discrepancies=(), **header):
+    """Replace a draft purchase-order receipt: its lines, its staff-recorded
+    discrepancies (short / wrong item / excess) and optionally its delivery
+    details. Lines are {po_line, stock_type, quantity}; variant, cost and
+    tax are copied from the PO line (and frozen again at posting). Refuses
+    over-receipt and anything posting would refuse. Stock does not change:
+    only post_goods_receipt() moves it, and it records damaged lines as
+    discrepancies, as before."""
+    if receipt.purchase_order_id is None:
+        raise GoodsReceiptError("Only purchase order receipts have PO lines.")
+    PurchaseOrder.objects.select_for_update().get(pk=receipt.purchase_order_id)
+    receipt = _lock_draft_receipt(receipt, GoodsReceipt.TYPE_STANDARD)
+    po = receipt.purchase_order
+    po_lines = {line.pk: line for line in po.lines.select_related("variant", "purchase_order")}
+    problems = []
+    if po.status not in PurchaseOrder.RECEIVABLE_STATUSES:
+        problems.append(f"{po.po_number} is {po.get_status_display().lower()}.")
+
+    built_lines = []
+    for number, data in enumerate(lines, start=1):
+        po_line = data.get("po_line")
+        if po_line is None or po_line.pk not in po_lines:
+            problems.append(f"Line {number}: choose a line from {po.po_number}.")
+            continue
+        line = GoodsReceiptLine(
+            receipt=receipt, po_line=po_lines[po_line.pk], stock_type=data.get("stock_type") or "retail",
+            quantity=data.get("quantity"),
+        )
+        line.apply_po_line_snapshot()
+        try:
+            line.full_clean(exclude=["receipt", "unit_cost"])
+        except ValidationError as exc:
+            problems += _messages(exc, f"Line {number}: ")
+            continue
+        built_lines.append(line)
+
+    built_discrepancies = []
+    for number, data in enumerate(discrepancies, start=1):
+        discrepancy = ReceiptDiscrepancy(
+            receipt=receipt, created_by=user,
+            discrepancy_type=data.get("discrepancy_type"), po_line=data.get("po_line"),
+            quantity=data.get("quantity"), variant=data.get("variant"),
+            observed_item_description=(data.get("observed_item_description") or "").strip(),
+            notes=(data.get("notes") or "").strip(),
+        )
+        try:
+            discrepancy.full_clean(exclude=["receipt", "created_by", "receipt_line", "resolved_by"])
+        except ValidationError as exc:
+            problems += _messages(exc, f"Discrepancy {number}: ")
+            continue
+        built_discrepancies.append(discrepancy)
+
+    problems += _discrepancy_problems(po, built_discrepancies, po_lines)
+    if not problems:
+        problems += _over_receipt_problems(built_lines, po_lines, built_discrepancies)
+    if problems:
+        raise GoodsReceiptError(" ".join(problems))
+
+    _apply_receipt_header(receipt, header)
+    receipt.discrepancies.all().delete()
+    receipt.lines.all().delete()
+    for line in built_lines:
+        line.save()
+    for discrepancy in built_discrepancies:
+        discrepancy.save()
+    return receipt
+
+
+@transaction.atomic
+def update_opening_receipt_lines(receipt, *, user, lines, **header):
+    """Replace a draft opening-stock receipt: stock on hand at cutover,
+    lines {variant, stock_type, quantity, unit_cost, tax_rate}. No vendor
+    and no purchase order, never PO-receipt semantics. Stock changes only
+    when post_opening_receipt() runs."""
+    receipt = _lock_draft_receipt(receipt, GoodsReceipt.TYPE_OPENING)
+    problems, built = [], []
+    for number, data in enumerate(lines, start=1):
+        line = GoodsReceiptLine(
+            receipt=receipt, variant=data.get("variant"), stock_type=data.get("stock_type") or "retail",
+            quantity=data.get("quantity"), unit_cost=data.get("unit_cost"), tax_rate=data.get("tax_rate"),
+        )
+        try:
+            line.full_clean(exclude=["receipt"])
+        except ValidationError as exc:
+            problems += _messages(exc, f"Line {number}: ")
+            continue
+        built.append(line)
+    if problems:
+        raise GoodsReceiptError(" ".join(problems))
+    _apply_receipt_header(receipt, header)
+    receipt.lines.all().delete()
+    for line in built:
+        line.save()
+    return receipt
+
+
+# ── Paid Through accounts (DEC-011 master data) ──────────────────────────────
+
+
+class PaymentAccountError(Exception):
+    """A Paid Through account cannot be saved (message is user-facing)."""
+
+
+def _save_payment_account(account):
+    account.name = (account.name or "").strip()
+    try:
+        account.full_clean()
+    except ValidationError as exc:
+        raise PaymentAccountError(" ".join(exc.messages)) from exc
+    account.save()
+    return account
+
+
+@transaction.atomic
+def create_payment_account(*, user, name, kind, is_active=True):
+    """Name (as the Zoho Books ledger account) and kind only: no balances,
+    account numbers or credentials."""
+    return _save_payment_account(PaymentAccount(name=name, kind=kind, is_active=is_active))
+
+
+@transaction.atomic
+def update_payment_account(account, *, user, name, kind, is_active):
+    """Rename, change kind, or (de)activate. Accounts are never deleted; a
+    deactivated account stays on its posted payments."""
+    account = PaymentAccount.objects.select_for_update().get(pk=account.pk)
+    account.name, account.kind, account.is_active = name, kind, is_active
+    return _save_payment_account(account)

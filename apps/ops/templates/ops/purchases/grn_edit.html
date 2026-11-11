@@ -1,0 +1,42 @@
+{% extends "ops/base.html" %}
+{% block title %}Edit {{ receipt.grn_number }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:grn_detail' receipt.grn_number %}">{% include "ops/_icon.html" with name="back" %}{{ receipt.grn_number }}</a>{% endblock %}
+{% block content %}
+<div class="page-head"><div>
+  <h1>Enter received goods · {{ receipt.grn_number }}</h1>
+  <p class="muted">{{ receipt.purchase_order.po_number }} · {{ receipt.supplier }} · {{ receipt.warehouse }}. Enter only what physically arrived. Stock changes when the receipt is posted; damaged units are recorded as discrepancies then.</p>
+</div></div>
+<form method="post" class="stack" novalidate data-items-url="{% url 'ops:purchase_items' %}">
+  {% csrf_token %}
+  {% include "ops/_form_errors.html" with form=header %}
+  <section class="card">
+    <h2>Delivery</h2>
+    <div class="form-grid">{% for field in header %}{% include "ops/_field.html" with field=field %}{% endfor %}</div>
+  </section>
+  <section class="card card--flush">
+    <h2 class="card__title">Received quantities</h2>
+    <table class="table table--responsive">
+      <thead><tr><th scope="col">Item</th><th scope="col" class="num">Ordered</th><th scope="col">Retail received</th><th scope="col">Damaged received</th></tr></thead>
+      <tbody>
+        {% for line, retail, damaged in quantities.rows %}
+        <tr>
+          <td data-label="Item">{{ line.variant }}<br><code>{{ line.variant.sku }}</code></td>
+          <td data-label="Ordered" class="num">{{ line.quantity_ordered }}</td>
+          <td data-label="Retail received"><div class="field">{{ retail }}{% for e in retail.errors %}<p class="field__error">{{ e }}</p>{% endfor %}</div></td>
+          <td data-label="Damaged received"><div class="field">{{ damaged }}{% for e in damaged.errors %}<p class="field__error">{{ e }}</p>{% endfor %}</div></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  <section>
+    <h2 class="section-title">Discrepancies (short / wrong item / excess) — recorded only, no stock change</h2>
+    {% include "ops/purchases/_formset_table.html" with formset=discrepancies %}
+  </section>
+  <datalist id="sku-options"></datalist>
+  <div class="form-actions">
+    <a class="button button--ghost" href="{% url 'ops:grn_detail' receipt.grn_number %}">Cancel</a>
+    <button type="submit" class="button button--primary" data-once>Save draft receipt</button>
+  </div>
+</form>
+{% endblock %}

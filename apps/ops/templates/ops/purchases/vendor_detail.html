@@ -6,7 +6,9 @@
   <h1>{{ vendor.name }}</h1>
   <p class="muted"><code>{{ vendor.vendor_code }}</code>{% if vendor.legal_name %} · {{ vendor.legal_name }}{% endif %}</p>
   <div class="badges">{% if vendor.is_active %}<span class="badge badge--ok">Active</span>{% else %}<span class="badge">Inactive</span>{% endif %}</div>
-</div></div>
+</div>
+{% if can_change_vendor %}<a class="button" href="{% url 'ops:vendor_edit' vendor.vendor_code %}">Edit vendor</a>{% endif %}
+</div>
 <section class="card">
   <dl class="dl">
     <dt>GST treatment</dt><dd>{{ vendor.get_gst_treatment_display|default:"—" }}</dd>

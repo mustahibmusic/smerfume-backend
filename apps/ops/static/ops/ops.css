@@ -255,6 +255,11 @@ form.inline { display: inline; }
 .sale-line--error { background: var(--danger-soft); }
 .sale-line:has([data-sale-delete]:checked), .sale-line.is-removed { display: none; }
 .sale-line__remove { padding-top: 22px; }
+.formset { display: grid; gap: 10px; justify-items: start; }
+.formset .card { width: 100%; }
+.formset__table td { vertical-align: top; }
+.formset__table .field input, .formset__table .field select { min-width: 90px; }
+.row--error td { background: var(--danger-soft); }
 
 /* Narrow screens */
 @media (max-width: 1024px) {

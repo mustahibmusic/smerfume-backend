@@ -5,7 +5,9 @@
 <div class="page-head"><div>
   <h1>Purchase orders</h1>
   <p class="muted">{{ paginator.count }} purchase order{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %}</p>
-</div></div>
+</div>
+{% if can_create_po %}<a class="button button--primary" href="{% url 'ops:po_new' %}">New purchase order</a>{% endif %}
+</div>
 <form method="get" class="filters filters--four" role="search">
   {% include "ops/_field.html" with field=filter_form.q %}
   {% include "ops/_field.html" with field=filter_form.status %}
@@ -42,6 +44,6 @@
 </div>
 {% include "ops/_pagination.html" %}
 {% else %}
-<section class="empty card"><h2>No purchase orders found</h2><p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Purchase orders are created in Django Admin for now.{% endif %}</p></section>
+<section class="empty card"><h2>No purchase orders found</h2><p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Create the first purchase order.{% endif %}</p></section>
 {% endif %}
 {% endblock %}

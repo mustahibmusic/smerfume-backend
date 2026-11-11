@@ -1,0 +1,139 @@
+{% extends "ops/base.html" %}
+{% block title %}{{ order.order_number }}{% endblock %}
+{% block page_title %}<a class="crumb" href="{% url 'ops:order_list' %}">{% include "ops/_icon.html" with name="back" %}Orders</a>{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>{{ order.order_number }}</h1>
+    <p class="muted">
+      {{ order.get_channel_display }} · {{ order.created_at|date:"d M Y, H:i" }}
+      {% if order.is_replacement %} · Replacement{% if order.original_order %} for <a href="{% url 'ops:order_detail' order.original_order.order_number %}">{{ order.original_order.order_number }}</a>{% endif %}{% endif %}
+    </p>
+    <div class="badges">
+      <span class="badge badge--{{ status_tone }}">{{ order.get_status_display }}</span>
+      <span class="badge badge--{{ payment_status_tone }}">{{ payment_status_label }}</span>
+    </div>
+  </div>
+  {% if admin_url %}
+    <a class="button button--ghost" href="{{ admin_url }}">{% include "ops/_icon.html" with name="external" %}<span>Open in Django Admin</span></a>
+  {% endif %}
+</div>
+
+<div class="stats">
+  <div class="stat"><span class="stat__label">Order total</span><span class="stat__value">₹{{ order.total|floatformat:"2g" }}</span></div>
+  <div class="stat"><span class="stat__label">Paid</span><span class="stat__value">₹{{ summary.total_paid|floatformat:"2g" }}</span></div>
+  <div class="stat"><span class="stat__label">Balance due</span><span class="stat__value">₹{{ summary.balance_due|floatformat:"2g" }}</span></div>
+  <div class="stat"><span class="stat__label">Refunded</span><span class="stat__value">₹{{ summary.refunded|floatformat:"2g" }}</span></div>
+</div>
+
+<div class="grid">
+  <section class="card">
+    <h2>Customer</h2>
+    <dl class="dl">
+      <dt>Name</dt><dd>{{ customer }}</dd>
+      {% if contact %}<dt>Contact</dt><dd>{{ contact }}</dd>{% endif %}
+      {% if order.guest_email %}<dt>Guest email</dt><dd>{{ order.guest_email }}</dd>{% endif %}
+      {% if order.created_by %}<dt>Recorded by</dt><dd>{{ order.created_by.full_name|default:order.created_by.email }}</dd>{% endif %}
+    </dl>
+  </section>
+  <section class="card">
+    <h2>Shipping</h2>
+    {% if address %}
+      <address class="address">
+        {{ address.full_name }}<br>
+        {{ address.address_line1 }}{% if address.address_line2 %}<br>{{ address.address_line2 }}{% endif %}<br>
+        {{ address.city }}, {{ address.get_state_display }} {{ address.pincode }}<br>
+        {{ address.mobile }}
+      </address>
+      {% if order.tracking_number %}<p class="muted">Tracking: {{ order.tracking_number }}</p>{% endif %}
+    {% else %}
+      <p class="muted">No shipping address{% if order.channel == "in_store" %} (in-store sale){% endif %}.</p>
+    {% endif %}
+    {% if order.delivered_at %}<p class="muted">Delivered {{ order.delivered_at|date:"d M Y, H:i" }}</p>{% endif %}
+  </section>
+</div>
+
+<section class="card card--flush">
+  <h2 class="card__title">Items</h2>
+  <table class="table table--responsive">
+    <thead>
+      <tr><th scope="col">Item</th><th scope="col">SKU</th><th scope="col" class="num">Qty</th><th scope="col" class="num">Unit price</th><th scope="col" class="num">Line total</th></tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td data-label="Item">{{ item.variant }}</td>
+        <td data-label="SKU"><code>{{ item.variant.sku }}</code></td>
+        <td data-label="Qty" class="num">{{ item.quantity }}</td>
+        <td data-label="Unit price" class="num">₹{{ item.unit_price|floatformat:"2g" }}</td>
+        <td data-label="Line total" class="num">₹{{ item.line_total|floatformat:"2g" }}</td>
+      </tr>
+      {% empty %}
+      <tr><td colspan="5" class="muted">No items.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <dl class="totals">
+    <dt>Subtotal</dt><dd>₹{{ order.subtotal|floatformat:"2g" }}</dd>
+    {% if order.discount_amount %}<dt>Discount</dt><dd>−₹{{ order.discount_amount|floatformat:"2g" }}</dd>{% endif %}
+    {% if order.shipping_charge %}<dt>Shipping</dt><dd>₹{{ order.shipping_charge|floatformat:"2g" }}</dd>{% endif %}
+    {% if order.cod_handling_charge %}<dt>COD handling</dt><dd>₹{{ order.cod_handling_charge|floatformat:"2g" }}</dd>{% endif %}
+    {% if order.convenience_fee %}<dt>Convenience fee</dt><dd>₹{{ order.convenience_fee|floatformat:"2g" }}</dd>{% endif %}
+    <dt class="totals__grand">Total</dt><dd class="totals__grand">₹{{ order.total|floatformat:"2g" }}</dd>
+  </dl>
+</section>
+
+<section class="card card--flush">
+  <h2 class="card__title">Payments received</h2>
+  {% if payments %}
+  <table class="table table--responsive">
+    <thead>
+      <tr><th scope="col">Payment</th><th scope="col">Date</th><th scope="col">Method</th><th scope="col">Reference</th><th scope="col">Recorded by</th><th scope="col" class="num">Amount</th></tr>
+    </thead>
+    <tbody>
+      {% for payment in payments %}
+      <tr>
+        <td data-label="Payment">{{ payment.payment_number }}</td>
+        <td data-label="Date">{{ payment.payment_date|date:"d M Y" }}</td>
+        <td data-label="Method">{{ payment.get_method_display }}</td>
+        <td data-label="Reference">{{ payment.reference|default:"—" }}</td>
+        <td data-label="Recorded by">{{ payment.recorded_by.full_name|default:payment.recorded_by.email|default:"—" }}</td>
+        <td data-label="Amount" class="num">₹{{ payment.amount|floatformat:"2g" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="card__body muted">No payments recorded{% if order.channel == "online" %}. Online payment method: {{ order.get_payment_method_display|default:"—" }}{% endif %}.</p>
+  {% endif %}
+</section>
+
+{% if returns %}
+<section class="card card--flush">
+  <h2 class="card__title">Returns and refunds</h2>
+  <table class="table table--responsive">
+    <thead>
+      <tr><th scope="col">Requested</th><th scope="col">Return status</th><th scope="col">Refunds</th></tr>
+    </thead>
+    <tbody>
+      {% for return in returns %}
+      <tr>
+        <td data-label="Requested">{{ return.created_at|date:"d M Y" }}</td>
+        <td data-label="Return status">{{ return.get_status_display }}</td>
+        <td data-label="Refunds">
+          {% for refund in return.refunds.all %}₹{{ refund.refund_amount|floatformat:"2g" }} ({{ refund.get_refund_status_display }}){% if not forloop.last %}<br>{% endif %}{% empty %}<span class="muted">None</span>{% endfor %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+{% if order.customer_notes %}
+<section class="card">
+  <h2>Customer notes</h2>
+  <p class="prewrap">{{ order.customer_notes }}</p>
+</section>
+{% endif %}
+{% endblock %}

@@ -24,6 +24,8 @@ from apps.core.views import readiness
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    # Smerfume Operations backend (staff UI). Gated by core.access_ops.
+    path("ops/", include("apps.ops.urls")),
     path("api/", include("config.api_urls")),
     # Readiness (database). Liveness /healthz/ is apps.core.health middleware.
     path("readyz/", readiness, name="readiness"),

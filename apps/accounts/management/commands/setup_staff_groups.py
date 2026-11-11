@@ -28,12 +28,18 @@ DRAFT_INLINE_DELETES = frozenset({
     "catalog.delete_editionnote",
 })
 
+# Gate to the Smerfume Operations backend (/ops/). Every staff group gets
+# it; what each group can see there is still decided by its model
+# permissions. Not Django Admin access (is_staff stays a manual step).
+OPS_ACCESS = ("core.access_ops",)
+
 CATALOG_MODELS = (
     "brand", "category", "perfumenote", "product", "productedition",
     "productvariant", "productvariantimage", "editionnote",
 )
 
 OPS = (
+    *OPS_ACCESS,
     *_view("orders", "order", "orderitem", "shippingaddress", "return", "returnitem", "refund"),
     *_view("accounts", "user", "customerprofile"),
     *_view("cart", "cart", "cartitem"),
@@ -48,6 +54,7 @@ OPS = (
 )
 
 WAREHOUSE = (
+    *OPS_ACCESS,
     *_view("orders", "order", "orderitem", "shippingaddress", "return", "returnitem"),
     *_view(
         "inventory", "inventorystock", "partialbottlelot", "stockmovement", "stocktransaction",
@@ -81,6 +88,7 @@ WAREHOUSE = (
 )
 
 FINANCE = (
+    *OPS_ACCESS,
     *_view("orders", "order", "orderitem", "return", "returnitem", "refund", "refundadjustment"),
     *_view("accounts", "customerprofile"),
     *_view("inventory", "inventorystock", "stockmovement", "stocktransaction", "supplier"),

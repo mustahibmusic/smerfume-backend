@@ -53,6 +53,8 @@ INSTALLED_APPS = [
     "apps.notifications",
     "apps.reviews",
     "apps.purchases",
+    # Staff operations UI (/ops/): presentation only, no models.
+    "apps.ops",
 ]
 
 MIDDLEWARE = [

@@ -1,0 +1,30 @@
+{% load static %}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{% block title %}Operations{% endblock %} · Smerfume Ops</title>
+  <link rel="stylesheet" href="{% static 'ops/ops.css' %}">
+  <script src="{% static 'ops/ops.js' %}" defer></script>
+</head>
+<body>
+{% block shell %}
+<div class="shell" data-shell>
+  {% include "ops/_sidebar.html" %}
+  <div class="shell__backdrop" data-nav-close></div>
+  <div class="shell__main">
+    {% include "ops/_topbar.html" %}
+    <main class="content" id="content">
+      {% if messages %}
+        <ul class="messages">
+          {% for message in messages %}<li class="message message--{{ message.tags|default:'info' }}">{{ message }}</li>{% endfor %}
+        </ul>
+      {% endif %}
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</div>
+{% endblock %}
+</body>
+</html>

@@ -427,6 +427,17 @@ Admin available at `/admin/`. Protected by Django's standard session authenticat
 
 ---
 
+## Operations Backend (CURRENT, Phase 1)
+
+`/ops/` is the staff-facing operations UI (`apps.ops`), separate from Django Admin. Django Admin stays the technical/admin console (raw model management, permissions and groups, emergency operations, low-level inspection).
+
+- **Access:** session auth via `/ops/login/` and POST-only `/ops/logout/`. Gate permission `core.access_ops` (independent of `is_staff`), plus the model permission of each view (for example `orders.view_order`). Unknown paths, records and pages return a branded 404; missing permissions return a branded 403.
+- **Presentation only:** `apps.ops` holds views, UI forms, templates, presentation helpers and its own static assets (no Unfold assets). It has no business rules: reads use domain models, selectors and `apps/orders/payments`; writes (none yet) must call existing domain services.
+- **Identifiers:** ops-native URLs use public identifiers (`/ops/orders/<order_number>/`), never database PKs.
+- **Phase 1 scope:** Orders list (search, status/channel/payment filters, pagination) and read-only order detail.
+
+---
+
 ## API Documentation (CURRENT)
 
 `drf-spectacular` generates an OpenAPI 3.0 schema automatically from view decorators.

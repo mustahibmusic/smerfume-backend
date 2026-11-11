@@ -1,0 +1,83 @@
+{% extends "ops/base.html" %}
+{% block title %}Orders{% endblock %}
+{% block page_title %}Orders{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Orders</h1>
+    <p class="muted">{{ paginator.count }} order{{ paginator.count|pluralize }}{% if is_filtered %} match the filters{% endif %}</p>
+  </div>
+</div>
+
+<form method="get" class="filters" role="search">
+  <div class="field field--grow">
+    <label for="id_q">Search</label>
+    <input type="search" name="q" id="id_q" value="{{ filter_form.q.value|default:'' }}" maxlength="100" placeholder="Order number, name, mobile or email">
+  </div>
+  {% for field in filter_form %}{% if field.name != "q" %}
+    <div class="field">
+      <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+      {{ field }}
+    </div>
+  {% endif %}{% endfor %}
+  <div class="filters__actions">
+    <button type="submit" class="button button--primary">Apply</button>
+    {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:order_list' %}">Clear</a>{% endif %}
+  </div>
+</form>
+{% if filter_form.errors %}
+  <div class="alert alert--danger" role="alert">
+    {% for field, errors in filter_form.errors.items %}{% for error in errors %}<p>{{ field|capfirst }}: {{ error }} This filter was ignored.</p>{% endfor %}{% endfor %}
+  </div>
+{% endif %}
+
+{% if rows %}
+<div class="card card--flush">
+  <table class="table table--responsive">
+    <thead>
+      <tr>
+        <th scope="col">Order</th>
+        <th scope="col">Date</th>
+        <th scope="col">Customer</th>
+        <th scope="col">Channel</th>
+        <th scope="col">Status</th>
+        <th scope="col">Payment</th>
+        <th scope="col" class="num">Total</th>
+        <th scope="col" class="num">Balance due</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}{% with order=row.order %}
+      <tr>
+        <td data-label="Order" class="nowrap"><a class="link-strong" href="{% url 'ops:order_detail' order.order_number %}">{{ order.order_number }}</a></td>
+        <td data-label="Date" class="nowrap">{{ order.created_at|date:"d M Y" }}<br><small class="muted">{{ order.created_at|date:"H:i" }}</small></td>
+        <td data-label="Customer">{{ row.customer }}{% if row.contact %}<br><small class="muted">{{ row.contact }}</small>{% endif %}</td>
+        <td data-label="Channel" class="nowrap">{{ order.get_channel_display }}</td>
+        <td data-label="Status"><span class="badge badge--{{ row.status_tone }}">{{ order.get_status_display }}</span></td>
+        <td data-label="Payment"><span class="badge badge--{{ row.payment_status_tone }}">{{ row.payment_status_label }}</span></td>
+        <td data-label="Total" class="num">₹{{ order.total|floatformat:"2g" }}</td>
+        <td data-label="Balance due" class="num">₹{{ order.balance_due|floatformat:"2g" }}</td>
+      </tr>
+      {% endwith %}{% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% if is_paginated %}
+<nav class="pagination" aria-label="Pages">
+  {% if page_obj.has_previous %}
+    <a class="button button--ghost" href="?{% if query_string %}{{ query_string }}&amp;{% endif %}page={{ page_obj.previous_page_number }}">Previous</a>
+  {% endif %}
+  <span class="muted">Page {{ page_obj.number }} of {{ paginator.num_pages }}</span>
+  {% if page_obj.has_next %}
+    <a class="button button--ghost" href="?{% if query_string %}{{ query_string }}&amp;{% endif %}page={{ page_obj.next_page_number }}">Next</a>
+  {% endif %}
+</nav>
+{% endif %}
+{% else %}
+<section class="empty card">
+  <h2>No orders found</h2>
+  <p class="muted">{% if is_filtered %}Change or clear the filters.{% else %}Orders appear here once placed.{% endif %}</p>
+</section>
+{% endif %}
+{% endblock %}

@@ -30,6 +30,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, transaction
+from django.db.models import Q
 from django.test import RequestFactory, TestCase, TransactionTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
@@ -2121,3 +2122,14 @@ class StockTypeTransferAdminTests(TestCase):
         self.assertContains(resp, "free")
         self.stock.refresh_from_db()
         self.assertEqual(self.stock.quantity, Decimal("10"))
+
+
+class ReservationActiveIndexTests(TestCase):
+    """The partial index must use the same statuses as active_reservations(),
+    or PostgreSQL stops using it for the Home warning query."""
+
+    def test_partial_index_condition_matches_active_statuses(self):
+        from apps.inventory.selectors import ACTIVE_RESERVATION_STATUSES
+
+        index = next(i for i in StockReservation._meta.indexes if i.name == "stock_res_active_created_idx")
+        self.assertEqual(index.condition, Q(status__in=list(ACTIVE_RESERVATION_STATUSES)))

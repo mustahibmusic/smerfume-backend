@@ -483,6 +483,8 @@ class StockMovement(BaseModel):
         indexes = [
             models.Index(fields=["variant", "warehouse", "created_at"]),
             models.Index(fields=["movement_type"]),
+            # Movement ledger list sorts the whole ledger by -created_at, -id.
+            models.Index(fields=["created_at", "id"], name="stock_movement_created_id_idx"),
         ]
 
     def __str__(self):
@@ -541,6 +543,13 @@ class StockReservation(BaseModel):
     class Meta:
         indexes = [
             models.Index(fields=["order_item", "status"]),
+            # Home "Reservations past warning age": active rows by age.
+            # Partial: active reservations are a small share of all rows.
+            models.Index(
+                fields=["created_at"],
+                name="stock_res_active_created_idx",
+                condition=models.Q(status__in=["held", "confirmed"]),
+            ),
         ]
 
     def __str__(self):

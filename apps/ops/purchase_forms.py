@@ -26,9 +26,16 @@ def _date_input():
 
 
 class SkuField(forms.CharField):
-    """A product variant typed or scanned as SKU (or exact barcode)."""
+    """A product variant typed or scanned as SKU (or exact barcode).
 
-    def __init__(self, **kwargs):
+    Lookup is always exact SKU first, then exact barcode. ``eligibility``
+    is an optional callable ``variant -> error message or None`` that a
+    form uses to add its own rule after the variant is identified; it
+    never changes how the variant is found.
+    """
+
+    def __init__(self, eligibility=None, **kwargs):
+        self.eligibility = eligibility
         kwargs.setdefault("max_length", 64)
         kwargs.setdefault("label", "Item (SKU)")
         kwargs.setdefault("widget", forms.TextInput(attrs={
@@ -46,7 +53,21 @@ class SkuField(forms.CharField):
         )
         if variant is None:
             raise forms.ValidationError(f"Unknown SKU '{value}'.")
+        problem = self.eligibility(variant) if self.eligibility else None
+        if problem:
+            raise forms.ValidationError(problem)
         return variant
+
+
+def purchasable_problem(variant):
+    """Purchase order lines take active, non-decant variants only: the same
+    rule issue_purchase_order() enforces, checked here when the line is
+    entered."""
+    if not variant.is_active:
+        return f"{variant.sku} is inactive and cannot be ordered."
+    if variant.is_decant:
+        return f"{variant.sku} is a decant; decants cannot be purchased."
+    return None
 
 
 # ── Purchase orders ──────────────────────────────────────────────────────────
@@ -85,7 +106,7 @@ class PurchaseOrderHeaderForm(forms.Form):
 
 
 class PurchaseOrderLineForm(forms.Form):
-    sku = SkuField()
+    sku = SkuField(eligibility=purchasable_problem)
     quantity_ordered = forms.IntegerField(min_value=1, label="Quantity")
     unit_price = forms.DecimalField(max_digits=12, decimal_places=2, min_value=0, label="Unit price")
     line_discount_amount = forms.DecimalField(

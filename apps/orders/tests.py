@@ -227,7 +227,7 @@ class GuestCheckoutTests(TestCase):
         order = Order.objects.get(order_number=resp.data["order_number"])
         self.assertEqual(order.guest_email, "guest@example.com")
         self.assertIsNotNone(order.user)
-        self.assertEqual(order.user.mobile_number, "9876543210")
+        self.assertEqual(order.user.mobile_number, "+919876543210")
 
     def test_guest_checkout_clears_guest_cart(self):
         token = self._make_guest_cart()
@@ -282,7 +282,7 @@ class GuestCheckoutTests(TestCase):
 
     def test_guest_checkout_links_to_existing_user_by_mobile(self):
         """If the mobile already has an account, the order links to it."""
-        existing_user = _make_user(mobile="9876543210")
+        existing_user = _make_user(mobile="+919876543210")
         token = self._make_guest_cart()
         resp = self.client.post(
             CHECKOUT_URL,
@@ -302,12 +302,12 @@ class GuestCheckoutTests(TestCase):
             format="json",
             HTTP_X_CART_TOKEN=token,
         )
-        user = User.objects.get(mobile_number="9876543210")
+        user = User.objects.get(mobile_number="+919876543210")
         self.assertEqual(user.email, "setme@example.com")
 
     def test_guest_checkout_does_not_overwrite_existing_email(self):
         """If the existing user already has an email, it is not overwritten."""
-        _make_user(mobile="9876543210", email="original@example.com")
+        _make_user(mobile="+919876543210", email="original@example.com")
         token = self._make_guest_cart()
         self.client.post(
             CHECKOUT_URL,
@@ -315,7 +315,7 @@ class GuestCheckoutTests(TestCase):
             format="json",
             HTTP_X_CART_TOKEN=token,
         )
-        user = User.objects.get(mobile_number="9876543210")
+        user = User.objects.get(mobile_number="+919876543210")
         self.assertEqual(user.email, "original@example.com")
 
     def test_auto_created_user_can_see_order_after_login(self):
@@ -329,7 +329,7 @@ class GuestCheckoutTests(TestCase):
         )
         self.assertEqual(resp.status_code, 201)
 
-        user = User.objects.get(mobile_number="9876543210")
+        user = User.objects.get(mobile_number="+919876543210")
         self.client.credentials(**_auth_header(user))
         list_resp = self.client.get("/api/orders/")
         self.assertEqual(list_resp.status_code, 200)
@@ -445,7 +445,7 @@ class GuestCheckoutEmailTests(TestCase):
         )
 
     def test_existing_user_without_email_is_not_changed(self):
-        existing = _make_user(mobile="9876543210")
+        existing = _make_user(mobile="+919876543210")
         resp = self._checkout("attacker@example.com")
         self.assertEqual(resp.status_code, 201)
         existing.refresh_from_db()
@@ -465,7 +465,7 @@ class GuestCheckoutEmailTests(TestCase):
         _make_user(mobile="+919000000001", email="taken@example.com", username="taken")
         resp = self._checkout("TAKEN@example.com")
         self.assertEqual(resp.status_code, 201)
-        new_user = User.objects.get(mobile_number="9876543210")
+        new_user = User.objects.get(mobile_number="+919876543210")
         self.assertIsNone(new_user.email)
 
     def test_email_race_does_not_cause_500(self):
@@ -474,7 +474,7 @@ class GuestCheckoutEmailTests(TestCase):
         with patch("apps.orders.services._email_available", return_value=True):
             resp = self._checkout("race@example.com")
         self.assertEqual(resp.status_code, 201)
-        new_user = User.objects.get(mobile_number="9876543210")
+        new_user = User.objects.get(mobile_number="+919876543210")
         self.assertIsNone(new_user.email)
 
 
@@ -3269,11 +3269,11 @@ class InStoreSaleServiceTests(TestCase):
         order = self._sell([(self.variant, 1)], customer_mobile="9811100002", customer_name="Asha")
         customer = order.user
         self.assertEqual((customer.mobile_number, customer.first_name, customer.role),
-                         ("9811100002", "Asha", "customer"))
+                         ("+919811100002", "Asha", "customer"))
         self.assertFalse(customer.has_usable_password())
 
     def test_existing_customer_reused_and_not_modified(self):
-        existing = _make_user(mobile="9811100003", email="keep@example.com", first_name="Original")
+        existing = _make_user(mobile="+919811100003", email="keep@example.com", first_name="Original")
         order = self._sell([(self.variant, 1)], customer_mobile="9811100003", customer_name="Changed")
         existing.refresh_from_db()
         self.assertEqual(order.user, existing)
@@ -3376,7 +3376,7 @@ class InStoreSaleAPITests(TestCase):
 
     def test_customer_sees_in_store_order_but_cannot_return_it(self):
         resp = self._post(user=self.staff)
-        customer = User.objects.get(mobile_number="9811100010")
+        customer = User.objects.get(mobile_number="+919811100010")
         client = APIClient()
         client.credentials(**_auth_header(customer))
 

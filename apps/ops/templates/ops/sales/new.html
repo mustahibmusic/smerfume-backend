@@ -24,6 +24,20 @@
       {% include "ops/_field.html" with field=form.customer_name %}
       {% include "ops/_field.html" with field=form.warehouse %}
     </div>
+    <div class="customer-lookup" data-customer-lookup
+         data-url="{% url 'ops:customer_lookup' %}"
+         data-address-url="{% url 'ops:customer_last_address' '00000000-0000-0000-0000-000000000000' %}">
+      <p class="customer-lookup__status muted" data-customer-status role="status" aria-live="polite"></p>
+      <ul class="customer-lookup__list" data-customer-results hidden></ul>
+      <div class="customer-lookup__selected" data-customer-selected hidden>
+        <button type="button" class="button button--ghost" data-customer-change>Change customer</button>
+        <span class="customer-lookup__address" data-customer-address hidden>
+          Last delivery address available
+          <button type="button" class="button button--ghost" data-customer-address-view aria-expanded="false">View</button>
+        </span>
+      </div>
+      <div class="customer-lookup__address-card" data-customer-address-card hidden></div>
+    </div>
   </section>
 
   <section class="card card--flush">

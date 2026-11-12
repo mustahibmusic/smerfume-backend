@@ -21,6 +21,7 @@ import logging
 import requests
 from django.conf import settings
 
+from ..mobile import mask_mobile
 from .base import BaseSMSBackend
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,7 @@ class MSG91SMSBackend(BaseSMSBackend):
 
             # MSG91 returns {"type": "success", ...} on success
             if data.get("type") == "success":
-                logger.info("MSG91 OTP sent to %s", mobile_number)
+                logger.info("MSG91 OTP sent to %s", mask_mobile(mobile_number))
                 return True
 
             # Vendor returned HTTP 200 but indicated a logical failure
@@ -92,8 +93,8 @@ class MSG91SMSBackend(BaseSMSBackend):
             return False
 
         except requests.exceptions.Timeout:
-            logger.error("MSG91 request timed out for %s", mobile_number)
+            logger.error("MSG91 request timed out for %s", mask_mobile(mobile_number))
             return False
         except requests.exceptions.RequestException as exc:
-            logger.error("MSG91 request failed for %s: %s", mobile_number, exc)
+            logger.error("MSG91 request failed for %s: %s", mask_mobile(mobile_number), exc)
             return False

@@ -480,6 +480,10 @@ BOOKED_INCOMING_SALES_ENABLED = os.getenv("BOOKED_INCOMING_SALES_ENABLED", "Fals
 #   or release TTL and never changes any reservation.
 OPS_DASHBOARD_RESERVATION_WARNING_HOURS = int(os.getenv("OPS_DASHBOARD_RESERVATION_WARNING_HOURS", "24"))
 
+# OPS_LOOKUP_RATE_PER_MINUTE (int env var, default 60): customer lookups per
+# staff user per minute on the New In-store Sale page (/ops/lookup/...).
+OPS_LOOKUP_RATE_PER_MINUTE = int(os.getenv("OPS_LOOKUP_RATE_PER_MINUTE", "60"))
+
 
 # ── Parfumly catalogue import ──────────────────────────────────────────────────
 # Public, unauthenticated fragrance metadata API used only by the

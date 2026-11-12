@@ -778,3 +778,17 @@ form.stack:not(.card form) > .form-actions:last-child { margin: 0; border: 1px s
 .gallery__item { display: flex; flex-direction: column; gap: 10px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); min-width: 0; }
 .gallery__item img { width: 100%; aspect-ratio: 1; object-fit: contain; border-radius: var(--radius-sm); background: var(--surface-2); }
 .gallery__item .inline-form .field { min-width: 0; flex: 1 1 120px; }
+
+/* ── In-store sale: customer lookup ─────────────────────────────────────── */
+.customer-lookup { margin-top: 12px; display: grid; gap: 8px; }
+.customer-lookup [hidden] { display: none !important; }
+.customer-lookup__status:empty { display: none; }
+.customer-lookup__list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; max-width: 520px; }
+.customer-lookup__list li + li { border-top: 1px solid var(--border); }
+.customer-lookup__option { display: grid; gap: 2px; width: 100%; padding: 8px 12px; background: var(--surface); border: 0; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.customer-lookup__option:hover, .customer-lookup__option:focus-visible { background: var(--surface-2); outline: none; }
+.customer-lookup__option small { color: var(--muted); }
+.customer-lookup__selected { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.customer-lookup__address { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
+.customer-lookup__address-card { max-width: 520px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
+.customer-lookup__address-card .dl { margin: 0; }

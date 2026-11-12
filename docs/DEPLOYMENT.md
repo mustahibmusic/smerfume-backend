@@ -88,6 +88,47 @@ Rules:
   (HSTS preload) as warnings. That is intentional during the initial
   rollout (section 7). It fails only on errors.
 
+### Contact-number canonicalisation (before `accounts.0005_canonical_mobile_numbers`)
+
+Local contact numbers are stored as `+91XXXXXXXXXX` (any 10-digit local
+number; `0` + 10, `91` + 10 and `+91` + 10 are the same number).
+International `+` numbers and unrecognised legacy values are kept as they
+are. Two accounts holding the same local number in different forms are a
+collision; accounts are never merged automatically.
+
+Before the release that contains `accounts.0005`, against the target
+database:
+
+1. `python manage.py audit_mobile_numbers` (read-only, masked output;
+   exits 1 while a collision exists).
+2. For each collision, decide which account keeps the number and run
+   `python manage.py resolve_mobile_collision --keep <public_id> --retire <public_id> --dry-run`,
+   then again without `--dry-run`. By default it only retires a customer
+   account with no history (no orders, cart items, verified OTP logins,
+   API sessions, admin log entries, groups or permissions, never logged
+   in): the number is cleared and the account deactivated; nothing is
+   moved. If both accounts have history it refuses.
+   - When the business decides the duplicate's orders belong to the kept
+     account, add `--merge-orders` (dry run first). It moves only the
+     retired account's Orders (their items, payments, returns, refunds and
+     delivery addresses stay attached to them), then retires the account.
+     It refuses if the retired account has any other direct record (OTP
+     records, sessions, carts, profile, admin entries, groups) or a
+     recorded login; those are never moved.
+3. `python manage.py audit_mobile_numbers` again: it must report
+   `Collisions: 0`.
+4. Deploy; the release step's `migrate` converts the numbers. It skips (and
+   reports) any collision it still finds, never changes those rows, and is
+   safe to run again.
+
+   **A deployment with an unresolved collision is invalid**, even though
+   the migration defensively skips it: the duplicate accounts stay split
+   and lookups by the canonical number find only one of them. Do not
+   deploy until step 3 reports `Collisions: 0`.
+5. `python manage.py audit_mobile_numbers` once more: `Collisions: 0` and
+   `To convert to +91: 0`. If a number was skipped, resolve it and run
+   `python manage.py canonicalize_mobiles` (same logic as the migration).
+
 ## 5. Start
 
 The image `CMD` starts Gunicorn only (`gunicorn.conf.py`):

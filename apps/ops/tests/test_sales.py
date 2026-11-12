@@ -539,3 +539,128 @@ class RecordPaymentTests(TestCase):
         response = self._pay("1000.00", order=order)
         self.assertRedirects(response, reverse("ops:order_detail", args=[order.order_number]))
         self.assertEqual(order.payments.get().recorded_by, self.cashier)
+
+
+# ── Customer lookup on the New In-store Sale page ────────────────────────────
+
+from django.core.cache import cache  # noqa: E402
+from django.db import connection  # noqa: E402
+from django.test import override_settings  # noqa: E402
+from django.test.utils import CaptureQueriesContext  # noqa: E402
+
+from apps.accounts.models import CustomerProfile  # noqa: E402
+from apps.orders.models import ShippingAddress  # noqa: E402
+
+LOOKUP_URL = reverse("ops:customer_lookup")
+
+
+def _lookup_customer(username, mobile, first_name="Asha", **extra):
+    user = User(username=username, mobile_number=mobile, role="customer", first_name=first_name,
+                email=f"{username}@example.com", **extra)
+    user.set_unusable_password()
+    user.save()
+    return user
+
+
+class CustomerLookupTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.staff = _user("lookupstaff", "orders.add_order")
+        self.client.force_login(self.staff)
+        self.asha = _lookup_customer("asha", "+919876543210", last_name="Rao")
+        self.other = _lookup_customer("other", "+919876543299", first_name="Ravi")
+
+    def _get(self, mobile):
+        response = self.client.get(LOOKUP_URL, {"mobile": mobile})
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def test_needs_permission_and_runs_no_customer_query(self):
+        self.client.force_login(_user("nolookup"))
+        with CaptureQueriesContext(connection) as ctx:
+            response = self.client.get(LOOKUP_URL, {"mobile": "9876543210"})
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse([q for q in ctx.captured_queries if "LIKE" in q["sql"]])
+
+    def test_minimum_six_digits_and_unsupported(self):
+        self.assertEqual(self._get("98765"), {"status": "too_short", "exact": False, "truncated": False,
+                                              "results": []})
+        self.assertEqual(self._get("+447911123456")["status"], "unsupported")
+
+    def test_prefix_returns_safe_fields_only(self):
+        data = self._get("987654")
+        self.assertEqual((data["status"], data["exact"]), ("ok", False))
+        self.assertEqual([r["mobile"] for r in data["results"]], ["+919876543210", "+919876543299"])
+        row = data["results"][0]
+        self.assertEqual(set(row), {"id", "name", "mobile", "email", "has_last_address"})
+        self.assertEqual(
+            (row["id"], row["name"], row["email"]), (str(self.asha.public_id), "Asha Rao", "a***@e***.com"),
+        )
+
+    def test_exact_ten_digits_selects_one_customer_in_any_form(self):
+        for typed in ("9876543210", "+91 98765 43210", "09876543210"):
+            data = self._get(typed)
+            self.assertTrue(data["exact"], typed)
+            self.assertEqual([r["mobile"] for r in data["results"]], ["+919876543210"])
+
+    def test_no_match_keeps_status_ok_with_no_results(self):
+        data = self._get("9123456789")
+        self.assertEqual((data["status"], data["exact"], data["results"]), ("ok", False, []))
+
+    def test_excludes_staff_inactive_and_profile_mobile(self):
+        _lookup_customer("staffer", "+919876543211", is_staff=True)
+        _lookup_customer("gone", "+919876543212", is_active=False)
+        profile_only = _lookup_customer("profile", "+918000000000")
+        CustomerProfile.objects.update_or_create(user=profile_only, defaults={"mobile": "9876543213"})
+        mobiles = [r["mobile"] for r in self._get("98765432")["results"]]
+        self.assertEqual(mobiles, ["+919876543210", "+919876543299"])
+
+    def test_at_most_five_with_truncated(self):
+        for n in range(6):
+            _lookup_customer(f"many{n}", f"+91700000000{n}")
+        data = self._get("700000")
+        self.assertEqual((len(data["results"]), data["truncated"]), (5, True))
+
+    def test_has_last_address_and_read_only_address_endpoint(self):
+        order = Order.objects.create(user=self.asha, order_number="SMR-LOOK-000001", subtotal=1, total=1)
+        ShippingAddress.objects.create(
+            order=order, full_name="Asha Rao", mobile="+919876543210", address_line1="1 MG Road",
+            city="Pune", state="MH", pincode="411001",
+        )
+        rows = {r["mobile"]: r for r in self._get("987654")["results"]}
+        self.assertTrue(rows["+919876543210"]["has_last_address"])
+        self.assertFalse(rows["+919876543299"]["has_last_address"])
+
+        url = reverse("ops:customer_last_address", args=[self.asha.public_id])
+        before = ShippingAddress.objects.count()
+        address = self.client.get(url).json()["address"]
+        self.assertEqual((address["city"], address["pincode"]), ("Pune", "411001"))
+        self.assertEqual(ShippingAddress.objects.count(), before)
+        self.assertEqual(self.client.get(reverse("ops:customer_last_address", args=[self.other.public_id])).json(),
+                         {"address": None})
+        staff_account = _lookup_customer("staffaddr", "+919876543298", is_staff=True)
+        self.assertEqual(
+            self.client.get(reverse("ops:customer_last_address", args=[staff_account.public_id])).status_code, 404,
+        )
+
+    @override_settings(OPS_LOOKUP_RATE_PER_MINUTE=2)
+    def test_rate_limited_per_staff_user(self):
+        self._get("987654")
+        self._get("987654")
+        self.assertEqual(self.client.get(LOOKUP_URL, {"mobile": "987654"}).status_code, 429)
+
+    def test_sale_page_has_lookup_box(self):
+        self.client.force_login(_user("salepage", "orders.add_order", "orders.view_order"))
+        response = self.client.get(SALE_URL)
+        self.assertContains(response, "data-customer-lookup")
+        self.assertContains(response, LOOKUP_URL)
+
+    def test_sale_with_bare_mobile_reuses_canonical_customer_and_adds_no_address(self):
+        self.client.force_login(_user("seller", "orders.add_order", "orders.view_order"))
+        variant = _stocked_variant()
+        response = self.client.post(SALE_URL, _sale_post(variant.sku, mobile="9876543210"))
+        self.assertEqual(response.status_code, 302)
+        order = Order.objects.get(channel=Order.CHANNEL_IN_STORE)
+        self.assertEqual(order.user, self.asha)
+        self.assertFalse(ShippingAddress.objects.filter(order=order).exists())
+        self.assertEqual(User.objects.filter(mobile_number__endswith="9876543210").count(), 1)

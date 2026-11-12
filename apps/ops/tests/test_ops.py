@@ -183,8 +183,9 @@ class HomeAndNavigationTests(TestCase):
         self.assertEqual([link["key"] for link in response.context["quick_links"]], ["orders"])
         self.assertContains(response, f'href="{LIST_URL}"')
 
-    def test_home_runs_no_domain_queries(self):
-        self.client.force_login(_ops_user())
+    def test_home_runs_no_domain_queries_without_permissions(self):
+        # DEC-019: dashboard widgets run only with their permissions.
+        self.client.force_login(_staff("panel_only", OPS_ACCESS_PERMISSION))
 
         def count():
             with CaptureQueriesContext(connection) as ctx:

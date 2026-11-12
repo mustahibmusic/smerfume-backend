@@ -14,6 +14,7 @@
   {% include "ops/_field.html" with field=filter_form.stock_type %}
   {% include "ops/_field.html" with field=filter_form.warehouse %}
   <label class="check"><input type="checkbox" name="low_stock"{% if filter_form.low_stock.value %} checked{% endif %}> Low stock only</label>
+  {% if can_filter_incoming %}<label class="check"><input type="checkbox" name="no_incoming"{% if filter_form.no_incoming.value %} checked{% endif %}> No booked incoming</label>{% endif %}
   <div class="filters__actions">
     <button type="submit" class="button button--primary">Apply</button>
     {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:stock_list' %}">Clear</a>{% endif %}

@@ -8,6 +8,7 @@ Rows are addressed by public id; warehouses are read-only here
 (configuration stays in Django Admin).
 """
 
+from django.conf import settings
 from django.contrib import messages
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404, redirect
@@ -38,9 +39,12 @@ from apps.ops.forms import (
     ReservationFilterForm,
     StockFilterForm,
 )
+from apps.ops.dashboard_selectors import reservation_warning_cutoff
 from apps.ops.mixins import FilteredListMixin, OpsAccessMixin
+from apps.purchases import selectors as purchase_selectors
 
 VARIANT_RELATED = "variant__edition__product__brand"
+VIEW_PO = "purchases.view_purchaseorder"
 
 
 def _variant_search(prefix=""):
@@ -75,7 +79,11 @@ def _form_errors_to_messages(request, form):
 
 
 class StockListView(OpsAccessMixin, FilteredListMixin, ListView):
-    """GET /ops/inventory/stock/?q=&stock_type=&warehouse=&low_stock=on"""
+    """GET /ops/inventory/stock/?q=&stock_type=&warehouse=&low_stock=on&no_incoming=on
+
+    ``no_incoming`` (users who may view purchase orders only) drops rows
+    with booked incoming units for the same item and warehouse.
+    """
 
     permission_required = ("inventory.view_inventorystock",)
     nav_active = "stock"
@@ -97,7 +105,16 @@ class StockListView(OpsAccessMixin, FilteredListMixin, ListView):
             queryset = queryset.filter(warehouse=data["warehouse"])
         if data.get("low_stock"):
             queryset = inventory_selectors.low_stock(queryset)
+        if data.get("no_incoming") and self.request.user.has_perm(VIEW_PO):
+            queryset = inventory_selectors.exclude_stock_keys(
+                queryset, purchase_selectors.incoming_sellable_by_stock_key(),
+            )
         return queryset
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["can_filter_incoming"] = self.request.user.has_perm(VIEW_PO)
+        return context
 
 
 def _stock_or_404(public_id):
@@ -305,7 +322,12 @@ class MovementListView(OpsAccessMixin, FilteredListMixin, ListView):
 
 
 class ReservationListView(OpsAccessMixin, FilteredListMixin, ListView):
-    """GET /ops/inventory/reservations/?q=&status=&purpose=&warehouse="""
+    """GET /ops/inventory/reservations/?q=&status=&purpose=&warehouse=&past_warning_age=on
+
+    ``past_warning_age``: active reservations older than
+    OPS_DASHBOARD_RESERVATION_WARNING_HOURS (a dashboard warning, not an
+    expiry rule).
+    """
 
     permission_required = ("inventory.view_stockreservation",)
     nav_active = "reservations"
@@ -322,6 +344,10 @@ class ReservationListView(OpsAccessMixin, FilteredListMixin, ListView):
             queryset = queryset.filter(
                 Q(order_item__order__order_number__icontains=data["q"]) | _variant_search()(data["q"])
             )
+        if data.get("past_warning_age"):
+            queryset = inventory_selectors.active_reservations_created_before(
+                queryset, reservation_warning_cutoff(),
+            )
         status = data.get("status")
         if status == "active":
             queryset = inventory_selectors.active_reservations(queryset)
@@ -331,6 +357,11 @@ class ReservationListView(OpsAccessMixin, FilteredListMixin, ListView):
             if data.get(field):
                 queryset = queryset.filter(**{field: data[field]})
         return queryset
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["reservation_warning_hours"] = settings.OPS_DASHBOARD_RESERVATION_WARNING_HOURS
+        return context
 
 
 class ReservationDetailView(OpsAccessMixin, TemplateView):

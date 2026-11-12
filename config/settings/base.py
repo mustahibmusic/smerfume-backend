@@ -473,6 +473,14 @@ MSG91_SENDER_ID = os.getenv("MSG91_SENDER_ID", "SMRFME")
 BOOKED_INCOMING_SALES_ENABLED = os.getenv("BOOKED_INCOMING_SALES_ENABLED", "False") == "True"
 
 
+# ── Smerfume Panel dashboard (DEC-019) ────────────────────────────────────────
+# OPS_DASHBOARD_RESERVATION_WARNING_HOURS (int env var, default 24):
+#   Age at which an active stock reservation is listed as an exception on
+#   the /ops/ Home dashboard. Alerting only: it is NOT a reservation expiry
+#   or release TTL and never changes any reservation.
+OPS_DASHBOARD_RESERVATION_WARNING_HOURS = int(os.getenv("OPS_DASHBOARD_RESERVATION_WARNING_HOURS", "24"))
+
+
 # ── Parfumly catalogue import ──────────────────────────────────────────────────
 # Public, unauthenticated fragrance metadata API used only by the
 # `import_parfumly_brand` management command (apps.catalog.parfumly).

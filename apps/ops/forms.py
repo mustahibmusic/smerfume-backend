@@ -26,6 +26,13 @@ def _with_all(choices):
     return [("", "All"), *choices]
 
 
+# Order list payment filter for "unpaid or partially paid" (DEC-019).
+PAYMENT_OUTSTANDING = "outstanding"
+# PO list payment filter: payable POs with money still to pay (DEC-019),
+# same set as the Home "Vendor outstanding" card.
+PO_PAYMENT_OUTSTANDING = "outstanding"
+
+
 class OrderFilterForm(forms.Form):
     """GET filters for the ops order list. Invalid values are reported and
     ignored; only cleaned values reach the query."""
@@ -34,8 +41,25 @@ class OrderFilterForm(forms.Form):
     status = forms.ChoiceField(required=False, choices=_with_all(Order.STATUS_CHOICES))
     channel = forms.ChoiceField(required=False, choices=_with_all(Order.CHANNEL_CHOICES))
     payment_status = forms.ChoiceField(
-        required=False, choices=_with_all(order_payments.STATUS_CHOICES), label="Payment",
+        required=False, label="Payment",
+        choices=_with_all([(PAYMENT_OUTSTANDING, "Outstanding (unpaid or partially paid)"),
+                           *order_payments.STATUS_CHOICES]),
     )
+    date_from = forms.DateField(
+        required=False, label="From", widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    date_to = forms.DateField(
+        required=False, label="To", widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    cod_unverified = forms.BooleanField(required=False, label="Awaiting COD verification")
+    exclude_cancelled = forms.BooleanField(required=False, label="Exclude cancelled")
+
+    def clean(self):
+        cleaned = super().clean()
+        start, end = cleaned.get("date_from"), cleaned.get("date_to")
+        if start and end and start > end:
+            self.add_error("date_to", "The end date is before the start date.")
+        return cleaned
 
 
 # ── Sales: presentation variants of the shared orders forms ─────────────────
@@ -137,6 +161,8 @@ class StockFilterForm(forms.Form):
     )
     warehouse = _warehouse_filter()
     low_stock = forms.BooleanField(required=False, label="At or below reorder level")
+    # Shown and applied only to users who may view purchase orders.
+    no_incoming = forms.BooleanField(required=False, label="No booked incoming")
 
 
 class PartialLotFilterForm(forms.Form):
@@ -165,6 +191,7 @@ class ReservationFilterForm(forms.Form):
     )
     purpose = forms.ChoiceField(required=False, choices=_with_all(StockReservation.PURPOSE_CHOICES))
     warehouse = _warehouse_filter()
+    past_warning_age = forms.BooleanField(required=False, label="Active, past dashboard warning age")
 
 
 # ── Purchases filters ───────────────────────────────────────────────────────
@@ -186,7 +213,9 @@ class PurchaseOrderFilterForm(forms.Form):
         empty_label="All",
     )
     payment_status = forms.ChoiceField(
-        required=False, choices=_with_all(PAYMENT_STATUS_CHOICES), label="Payment",
+        required=False, label="Payment",
+        choices=_with_all([(PO_PAYMENT_OUTSTANDING, "Outstanding (payable, money to pay)"),
+                           *PAYMENT_STATUS_CHOICES]),
     )
     overdue = forms.BooleanField(required=False, label="Overdue only")
 

@@ -2,7 +2,7 @@
 
 from decimal import ROUND_FLOOR, Decimal
 
-from django.db.models import F, Sum
+from django.db.models import F, Q, Sum
 
 from . import models as inv_models
 from .services.reservation import decant_capacity_ml
@@ -78,3 +78,22 @@ def low_stock(queryset):
 def active_reservations(queryset):
     """Reservations still holding stock (held or confirmed)."""
     return queryset.filter(status__in=ACTIVE_RESERVATION_STATUSES)
+
+
+def out_of_stock(queryset):
+    """InventoryStock rows with no free stock (quantity - reserved <= 0)."""
+    return queryset.filter(quantity__lte=F("quantity_reserved"))
+
+
+def active_reservations_created_before(queryset, cutoff):
+    """Active reservations created before ``cutoff``. A read filter only:
+    it never expires or releases anything."""
+    return active_reservations(queryset).filter(created_at__lt=cutoff)
+
+
+def exclude_stock_keys(queryset, keys):
+    """InventoryStock rows whose (variant_id, warehouse_id) is not in ``keys``."""
+    condition = Q()
+    for variant_id, warehouse_id in keys:
+        condition |= Q(variant_id=variant_id, warehouse_id=warehouse_id)
+    return queryset.exclude(condition) if keys else queryset

@@ -19,7 +19,6 @@ from django.db.models import Count, Q, Sum
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse
-from django.utils import timezone
 from django.views import View
 from django.views.generic import ListView, TemplateView
 
@@ -27,6 +26,7 @@ from apps.inventory.models import Supplier
 from apps.ops.forms import (
     BookedChangeFilterForm,
     DiscrepancyFilterForm,
+    PO_PAYMENT_OUTSTANDING,
     GoodsReceiptFilterForm,
     PaymentLedgerFilterForm,
     PurchaseOrderFilterForm,
@@ -151,7 +151,12 @@ class VendorDetailView(OpsAccessMixin, TemplateView):
 
 
 class PurchaseOrderListView(OpsAccessMixin, FilteredListMixin, ListView):
-    """GET /ops/purchases/orders/?q=&status=&payment_status=&vendor=&overdue=on"""
+    """GET /ops/purchases/orders/?q=&status=&payment_status=&vendor=&overdue=on
+
+    ``payment_status=outstanding`` lists payable POs with money still to
+    pay (``selectors.outstanding_purchase_orders``), the same set as the
+    Home "Vendor outstanding" card; draft and cancelled POs never match.
+    """
 
     permission_required = (VIEW_PO,)
     nav_active = "purchase_orders"
@@ -176,11 +181,13 @@ class PurchaseOrderListView(OpsAccessMixin, FilteredListMixin, ListView):
         if data.get("vendor"):
             queryset = queryset.filter(supplier=data["vendor"])
         if data.get("payment_status") and self.request.user.has_perm(VIEW_PAYMENTS):
-            queryset = queryset.filter(payment_status_db=data["payment_status"])
+            if data["payment_status"] == PO_PAYMENT_OUTSTANDING:
+                # Same set as the Home "Vendor outstanding" card.
+                queryset = queryset.filter(pk__in=selectors.outstanding_purchase_orders().values("pk"))
+            else:
+                queryset = queryset.filter(payment_status_db=data["payment_status"])
         if data.get("overdue"):
-            queryset = queryset.filter(
-                status__in=PurchaseOrder.RECEIVABLE_STATUSES, expected_date__lt=timezone.localdate(),
-            )
+            queryset = selectors.overdue_purchase_orders(queryset)
         return queryset
 
     def get_context_data(self, **kwargs):

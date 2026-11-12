@@ -18,6 +18,7 @@ from django.utils import timezone
 
 from apps.catalog.models import Brand, Category, Product, ProductEdition, ProductVariant
 from apps.inventory.models import InventoryStock, Supplier, Warehouse
+from apps.ops import purchase_forms
 from apps.ops.access import OPS_ACCESS_PERMISSION
 from apps.ops.tests.test_ops import PASSWORD, _perm
 from apps.inventory.services import suppliers as supplier_services
@@ -675,3 +676,91 @@ class VendorAndAccountTests(_Base):
         )
         self.account.refresh_from_db()
         self.assertEqual(self.account.name, "Ops Bank")
+
+
+class SkuFieldEligibilityTests(_Base):
+    """PO lines take active, non-decant variants only; opening receipts and
+    discrepancies keep their own (unrestricted) rules. Lookup stays exact
+    SKU first, then exact barcode, for every form."""
+
+    def setUp(self):
+        super().setUp()
+        self.variant.barcode = "8900000000011"
+        self.variant.save(update_fields=["barcode"])
+        self.inactive = _variant("OPS-PO-INACTIVE")
+        self.inactive.barcode = "8900000000028"
+        self.inactive.is_active = False
+        self.inactive.save(update_fields=["barcode", "is_active"])
+        self.decant = _variant("OPS-PO-DECANT")
+        self.decant.barcode = "8900000000035"
+        self.decant.is_decant = True
+        self.decant.save(update_fields=["barcode", "is_decant"])
+
+    def _po_line(self, code):
+        form = purchase_forms.PurchaseOrderLineForm({"sku": code, "quantity_ordered": "1", "unit_price": "100"})
+        return form, form.is_valid()
+
+    def _opening_line(self, code):
+        form = purchase_forms.OpeningLineForm(
+            {"sku": code, "stock_type": "retail", "quantity": "1", "unit_cost": "100"},
+        )
+        return form, form.is_valid()
+
+    def _discrepancy(self, code):
+        form = purchase_forms.ReceiptDiscrepancyForm(
+            {"discrepancy_type": ReceiptDiscrepancy.TYPE_WRONG_ITEM, "quantity": "1", "sku": code},
+        )
+        return form, form.is_valid()
+
+    def test_po_accepts_active_non_decant_by_sku_and_barcode(self):
+        for code in (self.variant.sku, self.variant.barcode):
+            form, valid = self._po_line(code)
+            self.assertTrue(valid, form.errors)
+            self.assertEqual(form.cleaned_data["sku"], self.variant)
+
+    def test_po_rejects_inactive_by_sku_and_barcode(self):
+        for code in (self.inactive.sku, self.inactive.barcode):
+            form, valid = self._po_line(code)
+            self.assertFalse(valid)
+            self.assertIn("inactive", form.errors["sku"][0])
+
+    def test_po_rejects_decant_by_sku_and_barcode(self):
+        for code in (self.decant.sku, self.decant.barcode):
+            form, valid = self._po_line(code)
+            self.assertFalse(valid)
+            self.assertIn("decants cannot be purchased", form.errors["sku"][0])
+
+    def test_po_page_shows_refusal_and_saves_nothing(self):
+        self.client.force_login(self.owner)
+        response = self.client.post(reverse("ops:po_new"), _po_post(self.supplier, self.warehouse, [
+            {"sku": self.decant.barcode, "quantity_ordered": "1", "unit_price": "100"},
+        ]))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "decants cannot be purchased")
+        self.assertFalse(PurchaseOrder.objects.exists())
+
+    def test_opening_receipt_unchanged(self):
+        for variant in (self.variant, self.inactive, self.decant):
+            for code in (variant.sku, variant.barcode):
+                form, valid = self._opening_line(code)
+                self.assertTrue(valid, form.errors)
+                self.assertEqual(form.cleaned_data["sku"], variant)
+
+    def test_discrepancy_unchanged(self):
+        for variant in (self.variant, self.inactive, self.decant):
+            for code in (variant.sku, variant.barcode):
+                form, valid = self._discrepancy(code)
+                self.assertTrue(valid, form.errors)
+                self.assertEqual(form.cleaned_data["sku"], variant)
+
+    def test_typed_entry_keeps_sku_first_when_sku_equals_another_barcode(self):
+        # Variant A's SKU is variant B's barcode: typed entry finds A (SKU
+        # first), as before; scanner precedence is not applied here.
+        variant_a = _variant("COLLIDE-123")
+        variant_b = _variant("OPS-PO-B")
+        variant_b.barcode = "COLLIDE-123"
+        variant_b.save(update_fields=["barcode"])
+        for build in (self._po_line, self._opening_line, self._discrepancy):
+            form, valid = build("COLLIDE-123")
+            self.assertTrue(valid, form.errors)
+            self.assertEqual(form.cleaned_data["sku"], variant_a)

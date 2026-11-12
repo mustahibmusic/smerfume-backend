@@ -427,6 +427,25 @@ The following apps are registered in `INSTALLED_APPS` but have no models:
 
 ---
 
+## Indexing
+
+Indexes are added only for real query patterns. Primary keys, unique fields,
+foreign keys and unique constraints already create indexes in PostgreSQL.
+
+Query-pattern indexes added by the 2026-11-12 indexing review:
+
+| Model | Index | Query it serves |
+|---|---|---|
+| `Order` | `order_created_id_idx` (`created_at`, `id`) | Order lists sorted by `-created_at, -id` (Smerfume Panel, admin `Meta.ordering`) |
+| `OrderPayment` | `order_payment_date_idx` (`payment_date`) | Home "Collected today" (`payment_date = today`) |
+| `StockMovement` | `stock_movement_created_id_idx` (`created_at`, `id`) | Movement ledger list sorted by `-created_at, -id` |
+| `StockReservation` | `stock_res_active_created_idx` (`created_at`) WHERE `status IN ('held', 'confirmed')` | Home "Reservations past warning age" (active rows older than the cutoff) |
+
+Rule: every model/schema change includes an indexing review of new filter,
+search and order fields, high-frequency joins, dashboard queries and list
+filters. If no index is needed, the reason is recorded. See `.claude/CLAUDE.md`
+"Indexing Review".
+
 ## Entity Relationship Overview
 
 ```

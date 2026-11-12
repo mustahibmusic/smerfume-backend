@@ -165,6 +165,8 @@ Do not record trivial implementation details.
 - Prefer Django ORM.
 - Follow existing project conventions.
 - Before modifying a model, inspect its current relationships and migrations.
+- Every model/schema change must include an indexing review (see
+  "Indexing Review" below).
 - Do not generate migrations unless model changes require them.
 - Run relevant tests after changes.
 - Do not commit directly without explicitly asking for confirmation.
@@ -173,6 +175,32 @@ Do not record trivial implementation details.
 - Prefer small, incremental changes.
 - Explain architectural changes before implementing them.
 - Maintain PEP-8 standards.
+
+## Indexing Review
+
+Every model/schema change must include an indexing review:
+
+- new filter/search/order fields
+- new high-frequency joins
+- new dashboard queries
+- new list-page filters
+
+must explicitly consider whether an index or composite index is needed.
+If not needed, record why (in the PR description or the change notes).
+
+When reviewing:
+
+- Check the real database first (`pg_indexes`): primary keys, `unique=True`,
+  foreign keys, `db_index=True`, `Meta.indexes` and unique constraints
+  already create indexes. Do not duplicate them or their left prefix.
+- Match the index column order to the common filter + `ORDER BY`.
+- `created_at__date` (and other `__date` lookups on a `DateTimeField`) is
+  not index-friendly on PostgreSQL with `USE_TZ`; a `created_at` index
+  only helps range filters (`created_at__gte` / `__lt`).
+- Use a partial index only when queries target a small, stable subset
+  (for example active reservations) and repeat the same predicate.
+- Small, low-volume tables (vendors, POs, GRNs) usually need no extra index.
+- Every index adds write and storage cost; prefer a few high-value ones.
 
 ## Third-Party Integrations
 

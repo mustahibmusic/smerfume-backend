@@ -149,6 +149,10 @@ class Order(BaseModel):
     class Meta:
         db_table = "orders_order"
         ordering = ["-created_at"]
+        indexes = [
+            # Order list pages (ops and admin) sort by -created_at, -id.
+            models.Index(fields=["created_at", "id"], name="order_created_id_idx"),
+        ]
         permissions = [
             ("verify_cod_order", "Can verify COD order"),
             ("pack_order", "Can pack order"),
@@ -580,6 +584,10 @@ class OrderPayment(BaseModel):
     class Meta:
         db_table = "orders_orderpayment"
         ordering = ["payment_date", "id"]
+        indexes = [
+            # Home "Collected today": payments filtered by payment_date.
+            models.Index(fields=["payment_date"], name="order_payment_date_idx"),
+        ]
         constraints = [
             models.CheckConstraint(condition=models.Q(amount__gt=0), name="order_payment_amount_gt_0"),
             models.CheckConstraint(

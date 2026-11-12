@@ -19,6 +19,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import Sum
 from django.utils import timezone
 
+from apps.accounts.mobile import mask_mobile, normalize_indian_mobile
 from apps.inventory.models import (
     DecantSource,
     InventoryStock,
@@ -62,7 +63,9 @@ def resolve_customer_by_mobile(mobile, email=None, name=""):
     the Order (guest_email).
     """
     User = get_user_model()
-    mobile_normalized = mobile.strip()
+    # Same rule as validation, so 9876543210 and +919876543210 are one
+    # customer. Callers pass validated values; this keeps the guarantee.
+    mobile_normalized = normalize_indian_mobile(mobile)
 
     user, created = User.objects.get_or_create(
         mobile_number=mobile_normalized,
@@ -77,7 +80,7 @@ def resolve_customer_by_mobile(mobile, email=None, name=""):
     if created:
         user.set_unusable_password()
         user.save(update_fields=["password"])
-        logger.info("Created customer user (pk=%s) for mobile %s", user.pk, mobile_normalized)
+        logger.info("Created customer user (pk=%s) for mobile %s", user.pk, mask_mobile(mobile_normalized))
 
     if created and email and _email_available(email, user):
         try:

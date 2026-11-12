@@ -1,6 +1,8 @@
 from django.urls import path, re_path
 
-from apps.ops.views import catalog, customers, inventory, list_pages, payments, purchase_drafts, purchases, refunds, returns, sales
+from apps.ops.views import (
+    catalog, customers, inventory, list_pages, lookups, payments, purchase_drafts, purchases, refunds, returns, sales,
+)
 from apps.ops.views.auth import OpsLoginView, OpsLogoutView, OpsPasswordChangeView
 from apps.ops.views.home import OpsHomeView, OpsNotFoundView, OpsProfileView
 from apps.ops.views.orders import OrderDetailView
@@ -49,6 +51,11 @@ urlpatterns = [
         name="order_record_payment",
     ),
     path("sales/new/", sales.InStoreSaleView.as_view(), name="in_store_sale"),
+    path("lookup/customers/", lookups.CustomerLookupView.as_view(), name="customer_lookup"),
+    path(
+        "lookup/customers/<uuid:public_id>/last-address/", lookups.CustomerLastAddressView.as_view(),
+        name="customer_last_address",
+    ),
     path("sales/items/", sales.InStoreItemSearchView.as_view(), name="in_store_items"),
     path("returns/", list_pages.ReturnListPage.as_view(), name="return_list"),
     path("returns/bulk/", list_pages.ReturnBulkView.as_view(), name="return_bulk"),

@@ -325,6 +325,196 @@
     form.querySelector("[data-sale-add]").addEventListener("click", addLine);
   }
 
+  // In-store sale: find the customer by mobile number. Suggestions from 6
+  // digits; a full 10-digit number matching one customer selects it. The
+  // server still resolves the customer from the mobile on submit.
+  function initCustomerLookup() {
+    var box = document.querySelector("[data-customer-lookup]");
+    var form = document.querySelector("[data-sale-form]");
+    if (!box || !form) {
+      return;
+    }
+    var mobile = form.querySelector("input[name='customer_mobile']");
+    var name = form.querySelector("input[name='customer_name']");
+    var status = box.querySelector("[data-customer-status]");
+    var list = box.querySelector("[data-customer-results]");
+    var selected = box.querySelector("[data-customer-selected]");
+    var addressNote = box.querySelector("[data-customer-address]");
+    var addressView = box.querySelector("[data-customer-address-view]");
+    var addressCard = box.querySelector("[data-customer-address-card]");
+    var url = box.getAttribute("data-url");
+    var addressUrl = box.getAttribute("data-address-url");
+    var timer = null;
+    var request = 0;
+    var current = null;
+
+    function clearList() {
+      list.innerHTML = "";
+      list.hidden = true;
+    }
+
+    function hideAddress() {
+      addressCard.hidden = true;
+      addressCard.innerHTML = "";
+      addressView.setAttribute("aria-expanded", "false");
+    }
+
+    function unselect() {
+      current = null;
+      selected.hidden = true;
+      addressNote.hidden = true;
+      hideAddress();
+      name.readOnly = false;
+    }
+
+    function select(customer) {
+      current = customer;
+      clearList();
+      mobile.value = customer.mobile;
+      name.value = customer.name;
+      name.readOnly = true;
+      status.textContent = "Existing customer: " + (customer.name || "no name on record") + " · " + customer.mobile;
+      selected.hidden = false;
+      addressNote.hidden = !customer.has_last_address;
+      hideAddress();
+    }
+
+    function show(data) {
+      clearList();
+      if (data.status === "too_short") {
+        status.textContent = "";
+        return;
+      }
+      if (data.status === "unsupported") {
+        status.textContent = "Customer search works with local 10-digit numbers.";
+        return;
+      }
+      if (data.exact) {
+        var match = data.results.filter(function (c) { return c.mobile.slice(-10) === digits().slice(-10); })[0];
+        if (match) {
+          select(match);
+          return;
+        }
+      }
+      if (!data.results.length) {
+        status.textContent = digits().length >= 10
+          ? "No customer with this number. A new customer will be created with the name you enter."
+          : "No matching customers yet.";
+        return;
+      }
+      status.textContent = data.results.length + (data.truncated ? "+" : "") + " matching customer"
+        + (data.results.length === 1 ? "" : "s") + ". Choose one or keep typing.";
+      data.results.forEach(function (customer) {
+        var item = document.createElement("li");
+        var button = document.createElement("button");
+        button.type = "button";
+        button.className = "customer-lookup__option";
+        var title = document.createElement("span");
+        title.textContent = (customer.name || "No name on record") + " · " + customer.mobile;
+        button.appendChild(title);
+        if (customer.email) {
+          var email = document.createElement("small");
+          email.textContent = customer.email;
+          button.appendChild(email);
+        }
+        button.addEventListener("click", function () {
+          select(customer);
+          name.focus();
+        });
+        item.appendChild(button);
+        list.appendChild(item);
+      });
+      list.hidden = false;
+    }
+
+    function digits() {
+      return mobile.value.replace(/[^0-9]/g, "");
+    }
+
+    function lookup() {
+      var value = mobile.value.trim();
+      var mine = ++request;
+      fetch(url + "?" + new URLSearchParams({ mobile: value }).toString(), { credentials: "same-origin" })
+        .then(function (response) { return response.ok ? response.json() : null; })
+        .then(function (data) {
+          if (mine !== request) {
+            return;  // a newer lookup is on its way
+          }
+          if (!data) {
+            status.textContent = "Customer search is unavailable. You can still record the sale.";
+            return;
+          }
+          show(data);
+        })
+        .catch(function () {
+          status.textContent = "Customer search is unavailable. You can still record the sale.";
+        });
+    }
+
+    mobile.addEventListener("input", function () {
+      if (current) {
+        unselect();
+        name.value = "";
+      }
+      window.clearTimeout(timer);
+      timer = window.setTimeout(lookup, 250);
+    });
+
+    box.querySelector("[data-customer-change]").addEventListener("click", function () {
+      unselect();
+      name.value = "";
+      mobile.value = "";
+      status.textContent = "";
+      mobile.focus();
+    });
+
+    addressView.addEventListener("click", function () {
+      if (!current) {
+        return;
+      }
+      if (!addressCard.hidden) {
+        hideAddress();
+        return;
+      }
+      fetch(addressUrl.replace("00000000-0000-0000-0000-000000000000", current.id), { credentials: "same-origin" })
+        .then(function (response) { return response.ok ? response.json() : { address: null }; })
+        .then(function (data) {
+          var a = data.address;
+          addressCard.innerHTML = "";
+          if (!a) {
+            addressCard.textContent = "No delivery address found.";
+          } else {
+            var dl = document.createElement("dl");
+            dl.className = "dl";
+            [
+              ["Name", a.full_name], ["Mobile", a.mobile],
+              ["Address", [a.address_line1, a.address_line2].filter(Boolean).join(", ")],
+              ["City", a.city], ["State", a.state], ["PIN code", a.pincode],
+            ].forEach(function (row) {
+              var dt = document.createElement("dt");
+              var dd = document.createElement("dd");
+              dt.textContent = row[0];
+              dd.textContent = row[1] || "—";
+              dl.appendChild(dt);
+              dl.appendChild(dd);
+            });
+            var note = document.createElement("p");
+            note.className = "muted";
+            note.textContent = "Read-only. Not added to this sale.";
+            addressCard.appendChild(dl);
+            addressCard.appendChild(note);
+          }
+          addressCard.hidden = false;
+          addressView.setAttribute("aria-expanded", "true");
+        })
+        .catch(function () { addressCard.textContent = "Address unavailable."; addressCard.hidden = false; });
+    });
+
+    if (mobile.value.trim()) {
+      lookup();  // re-rendered form after an error keeps the selection
+    }
+  }
+
   // Generic formset tables: "+ Add row" copies the empty form.
   function initFormsets() {
     document.querySelectorAll("[data-formset]").forEach(function (box) {
@@ -500,6 +690,7 @@
     initFilterToggle();
     initForms();
     initSale();
+    initCustomerLookup();
     initFormsets();
     initListSelection();
     initQuickView();

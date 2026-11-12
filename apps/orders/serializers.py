@@ -4,6 +4,7 @@ from decimal import Decimal
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
+from apps.accounts.mobile import InvalidMobileNumber, normalize_indian_mobile
 from apps.catalog.models import ProductVariant
 from apps.catalog.serializers import ProductVariantSerializer
 from apps.inventory.models import Warehouse
@@ -16,11 +17,13 @@ NOTE_MAX_LENGTH = 1000
 
 
 def validate_mobile_number(value):
-    """Shared mobile-number rule for checkout and in-store sales."""
-    value = value.strip()
-    if not re.fullmatch(r"\+?[0-9]{10,15}", value):
-        raise serializers.ValidationError("Enter a valid mobile number.")
-    return value
+    """Shared mobile-number rule for checkout and in-store sales: the
+    canonical form from apps.accounts.mobile (local numbers become
+    +91XXXXXXXXXX; international + numbers are kept)."""
+    try:
+        return normalize_indian_mobile(value)
+    except InvalidMobileNumber as exc:
+        raise serializers.ValidationError(str(exc)) from exc
 
 
 class ShippingAddressSerializer(serializers.ModelSerializer):

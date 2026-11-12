@@ -877,7 +877,7 @@ class AccountsAdminQueryCountTests(AdminQueryCountMixin, TestCase):
 
 from decimal import Decimal  # noqa: E402
 
-from apps.orders.models import Order, Return, ShippingAddress  # noqa: E402
+from apps.orders.models import Order, OrderItem, Return, ShippingAddress  # noqa: E402
 
 
 class CustomerOperationsViewTests(TestCase):
@@ -1052,3 +1052,299 @@ class SupplierPaymentGroupPermissionTests(TestCase):
             self.assertNotIn("purchases.delete_paymentaccount", group)
         for group in (ops, warehouse):
             self.assertFalse(group & ({"purchases.post_po_payment", "purchases.view_paymentaccount"} | account_admin))
+
+
+# ── Contact-number canonicalisation ──────────────────────────────────────────
+
+import importlib  # noqa: E402
+
+from django.apps import apps as django_apps  # noqa: E402
+from rest_framework import serializers as drf_serializers  # noqa: E402
+
+from apps.accounts import mobile as mobile_rules  # noqa: E402
+from apps.accounts.mobile_cleanup import canonicalize  # noqa: E402
+from apps.accounts.serializers import _normalize_indian_mobile  # noqa: E402
+from apps.cart.models import Cart  # noqa: E402
+from apps.orders.services import resolve_customer_by_mobile  # noqa: E402
+
+
+class MobileNormalizerTests(TestCase):
+    def test_any_ten_digit_local_number_gets_plus_91(self):
+        for raw, canonical in (
+            ("0123456789", "+910123456789"), ("2123456789", "+912123456789"),
+            ("5123456789", "+915123456789"), ("9876543210", "+919876543210"),
+        ):
+            self.assertEqual(mobile_rules.normalize_indian_mobile(raw), canonical)
+
+    def test_equivalent_forms_are_one_number(self):
+        for raw in ("9876543210", "09876543210", "919876543210", "+919876543210",
+                    "+91 98765-43210", " (98765) 43210 ", "+91 09876543210"):
+            self.assertEqual(mobile_rules.normalize_indian_mobile(raw), "+919876543210", raw)
+
+    def test_only_the_extra_trunk_zero_is_dropped(self):
+        self.assertEqual(mobile_rules.normalize_indian_mobile("00123456789"), "+910123456789")
+        self.assertEqual(mobile_rules.normalize_indian_mobile("0123456789"), "+910123456789")
+
+    def test_international_and_legacy_numbers_are_kept(self):
+        self.assertEqual(mobile_rules.normalize_indian_mobile("+447911123456"), "+447911123456")
+        self.assertEqual(mobile_rules.normalize_indian_mobile("+1 415 555 0100"), "+14155550100")
+        self.assertEqual(mobile_rules.normalize_indian_mobile("1234567890123"), "1234567890123")
+
+    def test_invalid_values(self):
+        for raw in ("", "987654321", "98765abcde", "+1234", "1234567890123456", "+91987654321"):
+            with self.assertRaises(mobile_rules.InvalidMobileNumber, msg=raw):
+                mobile_rules.normalize_indian_mobile(raw)
+
+    def test_otp_takes_local_numbers_only_with_any_first_digit(self):
+        self.assertEqual(_normalize_indian_mobile("0123456789"), "+910123456789")
+        self.assertEqual(_normalize_indian_mobile("+919876543210"), "+919876543210")
+        with self.assertRaises(drf_serializers.ValidationError):
+            _normalize_indian_mobile("+447911123456")
+
+    def test_lookup_prefix(self):
+        prefix = mobile_rules.mobile_lookup_prefix
+        self.assertIsNone(prefix("98765"))
+        self.assertEqual(prefix("987654"), "+91987654")
+        self.assertEqual(prefix("012345"), "+91012345")  # a leading zero stays part of the number
+        self.assertIsNone(prefix("+91 98765"))  # 5 local digits
+        self.assertEqual(prefix("+91987654"), "+91987654")
+        self.assertEqual(prefix("09876543210"), "+919876543210")
+        self.assertEqual(prefix("919876543210"), "+919876543210")
+        self.assertIsNone(prefix("+447911123456"))
+        self.assertIsNone(prefix("98765abc"))
+
+    def test_mask(self):
+        self.assertEqual(mobile_rules.mask_mobile("+919876543210"), "******3210")
+
+
+class ResolveCustomerByMobileTests(TestCase):
+    def test_equivalent_forms_resolve_to_one_customer(self):
+        first = resolve_customer_by_mobile("9876543210")
+        self.assertEqual(first.mobile_number, "+919876543210")
+        for raw in ("+919876543210", "09876543210", "919876543210"):
+            self.assertEqual(resolve_customer_by_mobile(raw), first)
+        self.assertEqual(User.objects.filter(mobile_number__endswith="9876543210").count(), 1)
+
+    def test_international_number_kept(self):
+        self.assertEqual(resolve_customer_by_mobile("+447911123456").mobile_number, "+447911123456")
+
+    def test_new_customer_log_masks_mobile(self):
+        with self.assertLogs("apps.orders.services", level="INFO") as logs:
+            resolve_customer_by_mobile("9876500001")
+        self.assertNotIn("9876500001", "".join(logs.output))
+        self.assertIn("******0001", "".join(logs.output))
+
+
+def _mobile_user(username, mobile, **extra):
+    user = User(username=username, mobile_number=mobile, role="customer", email=None, **extra)
+    user.set_unusable_password()
+    user.save()
+    return user
+
+
+def _cart_variant():
+    from apps.catalog.models import Brand, Category, Product, ProductEdition, ProductVariant
+
+    brand = Brand.objects.create(name="MobBrand", slug="mobbrand")
+    category = Category.objects.create(name="MobCat", slug="mobcat")
+    product = Product.objects.create(name="MobProduct", slug="mobproduct", brand=brand, category=category)
+    edition = ProductEdition.objects.create(product=product, name="EDP", concentration="edp", gender="unisex")
+    return ProductVariant.objects.create(edition=edition, size_ml=50, sku="MOB-1", selling_price="1", mrp="1")
+
+
+class MobileCanonicalisationTests(TestCase):
+    def test_canonicalize_converts_and_skips_collisions_and_is_idempotent(self):
+        bare = _mobile_user("bare", "9000000001")
+        trunk = _mobile_user("trunk", "09000000002")
+        zero_first = _mobile_user("zero", "0123456789")
+        clash_a = _mobile_user("clash_a", "9000000003")
+        clash_b = _mobile_user("clash_b", "+919000000003")
+        foreign = _mobile_user("foreign", "+447911123456")
+        legacy = _mobile_user("legacy", "1234567890123")
+
+        result = canonicalize(User)
+        self.assertEqual(result, {"updated": 3, "already": 0, "collisions": 1, "unrecognised": 2})
+        for user, expected in (
+            (bare, "+919000000001"), (trunk, "+919000000002"), (zero_first, "+910123456789"),
+            (clash_a, "9000000003"), (clash_b, "+919000000003"),
+            (foreign, "+447911123456"), (legacy, "1234567890123"),
+        ):
+            user.refresh_from_db()
+            self.assertEqual(user.mobile_number, expected)
+        self.assertEqual(canonicalize(User)["updated"], 0)  # a second run changes nothing
+
+    def test_migration_function_uses_the_same_rules(self):
+        _mobile_user("mig", "9000000009")
+        migration = importlib.import_module("apps.accounts.migrations.0005_canonical_mobile_numbers")
+        migration.forwards(django_apps, None)
+        self.assertTrue(User.objects.filter(mobile_number="+919000000009").exists())
+
+
+class MobileCollisionCommandTests(TestCase):
+    def setUp(self):
+        self.with_orders = _mobile_user("keep_me", "9000000005")
+        Order.objects.create(user=self.with_orders, order_number="SMR-MOB-000001", subtotal=1, total=1)
+        self.empty = _mobile_user("retire_me", "+919000000005")
+
+    def _resolve(self, keep, retire, **options):
+        call_command("resolve_mobile_collision", keep=str(keep.public_id), retire=str(retire.public_id),
+                     stdout=StringIO(), **options)
+
+    def test_audit_reports_masked_collision_and_fails_until_resolved(self):
+        out = StringIO()
+        with self.assertRaises(CommandError):
+            call_command("audit_mobile_numbers", stdout=out)
+        text = out.getvalue()
+        self.assertIn("Collisions: 1", text)
+        self.assertIn("******0005", text)
+        self.assertNotIn("9000000005", text)
+        self.assertIn("orders 1", text)
+        self.empty.refresh_from_db()
+        self.assertEqual(self.empty.mobile_number, "+919000000005")  # read-only
+
+    def test_resolve_dry_run_changes_nothing(self):
+        self._resolve(self.with_orders, self.empty, dry_run=True)
+        self.empty.refresh_from_db()
+        self.assertEqual((self.empty.mobile_number, self.empty.is_active), ("+919000000005", True))
+
+    def test_resolve_retires_empty_duplicate_then_audit_passes(self):
+        self._resolve(self.with_orders, self.empty)
+        self.empty.refresh_from_db()
+        self.assertEqual((self.empty.mobile_number, self.empty.is_active), (None, False))
+        self.assertEqual(Order.objects.get().user, self.with_orders)  # nothing moved or merged
+        call_command("audit_mobile_numbers", stdout=StringIO())  # no collision left
+        call_command("canonicalize_mobiles", stdout=StringIO())
+        self.with_orders.refresh_from_db()
+        self.assertEqual(self.with_orders.mobile_number, "+919000000005")
+
+    def test_resolve_refuses_accounts_with_history(self):
+        with self.assertRaisesMessage(CommandError, "history"):
+            self._resolve(self.empty, self.with_orders)
+        cart = Cart.objects.create(user=self.empty)
+        cart.items.create(variant=_cart_variant(), quantity=1)
+        with self.assertRaisesMessage(CommandError, "cart items"):
+            self._resolve(self.with_orders, self.empty)
+        self.empty.refresh_from_db()
+        self.assertTrue(self.empty.is_active)
+
+    def test_resolve_refuses_staff_and_different_numbers(self):
+        other = _mobile_user("other", "9000000006")
+        with self.assertRaisesMessage(CommandError, "same local number"):
+            self._resolve(self.with_orders, other)
+        User.objects.filter(pk=self.empty.pk).update(is_staff=True)
+        with self.assertRaisesMessage(CommandError, "customer account"):
+            self._resolve(self.with_orders, self.empty)
+
+
+class MobileCollisionMergeOrdersTests(TestCase):
+    """--merge-orders: the explicit business decision to move a duplicate's
+    Orders to the kept account and retire the duplicate."""
+
+    def setUp(self):
+        from apps.ops.tests.test_ops import _order, _pay
+        from apps.orders.models import OrderPayment, Refund, ShippingAddress
+
+        self.OrderPayment, self.Refund, self.ShippingAddress = OrderPayment, Refund, ShippingAddress
+        self.kept = _mobile_user("otp_user", "+919000000007")
+        OTPVerification.objects.create(
+            user=self.kept, otp_hash="x", expires_at=timezone.now(), is_verified=True,
+        )
+        self.retired = _mobile_user("bare_user", "9000000007")
+        self.staff = User.objects.create_user(username="cashier", email="cashier@example.com", password="x",
+                                              is_staff=True)
+        self.orders = []
+        for n in (71, 72):
+            order = _order(n)
+            Order.objects.filter(pk=order.pk).update(user=self.retired)
+            self.orders.append(order)
+        _pay(self.orders[0], "1000.00", self.staff)
+        ShippingAddress.objects.create(
+            order=self.orders[0], full_name="Asha", mobile="+919000000007", address_line1="1 MG Road",
+            city="Pune", state="MH", pincode="411001",
+        )
+        returned = Return.objects.create(order=self.orders[1], status=Return.STATUS_COMPLETED)
+        Refund.objects.create(return_request=returned, refund_amount=Decimal("10.00"),
+                              refund_status=Refund.STATUS_COMPLETED, refund_method=Refund.METHOD_BANK_TRANSFER)
+
+    def _resolve(self, keep=None, retire=None, **options):
+        out = StringIO()
+        call_command("resolve_mobile_collision", keep=str((keep or self.kept).public_id),
+                     retire=str((retire or self.retired).public_id), stdout=out, **options)
+        return out.getvalue()
+
+    def _children(self):
+        return (
+            sorted(Order.objects.filter(pk__in=[o.pk for o in self.orders]).values_list("user_id", flat=True)),
+            OrderItem.objects.filter(order__in=self.orders).count(),
+            self.OrderPayment.objects.filter(order__in=self.orders).count(),
+            Return.objects.filter(order__in=self.orders).count(),
+            self.Refund.objects.filter(return_request__order__in=self.orders).count(),
+            self.ShippingAddress.objects.filter(order__in=self.orders).count(),
+        )
+
+    def test_default_mode_still_refuses_when_both_have_history(self):
+        with self.assertRaisesMessage(CommandError, "history"):
+            self._resolve()
+        with self.assertRaisesMessage(CommandError, "history"):
+            self._resolve(keep=self.retired, retire=self.kept)
+
+    def test_dry_run_reports_and_writes_nothing(self):
+        before = self._children()
+        text = self._resolve(merge_orders=True, dry_run=True)
+        self.assertIn("Orders to move: 2", text)
+        self.assertIn("Direct relations (retire): orders.Order.user=2", text)
+        self.assertIn("accounts.OTPVerification.user=1", text)  # reported for the kept account
+        self.assertIn("Blockers: none", text)
+        self.assertIn("******0007", text)
+        self.assertNotIn("9000000007", text)
+        self.assertEqual(self._children(), before)
+        self.retired.refresh_from_db()
+        self.assertEqual((self.retired.mobile_number, self.retired.is_active), ("9000000007", True))
+
+    def test_merge_moves_orders_and_keeps_their_children(self):
+        _, items, payments, returns, refunds, addresses = self._children()
+        with self.assertLogs("apps.accounts.management.commands.resolve_mobile_collision", level="INFO") as logs:
+            text = self._resolve(merge_orders=True)
+        self.assertEqual(self._children(), ([self.kept.pk, self.kept.pk], items, payments, returns, refunds,
+                                            addresses))
+        self.assertEqual((items, payments, returns, refunds, addresses), (2, 1, 1, 1, 1))
+        self.retired.refresh_from_db()
+        self.assertEqual((self.retired.mobile_number, self.retired.is_active), (None, False))
+        self.kept.refresh_from_db()
+        self.assertEqual((self.kept.mobile_number, self.kept.is_active), ("+919000000007", True))
+        self.assertEqual(self.kept.otps.count(), 1)  # nothing else touched
+        self.assertNotIn("9000000007", text + "".join(logs.output))
+        self.assertIn("orders moved 2", "".join(logs.output))
+        call_command("audit_mobile_numbers", stdout=StringIO())  # collision gone
+
+    def test_unsupported_history_on_retired_account_refuses(self):
+        OTPVerification.objects.create(user=self.retired, otp_hash="x", expires_at=timezone.now())
+        before = self._children()
+        with self.assertRaisesMessage(CommandError, "accounts.OTPVerification.user=1"):
+            self._resolve(merge_orders=True)
+        self.assertEqual(self._children(), before)
+        User.objects.filter(pk=self.retired.pk).update(last_login=timezone.now())
+        OTPVerification.objects.filter(user=self.retired).delete()
+        with self.assertRaisesMessage(CommandError, "last login recorded"):
+            self._resolve(merge_orders=True)
+
+    def test_different_numbers_and_staff_refused(self):
+        other = _mobile_user("other_num", "9000000009")
+        with self.assertRaisesMessage(CommandError, "same local number"):
+            self._resolve(retire=other, merge_orders=True)
+        User.objects.filter(pk=self.retired.pk).update(is_superuser=True)
+        with self.assertRaisesMessage(CommandError, "customer account"):
+            self._resolve(merge_orders=True)
+        User.objects.filter(pk=self.retired.pk).update(is_superuser=False)
+        User.objects.filter(pk=self.kept.pk).update(is_staff=True)
+        with self.assertRaisesMessage(CommandError, "active customer account"):
+            self._resolve(merge_orders=True)
+
+    def test_failure_rolls_back_everything(self):
+        before = self._children()
+        with patch.object(User, "save", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self._resolve(merge_orders=True)
+        self.assertEqual(self._children(), before)  # orders not moved
+        self.retired.refresh_from_db()
+        self.assertEqual((self.retired.mobile_number, self.retired.is_active), ("9000000007", True))

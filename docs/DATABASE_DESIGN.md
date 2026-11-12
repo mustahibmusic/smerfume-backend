@@ -441,6 +441,13 @@ Query-pattern indexes added by the 2026-11-12 indexing review:
 | `StockMovement` | `stock_movement_created_id_idx` (`created_at`, `id`) | Movement ledger list sorted by `-created_at, -id` |
 | `StockReservation` | `stock_res_active_created_idx` (`created_at`) WHERE `status IN ('held', 'confirmed')` | Home "Reservations past warning age" (active rows older than the cutoff) |
 
+Indexing review, contact numbers (2026-11-13): no new index. Exact lookups
+(`mobile_number = '+91…'`) use the unique btree on `accounts_user.mobile_number`;
+the in-store customer search (`mobile_number LIKE '+91<digits>%'`) uses the
+existing `mobile_number varchar_pattern_ops` btree (EXPLAIN: Index Cond with
+`~>=~` / `~<~`). Only prefix search is offered; a "contains" search would not
+be indexable. `CustomerProfile.mobile` is never searched.
+
 Rule: every model/schema change includes an indexing review of new filter,
 search and order fields, high-frequency joins, dashboard queries and list
 filters. If no index is needed, the reason is recorded. See `.claude/CLAUDE.md`

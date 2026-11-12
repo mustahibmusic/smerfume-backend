@@ -28,6 +28,9 @@ def _with_all(choices):
 
 # Order list payment filter for "unpaid or partially paid" (DEC-019).
 PAYMENT_OUTSTANDING = "outstanding"
+# PO list payment filter: payable POs with money still to pay (DEC-019),
+# same set as the Home "Vendor outstanding" card.
+PO_PAYMENT_OUTSTANDING = "outstanding"
 
 
 class OrderFilterForm(forms.Form):
@@ -49,6 +52,7 @@ class OrderFilterForm(forms.Form):
         required=False, label="To", widget=forms.DateInput(attrs={"type": "date"}),
     )
     cod_unverified = forms.BooleanField(required=False, label="Awaiting COD verification")
+    exclude_cancelled = forms.BooleanField(required=False, label="Exclude cancelled")
 
     def clean(self):
         cleaned = super().clean()
@@ -209,7 +213,9 @@ class PurchaseOrderFilterForm(forms.Form):
         empty_label="All",
     )
     payment_status = forms.ChoiceField(
-        required=False, choices=_with_all(PAYMENT_STATUS_CHOICES), label="Payment",
+        required=False, label="Payment",
+        choices=_with_all([(PO_PAYMENT_OUTSTANDING, "Outstanding (payable, money to pay)"),
+                           *PAYMENT_STATUS_CHOICES]),
     )
     overdue = forms.BooleanField(required=False, label="Overdue only")
 

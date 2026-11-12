@@ -24,12 +24,15 @@ VIEW_ORDER = "orders.view_order"
 
 
 class OrderListView(OpsAccessMixin, ListView):
-    """GET /ops/orders/?q=&status=&channel=&payment_status=&date_from=&date_to=&cod_unverified=on&page=
+    """GET /ops/orders/?q=&status=&channel=&payment_status=&date_from=&date_to=
+    &cod_unverified=on&exclude_cancelled=on&page=
 
     Newest first, 25 per page. ``q`` matches order number, customer
     name/mobile/email and shipping name/mobile. Invalid filter values are
     reported and ignored. ``payment_status=outstanding`` means unpaid or
-    partially paid; dates filter on the local order date. An out-of-range
+    partially paid; dates filter on the local order date;
+    ``exclude_cancelled`` keeps the order-value set used by the Home
+    "Sales today" card (``orders.selectors.order_value_orders``). An out-of-range
     or non-numeric ``page`` returns the branded 404 (Django paginator
     behaviour).
     """
@@ -73,6 +76,8 @@ class OrderListView(OpsAccessMixin, ListView):
             queryset = queryset.filter(created_at__date__lte=data["date_to"])
         if data.get("cod_unverified"):
             queryset = order_selectors.orders_awaiting_cod_verification(queryset)
+        if data.get("exclude_cancelled"):
+            queryset = order_selectors.order_value_orders(queryset)
         return queryset
 
     def get_context_data(self, **kwargs):

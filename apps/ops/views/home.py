@@ -219,13 +219,12 @@ class OpsHomeView(OpsAccessMixin, TemplateView):
                 presenters.order_row_basic(order) for order in widgets.get("waiting_to_ship", [])
             ],
             "links": {
-                "today_orders": _order_list(date_from=today, date_to=today),
+                "today_orders": _order_list(date_from=today, date_to=today, exclude_cancelled="on"),
                 "in_store_outstanding": _order_list(channel="in_store", payment_status="outstanding"),
                 "confirmed": _order_list(status="confirmed"),
                 "processing": _order_list(status="processing"),
                 "low_stock": _url("ops:stock_list", (("stock_type", "retail"), ("low_stock", "on"))),
-                "po_unpaid": _url("ops:po_list", (("payment_status", "unpaid"),)),
-                "po_partially_paid": _url("ops:po_list", (("payment_status", "partially_paid"),)),
+                "po_outstanding": _url("ops:po_list", (("payment_status", "outstanding"),)),
             },
             "reservation_warning_hours": settings.OPS_DASHBOARD_RESERVATION_WARNING_HOURS,
         })

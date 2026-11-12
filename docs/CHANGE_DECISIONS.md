@@ -495,6 +495,71 @@ Counter sales are routinely paid in more than one part. A single method and refe
 
 ---
 
+## DEC-019 — Smerfume Panel Dashboard Strategy
+
+### Original Product Bible Requirement
+The Product Bible has no dashboard specification. The Admin ERP roadmap lists "Phase 3: dashboard/KPIs, reporting" with no detail.
+
+### Updated Decision
+1. **Purpose.** `/ops/` Home is built around operations and exceptions. It shows today's position and what needs action. It is not an analytics or accounting report.
+2. **Home P0 contents.** Sales today, orders today, collected today, in-store balance due, to fulfil, low/out of stock, vendor outstanding (operational), a 30-day order value chart, an exceptions panel, oldest outstanding in-store orders, orders waiting to ship, and quick actions.
+3. **Sales wording.** The sum of `Order.total` excluding `cancelled` orders is called "Sales today" or "Order value today". It is never called "Net sales". A net-after-refunds metric is a separate metric and is not P0.
+4. **Balance due scope.** `OrderPayment` (CPAY) is not yet authoritative for online prepaid or COD collections. So P0 shows only "In-store balance due", computed with `orders_open_for_manual_payment()`.
+   - Online and COD orders must never appear unpaid because they have no CPAY rows.
+   - The metric may become channel-independent once online and COD collections post into `OrderPayment`. That change needs a later decision.
+5. **Record Payment.** Manual Record Payment is for in-store orders only. Every dashboard path to it leads only to in-store orders with payment status `unpaid` or `partially_paid`.
+   - The order list filter `payment_status=outstanding` means unpaid or partially paid. On these paths it is always combined with `channel=in_store`.
+6. **Vendor outstanding.** Uses the existing supplier-payment summary logic (`annotate_payment_summary()`) and its eligible statuses (`PurchaseOrder.PAYABLE_STATUSES`). The dashboard defines no PO status or payment rules of its own.
+   - Labels: "Vendor outstanding (operational)" and "Per POs, not Zoho".
+   - POs without a known ordered total (tax treatment not set) are shown as a count, not an amount.
+7. **Reservation warning.** The age at which a reservation shows as a warning is a configurable dashboard setting (`OPS_DASHBOARD_RESERVATION_WARNING_HOURS`, default 24).
+   - It is for alerting only.
+   - It is separate from, and never used as, the future reservation expiry/release TTL.
+8. **Drill-downs.** A card's drill-down shows the same population as the card. A card with no matching list page has no drill-down and is not shown as clickable.
+   - Sales today and Orders today: the order list for today's date with cancelled orders excluded.
+   - Vendor outstanding: the PO list filter `payment_status=outstanding`, which uses the same purchase selector as the card. Draft and cancelled POs never match.
+   - Collected today: no drill-down in P0, because there is no ops CPAY ledger list yet.
+9. **Dedicated dashboards.** P0/P1: Sales, Inventory Health, Procurement, Payments (separate CPAY and SPAY tabs), and Returns & Refunds. Product Performance comes later.
+10. **Excluded metrics.** None of these are shown:
+    - margin or profit
+    - GST or tax figures
+    - stock value presented as fact
+    - accounting cash flow
+    - supplier payable presented as accounting truth
+    - vanity metrics (sessions, conversion, user counts, catalogue counts, note popularity)
+11. **Accounting boundary.** Zoho Books remains the accounting and GST source of truth (DEC-001). Panel money figures are operational ledger totals, and each one names its source.
+12. **Stock boundary.** Physical stock and booked incoming stock (DEC-009) are always shown as separate figures. They are never added together on staff dashboards.
+13. **Permissions (hard acceptance criterion).** Every card, queue, table and quick action is gated by an existing model or view permission. When the user lacks that permission:
+    - the widget is not rendered, and
+    - its underlying queryset is not executed.
+
+    Tests must prove both.
+14. **Implementation boundary.** All dashboard queries live in a read-only module, `apps/ops/dashboard_selectors.py`. That module only calls and combines existing domain selectors and payment helpers.
+    - It contains no financial or inventory rules of its own.
+    - If a needed rule is missing (for example, out of stock), it is added to the owning domain's selectors (for example `apps/inventory/selectors.py`) and called from there.
+    - Dashboard code never writes data.
+15. **Freshness.** Home and all queues run live queries on page load. No snapshot tables in P0.
+16. **Layout.** Desktop shows the KPI cards as a row of 4 and a row of 3. Tablet shows 2 cards per row, phone 1 card per row.
+
+### Reason
+The system is ledger-based and action-driven. Staff need queues and exceptions before charts. Metrics without cost, GST, bill data or complete payment coverage would mislead.
+
+### Impact
+- `apps/ops`: new `dashboard_selectors.py`; Home view context and template; the reservation warning setting; list filters needed by the drill-downs (orders: `payment_status=outstanding`, date range, COD unverified, exclude cancelled; stock: no incoming; reservations: past warning age; POs: `payment_status=outstanding`).
+- Domain selectors gain missing read-only helpers only (`apps/orders/selectors.py`, `apps/inventory/selectors.py`, `apps/purchases/selectors.py`, `orders.payments.OUTSTANDING_STATUSES`).
+- No model, migration, service or permission changes.
+
+### Status
+**APPROVED** (2026-11-12). Home P0 implemented on `feat/ops-home-dashboard`. The dedicated dashboards (item 9) and an ops CPAY ledger list are not implemented.
+
+### Date
+2026-11-12
+
+### Related Documentation
+- DEC-001, DEC-009, DEC-010, DEC-011, DEC-013
+
+---
+
 ## Self-Consistency Check
 
 The following issues were reviewed after drafting this file:

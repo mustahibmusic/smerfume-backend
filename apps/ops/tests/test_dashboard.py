@@ -16,6 +16,7 @@ from apps.ops import dashboard_selectors
 from apps.ops.access import OPS_ACCESS_PERMISSION
 from apps.ops.views import home
 from apps.orders.models import Order
+from apps.purchases import selectors as purchase_selectors
 from apps.purchases import services as purchase_services
 from apps.purchases.models import PaymentAccount, PurchaseOrder, PurchaseOrderLine
 
@@ -26,6 +27,7 @@ HOME_URL = reverse("ops:home")
 ORDER_LIST_URL = reverse("ops:order_list")
 STOCK_LIST_URL = reverse("ops:stock_list")
 RESERVATION_LIST_URL = reverse("ops:reservation_list")
+PO_LIST_URL = reverse("ops:po_list")
 DOMAIN_TABLES = ('"orders_', '"inventory_', '"purchases_', '"catalog_')
 
 # Every gated unit on Home: (selector name, permissions).
@@ -213,6 +215,17 @@ class PurchaseWidgetTests(TestCase):
         self.assertEqual(data, {"total": Decimal("850.00"), "count": 2, "unclassified": 1})
         self.assertEqual(paid_part.remaining_against_po, Decimal("600.00"))
 
+        # The PO list drill-down lists exactly the POs the card counts.
+        self.client.force_login(self.owner)
+        response = self.client.get(PO_LIST_URL, {"payment_status": "outstanding"})
+        self.assertEqual(response.status_code, 200)
+        listed = {po.pk for po in response.context["object_list"]}
+        self.assertEqual(listed, set(purchase_selectors.outstanding_purchase_orders().values_list("pk", flat=True)))
+        self.assertEqual(len(listed), data["count"])
+        home_response = self.client.get(HOME_URL)
+        self.assertContains(home_response, f'href="{PO_LIST_URL}?payment_status=outstanding"')
+        self.assertNotContains(home_response, "payment_status=unpaid")
+
     def test_low_stock_without_incoming_and_filter(self):
         covered_variant = _variant()
         InventoryStock.objects.create(
@@ -295,6 +308,27 @@ class DrillDownFilterTests(TestCase):
         response = self.client.get(ORDER_LIST_URL, {"date_from": iso, "date_to": "2000-01-01"})
         self.assertContains(response, "The end date is before the start date.")
         self.assertEqual(len(response.context["rows"]), 1)  # date_to ignored, date_from applied
+
+    def test_sales_today_drill_down_matches_kpi_population(self):
+        kept = _order(90, status=Order.STATUS_CONFIRMED)
+        _order(91, status=Order.STATUS_CANCELLED)
+        old = _order(92)
+        Order.objects.filter(pk=old.pk).update(created_at=timezone.now() - timedelta(days=3))
+        iso = timezone.localdate().isoformat()
+        numbers = self._numbers({"date_from": iso, "date_to": iso, "exclude_cancelled": "on"})
+        self.assertEqual(numbers, {kept.order_number})
+        self.assertEqual(len(numbers), dashboard_selectors.order_value_today()["count"])
+
+        response = self.client.get(HOME_URL)
+        url = f"{ORDER_LIST_URL}?date_from={iso}&amp;date_to={iso}&amp;exclude_cancelled=on"
+        self.assertContains(response, url, count=2)  # Sales today + Orders today cards
+
+    def test_collected_today_card_is_not_a_link(self):
+        self.client.force_login(_staff("cpay", OPS_ACCESS_PERMISSION, "orders.view_orderpayment"))
+        response = self.client.get(HOME_URL)
+        self.assertContains(response, '<div class="kpi" data-widget="collected_today">')
+        self.assertNotContains(response, 'data-widget="collected_today" href')
+        self.assertNotRegex(response.content.decode(), r'<a[^>]*data-widget="collected_today"')
 
     def test_cod_unverified(self):
         cod = _order(70, channel=Order.CHANNEL_ONLINE, status=Order.STATUS_PENDING,

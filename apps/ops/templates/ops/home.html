@@ -74,8 +74,7 @@
       <span class="kpi__note">Per POs, not Zoho</span>
       <span class="kpi__meta">{{ w.vendor_outstanding.count }} PO{{ w.vendor_outstanding.count|pluralize }} with money to pay{% if w.vendor_outstanding.unclassified %}; {{ w.vendor_outstanding.unclassified }} without a known total{% endif %}</span>
       <span class="kpi__links">
-        <a href="{{ links.po_unpaid }}">Unpaid POs</a>
-        <a href="{{ links.po_partially_paid }}">Partly paid POs</a>
+        <a href="{{ links.po_outstanding }}">Outstanding POs</a>
       </span>
     </div>
   {% endif %}

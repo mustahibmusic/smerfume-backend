@@ -12,23 +12,26 @@ from django.views.generic import ListView, TemplateView
 
 from apps.ops import presenters
 from apps.ops.access import has_admin_access
-from apps.ops.forms import OrderFilterForm
+from apps.ops.forms import PAYMENT_OUTSTANDING, OrderFilterForm
 from apps.ops.mixins import OpsAccessMixin
 from apps.ops.views.payments import can_record_payment
 from apps.ops.views.returns import order_can_create_return
 from apps.orders import payments as order_payments
+from apps.orders import selectors as order_selectors
 from apps.orders.models import Order
 
 VIEW_ORDER = "orders.view_order"
 
 
 class OrderListView(OpsAccessMixin, ListView):
-    """GET /ops/orders/?q=&status=&channel=&payment_status=&page=
+    """GET /ops/orders/?q=&status=&channel=&payment_status=&date_from=&date_to=&cod_unverified=on&page=
 
     Newest first, 25 per page. ``q`` matches order number, customer
     name/mobile/email and shipping name/mobile. Invalid filter values are
-    reported and ignored. An out-of-range or non-numeric ``page`` returns
-    the branded 404 (Django paginator behaviour).
+    reported and ignored. ``payment_status=outstanding`` means unpaid or
+    partially paid; dates filter on the local order date. An out-of-range
+    or non-numeric ``page`` returns the branded 404 (Django paginator
+    behaviour).
     """
 
     permission_required = (VIEW_ORDER,)
@@ -57,9 +60,19 @@ class OrderListView(OpsAccessMixin, ListView):
                 | Q(shipping_address__mobile__icontains=q)
                 | Q(shipping_address__full_name__icontains=q)
             )
-        for field in ("status", "channel", "payment_status"):
+        for field in ("status", "channel"):
             if data.get(field):
                 queryset = queryset.filter(**{field: data[field]})
+        if data.get("payment_status") == PAYMENT_OUTSTANDING:
+            queryset = queryset.filter(payment_status__in=order_payments.OUTSTANDING_STATUSES)
+        elif data.get("payment_status"):
+            queryset = queryset.filter(payment_status=data["payment_status"])
+        if data.get("date_from"):
+            queryset = queryset.filter(created_at__date__gte=data["date_from"])
+        if data.get("date_to"):
+            queryset = queryset.filter(created_at__date__lte=data["date_to"])
+        if data.get("cod_unverified"):
+            queryset = order_selectors.orders_awaiting_cod_verification(queryset)
         return queryset
 
     def get_context_data(self, **kwargs):

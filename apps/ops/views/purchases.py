@@ -19,7 +19,6 @@ from django.db.models import Count, Q, Sum
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse
-from django.utils import timezone
 from django.views import View
 from django.views.generic import ListView, TemplateView
 
@@ -178,9 +177,7 @@ class PurchaseOrderListView(OpsAccessMixin, FilteredListMixin, ListView):
         if data.get("payment_status") and self.request.user.has_perm(VIEW_PAYMENTS):
             queryset = queryset.filter(payment_status_db=data["payment_status"])
         if data.get("overdue"):
-            queryset = queryset.filter(
-                status__in=PurchaseOrder.RECEIVABLE_STATUSES, expected_date__lt=timezone.localdate(),
-            )
+            queryset = selectors.overdue_purchase_orders(queryset)
         return queryset
 
     def get_context_data(self, **kwargs):

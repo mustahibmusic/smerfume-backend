@@ -14,6 +14,7 @@ from django.db.models import (
     Value, When,
 )
 from django.db.models.functions import Coalesce, Round
+from django.utils import timezone
 
 from apps.inventory.models import InventoryStock, StockReservationAllocation
 
@@ -121,16 +122,18 @@ def format_units(value):
     return str(int(value)) if value == int(value) else str(value)
 
 
-def active_incoming_allocated_quantities(po_line_ids):
+def active_incoming_allocated_quantities(po_line_ids=None):
     """{po_line_id: units held by active incoming allocations}. Converted,
     reallocated and released rows never count: converted units are already
-    covered by physical quantity_reserved."""
+    covered by physical quantity_reserved. ``None`` means every line."""
+    rows = StockReservationAllocation.objects.filter(
+        allocation_type=StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
+        incoming_status=StockReservationAllocation.INCOMING_ACTIVE,
+    )
+    if po_line_ids is not None:
+        rows = rows.filter(purchase_order_line_id__in=list(po_line_ids))
     rows = (
-        StockReservationAllocation.objects.filter(
-            allocation_type=StockReservationAllocation.ALLOCATION_INCOMING_PO_LINE,
-            incoming_status=StockReservationAllocation.INCOMING_ACTIVE,
-            purchase_order_line_id__in=list(po_line_ids),
-        )
+        rows
         .values("purchase_order_line_id")
         .annotate(total=Sum("units"))
     )
@@ -248,6 +251,55 @@ def sellable_quantity(variant, warehouse):
     return sellable_quantities([variant.pk], warehouse)[variant.pk]
 
 
+def incoming_sellable_by_stock_key():
+    """{(variant_id, warehouse_id): incoming sellable units} over every
+    bookable line, using the same per-line rule as checkout. Keys with
+    nothing incoming are omitted. Staff figure: shown apart from physical
+    stock and independent of BOOKED_INCOMING_SALES_ENABLED."""
+    lines = list(
+        PurchaseOrderLine.objects.filter(
+            purchase_order__status__in=PurchaseOrder.BOOKABLE_STATUSES,
+            confirmed_booked_quantity__gt=0,
+        ).select_related("purchase_order")
+    )
+    amounts = _incoming_amounts(lines)
+    result = {}
+    for line in lines:
+        if amounts[line.pk] > 0:
+            key = (line.variant_id, line.purchase_order.warehouse_id)
+            result[key] = result.get(key, ZERO) + amounts[line.pk]
+    return result
+
+
+def incoming_allocation_mismatches():
+    """PO lines whose active incoming allocations exceed what the line can
+    still deliver: allocated > confirmed_booked_quantity - net retail
+    received, or any active allocation on a PO that is no longer bookable.
+    Read only; resolving them stays with the booking/GRN services."""
+    allocated = active_incoming_allocated_quantities()
+    if not allocated:
+        return []
+    lines = list(
+        PurchaseOrderLine.objects.filter(pk__in=list(allocated))
+        .select_related("purchase_order", "variant")
+        .order_by("purchase_order_id", "pk")
+    )
+    received = received_quantities([line.pk for line in lines], stock_type="retail")
+    return [
+        line for line in lines
+        if line.purchase_order.status not in PurchaseOrder.BOOKABLE_STATUSES
+        or allocated[line.pk] > Decimal(line.confirmed_booked_quantity) - received.get(line.pk, 0)
+    ]
+
+
+def overdue_purchase_orders(queryset=None):
+    """Issued or partially received POs whose expected date has passed."""
+    queryset = PurchaseOrder.objects.all() if queryset is None else queryset
+    return queryset.filter(
+        status__in=PurchaseOrder.RECEIVABLE_STATUSES, expected_date__lt=timezone.localdate(),
+    )
+
+
 # --- DEC-010: supplier payment coverage in SQL (PO list, filters) ---
 
 _MONEY_FIELD = DecimalField(max_digits=14, decimal_places=2)
@@ -316,6 +368,30 @@ def annotate_payment_summary(queryset):
             output_field=CharField(),
         )
     )
+
+
+def payable_purchase_orders(queryset=None):
+    """POs in DEC-010 payable statuses, annotated with the operational
+    payment summary (annotate_payment_summary)."""
+    queryset = PurchaseOrder.objects.all() if queryset is None else queryset
+    return annotate_payment_summary(queryset.filter(status__in=PurchaseOrder.PAYABLE_STATUSES))
+
+
+def outstanding_purchase_orders(queryset=None):
+    """Payable POs with a known ordered total and money still to pay,
+    annotated ``remaining_db`` (= PurchaseOrder.remaining_against_po).
+    Operational only; Zoho Books is authoritative for the liability."""
+    return (
+        payable_purchase_orders(queryset)
+        .filter(ordered_gross_total_db__isnull=False, net_paid_db__lt=F("ordered_gross_total_db"))
+        .annotate(remaining_db=F("ordered_gross_total_db") - F("net_paid_db"))
+    )
+
+
+def unclassified_payable_purchase_orders(queryset=None):
+    """Payable POs whose ordered total is unknown (tax treatment or a GST
+    rate missing), so they cannot be counted in outstanding amounts."""
+    return payable_purchase_orders(queryset).filter(ordered_gross_total_db__isnull=True)
 
 
 def reversible_payment_entries(po):

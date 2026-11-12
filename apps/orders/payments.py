@@ -18,7 +18,7 @@ from .models import Order, OrderPayment, OrderPaymentError, Refund, RefundAdjust
 
 __all__ = [
     "OrderPaymentError", "record_order_payment", "validate_payment_input", "next_payment_number",
-    "payment_summary", "annotate_payment_summary", "STATUS_CHOICES",
+    "payment_summary", "annotate_payment_summary", "STATUS_CHOICES", "OUTSTANDING_STATUSES",
 ]
 
 ZERO = Decimal("0.00")
@@ -35,6 +35,8 @@ STATUS_CHOICES = (
     (STATUS_PAID, "Paid"),
     (STATUS_OVERPAID, "Overpaid"),
 )
+# Money still to collect: the statuses a manual Record Payment can act on.
+OUTSTANDING_STATUSES = (STATUS_UNPAID, STATUS_PARTIALLY_PAID)
 
 _MONEY = DecimalField(max_digits=12, decimal_places=2)
 

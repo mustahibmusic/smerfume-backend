@@ -63,3 +63,13 @@ def order_row(order):
         "payment_status_label": payment_status_label(order.payment_status),
         "payment_status_tone": PAYMENT_STATUS_TONES.get(order.payment_status, "muted"),
     }
+
+
+def order_row_basic(order):
+    """List row for an order without payment annotations."""
+    return {
+        "order": order,
+        "customer": customer_name(order),
+        "contact": customer_contact(order),
+        "status_tone": ORDER_STATUS_TONES.get(order.status, "muted"),
+    }

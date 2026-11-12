@@ -9,25 +9,230 @@
   </div>
 </div>
 
-{% if quick_links %}
-  <section aria-labelledby="quick-access">
-    <h2 id="quick-access" class="section-title">Quick access</h2>
-    <ul class="quick-grid">
-      {% for link in quick_links %}
+{% with w=widgets %}
+{% if w.order_value_today or w.collected_today or w.in_store_balance_due %}
+<section class="kpi-grid kpi-grid--four" aria-label="Today">
+  {% if w.order_value_today %}
+    <a class="kpi kpi--link" href="{{ links.today_orders }}" data-widget="sales_today">
+      <span class="kpi__label">Sales today</span>
+      <span class="kpi__value">₹{{ w.order_value_today.total|floatformat:"2g" }}</span>
+      <span class="kpi__meta">{% for channel in w.order_value_today.channels %}{{ channel.label }} ₹{{ channel.total|floatformat:"2g" }}{% if not forloop.last %} · {% endif %}{% endfor %}</span>
+      <span class="kpi__note">Order value, cancelled excluded</span>
+    </a>
+    <a class="kpi kpi--link" href="{{ links.today_orders }}" data-widget="orders_today">
+      <span class="kpi__label">Orders today</span>
+      <span class="kpi__value">{{ w.order_value_today.count }}</span>
+      <span class="kpi__meta">{% for channel in w.order_value_today.channels %}{{ channel.label }} {{ channel.count }}{% if not forloop.last %} · {% endif %}{% endfor %}</span>
+      <span class="kpi__note">Cancelled excluded</span>
+    </a>
+  {% endif %}
+  {% if w.collected_today %}
+    <div class="kpi" data-widget="collected_today">
+      <span class="kpi__label">Collected today (CPAY)</span>
+      <span class="kpi__value">₹{{ w.collected_today.total|floatformat:"2g" }}</span>
+      <span class="kpi__meta">{{ w.collected_today.count }} payment{{ w.collected_today.count|pluralize }} recorded</span>
+      <span class="kpi__note">Customer payment ledger only</span>
+    </div>
+  {% endif %}
+  {% if w.in_store_balance_due %}
+    <a class="kpi kpi--link" href="{{ links.in_store_outstanding }}" data-widget="in_store_balance_due">
+      <span class="kpi__label">In-store balance due</span>
+      <span class="kpi__value">₹{{ w.in_store_balance_due.total|floatformat:"2g" }}</span>
+      <span class="kpi__meta">{{ w.in_store_balance_due.count }} order{{ w.in_store_balance_due.count|pluralize }} unpaid or partly paid</span>
+      <span class="kpi__note">In-store only; online and COD not included</span>
+    </a>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if w.to_fulfil or w.stock_health or w.vendor_outstanding %}
+<section class="kpi-grid kpi-grid--three" aria-label="Operations">
+  {% if w.to_fulfil %}
+    <div class="kpi" data-widget="to_fulfil">
+      <span class="kpi__label">To fulfil</span>
+      <span class="kpi__value">{{ w.to_fulfil.count }}</span>
+      <span class="kpi__links">
+        <a href="{{ links.confirmed }}">Confirmed {{ w.to_fulfil.statuses.0.count }}</a>
+        <a href="{{ links.processing }}">Processing {{ w.to_fulfil.statuses.1.count }}</a>
+      </span>
+    </div>
+  {% endif %}
+  {% if w.stock_health %}
+    <a class="kpi kpi--link" href="{{ links.low_stock }}" data-widget="stock_health">
+      <span class="kpi__label">Low / out of stock</span>
+      <span class="kpi__value">{{ w.stock_health.low }} <small>low</small> · {{ w.stock_health.out }} <small>out</small></span>
+      <span class="kpi__meta">Physical retail stock</span>
+      {% if w.stock_incoming %}
+        <span class="kpi__incoming" data-widget="stock_incoming">Booked incoming (not physical): {{ w.stock_incoming.units|floatformat:"-2g" }} unit{{ w.stock_incoming.units|pluralize }}{% if w.stock_health.low %}; {{ w.stock_incoming.low_with_incoming }} of {{ w.stock_health.low }} low row{{ w.stock_health.low|pluralize }} covered{% endif %}</span>
+      {% endif %}
+    </a>
+  {% endif %}
+  {% if w.vendor_outstanding %}
+    <div class="kpi" data-widget="vendor_outstanding">
+      <span class="kpi__label">Vendor outstanding (operational)</span>
+      <span class="kpi__value">₹{{ w.vendor_outstanding.total|floatformat:"2g" }}</span>
+      <span class="kpi__note">Per POs, not Zoho</span>
+      <span class="kpi__meta">{{ w.vendor_outstanding.count }} PO{{ w.vendor_outstanding.count|pluralize }} with money to pay{% if w.vendor_outstanding.unclassified %}; {{ w.vendor_outstanding.unclassified }} without a known total{% endif %}</span>
+      <span class="kpi__links">
+        <a href="{{ links.po_unpaid }}">Unpaid POs</a>
+        <a href="{{ links.po_partially_paid }}">Partly paid POs</a>
+      </span>
+    </div>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if w.order_value_chart or exceptions_visible %}
+<div class="dash-row">
+  {% if w.order_value_chart %}
+    {% with chart=w.order_value_chart %}
+    <section class="card dash-chart" aria-labelledby="chart-title" data-widget="order_value_chart">
+      <header class="dash-card__head">
+        <h2 id="chart-title">Order value, 30 days</h2>
+        <p class="muted">₹{{ chart.total|floatformat:"2g" }} · {{ chart.start|date:"d M" }} – {{ chart.end|date:"d M" }} · cancelled excluded</p>
+      </header>
+      <ul class="legend" aria-hidden="true">
+        {% for channel in chart.channels %}<li><span class="legend__swatch legend__swatch--{{ channel.key }}"></span>{{ channel.label }}</li>{% endfor %}
+      </ul>
+      <div class="bars" role="img" aria-label="Daily order value by channel for the last 30 days; total ₹{{ chart.total|floatformat:'2g' }}. The same figures are in the table below.">
+        {% for day in chart.days %}
+          <div class="bars__col" title="{{ day.date|date:'D d M' }}: ₹{{ day.total|floatformat:'2g' }}{% for s in day.segments %} · {{ s.label }} ₹{{ s.total|floatformat:'2g' }}{% endfor %}">
+            <div class="bars__stack" style="height: {{ day.height|stringformat:'s' }}%">
+              {% for s in day.segments %}{% if s.total %}<span class="bars__seg bars__seg--{{ s.key }}" style="flex-grow: {{ s.share|stringformat:'s' }}"></span>{% endif %}{% endfor %}
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+      <div class="bars__axis muted" aria-hidden="true"><span>{{ chart.start|date:"d M" }}</span><span>Today</span></div>
+      <details class="dash-details">
+        <summary>Show as table</summary>
+        <table class="table">
+          <thead><tr><th scope="col">Date</th>{% for channel in chart.channels %}<th scope="col" class="num">{{ channel.label }}</th>{% endfor %}<th scope="col" class="num">Total</th></tr></thead>
+          <tbody>
+            {% for day in chart.days reversed %}
+              <tr><td>{{ day.date|date:"D d M" }}</td>{% for s in day.segments %}<td class="num">₹{{ s.total|floatformat:"2g" }}</td>{% endfor %}<td class="num">₹{{ day.total|floatformat:"2g" }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </details>
+    </section>
+    {% endwith %}
+  {% endif %}
+
+  {% if exceptions_visible %}
+    <section class="card dash-exceptions" aria-labelledby="exceptions-title" data-widget="exceptions">
+      <header class="dash-card__head">
+        <h2 id="exceptions-title">Exceptions</h2>
+        <p class="muted">Items that need action{% if exceptions %} · {{ exceptions|length }} type{{ exceptions|length|pluralize }}{% endif %}</p>
+      </header>
+      {% if exceptions %}
+        <ul class="exceptions">
+          {% for row in exceptions %}
+            <li class="exceptions__row" data-exception="{{ row.key }}">
+              {% if row.url %}
+                <a class="exceptions__link" href="{{ row.url }}">
+                  <span class="badge badge--{{ row.tone }}">{{ row.count }}</span>
+                  <span class="exceptions__label">{{ row.label }}{% if row.key == "aged_reservations" %} (over {{ reservation_warning_hours }} h){% endif %}</span>
+                  {% if row.amount %}<span class="exceptions__amount">₹{{ row.amount|floatformat:"2g" }}</span>{% endif %}
+                </a>
+              {% else %}
+                <div class="exceptions__link">
+                  <span class="badge badge--{{ row.tone }}">{{ row.count }}</span>
+                  <span class="exceptions__label">{{ row.label }}</span>
+                </div>
+                {% if row.purchase_orders %}
+                  <p class="exceptions__sub">{% for po in row.purchase_orders %}<a href="{% url 'ops:po_detail' po.po_number %}">{{ po.po_number }}</a>{% if not forloop.last %}, {% endif %}{% endfor %}{% if row.count > row.purchase_orders|length %} and more{% endif %}</p>
+                {% endif %}
+              {% endif %}
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="exceptions__clear">Nothing needs action right now.</p>
+      {% endif %}
+    </section>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if "oldest_outstanding" in w or "waiting_to_ship" in w %}
+<div class="dash-row dash-row--even">
+  {% if "oldest_outstanding" in w %}
+    <section class="card card--flush" aria-labelledby="outstanding-title" data-widget="oldest_outstanding">
+      <header class="dash-card__head dash-card__head--flush">
+        <h2 id="outstanding-title">Oldest outstanding in-store orders</h2>
+        <a href="{{ links.in_store_outstanding }}">View all</a>
+      </header>
+      {% if oldest_outstanding_rows %}
+        <table class="table table--responsive">
+          <thead><tr><th scope="col">Order</th><th scope="col">Customer</th><th scope="col">Placed</th><th scope="col" class="num">Total</th><th scope="col" class="num">Balance due</th></tr></thead>
+          <tbody>
+            {% for row in oldest_outstanding_rows %}
+              <tr>
+                <td data-label="Order" class="nowrap"><a href="{% url 'ops:order_detail' row.order.order_number %}">{{ row.order.order_number }}</a></td>
+                <td data-label="Customer">{{ row.customer }}</td>
+                <td data-label="Placed" class="nowrap">{{ row.order.created_at|date:"d M, H:i" }}</td>
+                <td data-label="Total" class="num">₹{{ row.order.total|floatformat:"2g" }}</td>
+                <td data-label="Balance due" class="num">₹{{ row.order.balance_due|floatformat:"2g" }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="card__body muted">No in-store order has a balance due.</p>
+      {% endif %}
+    </section>
+  {% endif %}
+  {% if "waiting_to_ship" in w %}
+    <section class="card card--flush" aria-labelledby="ship-title" data-widget="waiting_to_ship">
+      <header class="dash-card__head dash-card__head--flush">
+        <h2 id="ship-title">Orders waiting to ship</h2>
+        <span class="dash-card__links"><a href="{{ links.confirmed }}">Confirmed</a> · <a href="{{ links.processing }}">Processing</a></span>
+      </header>
+      {% if waiting_rows %}
+        <table class="table table--responsive">
+          <thead><tr><th scope="col">Order</th><th scope="col">Channel</th><th scope="col">Status</th><th scope="col">Placed</th><th scope="col" class="num">Items</th></tr></thead>
+          <tbody>
+            {% for row in waiting_rows %}
+              <tr>
+                <td data-label="Order"><a href="{% url 'ops:order_detail' row.order.order_number %}">{{ row.order.order_number }}</a><br><small class="muted">{{ row.customer }}</small></td>
+                <td data-label="Channel" class="nowrap">{{ row.order.get_channel_display }}</td>
+                <td data-label="Status"><span class="badge badge--{{ row.status_tone }}">{{ row.order.get_status_display }}</span></td>
+                <td data-label="Placed" class="nowrap">{{ row.order.created_at|date:"d M, H:i" }}</td>
+                <td data-label="Items" class="num">{{ row.order.item_count }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="card__body muted">No orders are waiting to ship.</p>
+      {% endif %}
+    </section>
+  {% endif %}
+</div>
+{% endif %}
+{% endwith %}
+
+{% if quick_actions %}
+  <section aria-labelledby="quick-actions">
+    <h2 id="quick-actions" class="section-title">Quick actions</h2>
+    <ul class="quick-grid quick-grid--actions">
+      {% for action in quick_actions %}
         <li>
-          <a class="quick-card" href="{{ link.url }}">
-            <span class="quick-card__icon">{% include "ops/_icon.html" with name=link.icon %}</span>
+          <a class="quick-card" href="{{ action.url }}" data-action="{{ action.key }}">
+            <span class="quick-card__icon">{% include "ops/_icon.html" with name=action.icon %}</span>
             <span class="quick-card__body">
-              <small class="muted">{{ link.group }}</small>
-              <strong>{{ link.label }}</strong>
-              {% if link.description %}<span class="muted">{{ link.description }}</span>{% endif %}
+              <strong>{{ action.label }}</strong>
+              <span class="muted">{{ action.description }}</span>
             </span>
           </a>
         </li>
       {% endfor %}
     </ul>
   </section>
-{% else %}
+{% endif %}
+
+{% if not quick_links %}
   <section class="empty card">
     <h2>No sections assigned</h2>
     <p class="muted">No sections are assigned to your account yet. Ask a manager for access.</p>

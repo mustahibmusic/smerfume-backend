@@ -14,6 +14,7 @@
   {% include "ops/_field.html" with field=filter_form.status %}
   {% include "ops/_field.html" with field=filter_form.purpose %}
   {% include "ops/_field.html" with field=filter_form.warehouse %}
+  <label class="check"><input type="checkbox" name="past_warning_age"{% if filter_form.past_warning_age.value %} checked{% endif %}> Past warning age ({{ reservation_warning_hours }} h)</label>
   <div class="filters__actions">
     <button type="submit" class="button button--primary">Apply</button>
     {% if is_filtered %}<a class="button button--ghost" href="{% url 'ops:reservation_list' %}">Clear</a>{% endif %}

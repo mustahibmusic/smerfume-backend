@@ -353,6 +353,17 @@
     var nameTimer = null;
     var mobileTimer = null;
     var dialByIso = {};
+    var editFields = box.querySelectorAll("[data-customer-edit]");
+    var preview = box.querySelector("[data-mobile-preview]");
+    var selectedName = box.querySelector("[data-selected-name]");
+    var selectedPhone = box.querySelector("[data-selected-phone]");
+    var isoByDial = {};
+    var dialData = document.getElementById("dial-countries");
+    if (dialData) {
+      try { isoByDial = JSON.parse(dialData.textContent); } catch (error) { isoByDial = {}; }
+    }
+    var longestDial = Object.keys(isoByDial).reduce(function (n, d) { return Math.max(n, d.length); }, 0);
+    var NATIONAL_MAX_DIGITS = 10;  // same rule as accounts.mobile.split_mobile_entry
 
     Array.prototype.forEach.call(country.options, function (option) {
       var match = option.textContent.match(/\((\+\d+)\)\s*$/);
@@ -361,6 +372,94 @@
 
     function digits(value) {
       return (value || "").replace(/[^0-9]/g, "");
+    }
+
+    // Mirrors accounts.mobile.split_mobile_entry(): a +<code> / 00<code>
+    // number picks its own country (longest known code); digits that repeat
+    // the selected code ahead of a too-long number lose it. The server
+    // applies the same rule on submit, so this only keeps the screen honest.
+    function splitEntry(raw, dial) {
+      var cleaned = (raw || "").replace(/[\s\-.()]/g, "");
+      if (cleaned.indexOf("00") === 0) {
+        cleaned = "+" + cleaned.slice(2);
+      }
+      if (cleaned.charAt(0) === "+") {
+        if (!/^\+\d+$/.test(cleaned)) {
+          return null;
+        }
+        for (var length = Math.min(longestDial, cleaned.length - 1); length > 1; length--) {
+          if (isoByDial[cleaned.slice(0, length)]) {
+            return { dial: cleaned.slice(0, length), national: cleaned.slice(length) };
+          }
+        }
+        return null;
+      }
+      if (!/^\d*$/.test(cleaned)) {
+        return null;
+      }
+      var code = (dial || "").slice(1);
+      if (dial !== "+91" && code && cleaned.length > NATIONAL_MAX_DIGITS && cleaned.indexOf(code) === 0) {
+        cleaned = cleaned.slice(code.length);
+      }
+      return { dial: dial, national: cleaned };
+    }
+
+    // The national part as stored: for +91 the trunk 0 + 10 and 91 + 10
+    // forms reduce to the 10 digits (any first digit); others as typed.
+    function storedNational(dial, national) {
+      if (dial === "+91") {
+        if (national.length === 11 && national.charAt(0) === "0") { return national.slice(1); }
+        if (national.length === 12 && national.indexOf("91") === 0) { return national.slice(2); }
+        return national.length === 10 ? national : null;
+      }
+      var total = dial.length - 1 + national.length;
+      return national.length >= 6 && total <= 15 ? national : null;
+    }
+
+    function grouped(dial, national) {
+      if (dial === "+91" && national.length === 10) {
+        return national.slice(0, 5) + " " + national.slice(5);
+      }
+      var parts = [];
+      var rest = national;
+      [4, 3].forEach(function (size) {
+        if (rest.length > size + 1) {
+          parts.unshift(rest.slice(-size));
+          rest = rest.slice(0, -size);
+        }
+      });
+      parts.unshift(rest);
+      return parts.join(" ");
+    }
+
+    function currentEntry() {
+      return splitEntry(mobile.value, dialByIso[country.value] || "");
+    }
+
+    function updatePreview() {
+      var entry = currentEntry();
+      var national = entry && entry.national ? storedNational(entry.dial, entry.national) : null;
+      if (!mobile.value.trim()) {
+        preview.textContent = "";
+      } else if (!entry) {
+        preview.textContent = "Digits only, or paste the full number with + and its country code.";
+      } else {
+        preview.textContent = national ? "Saves as " + entry.dial + " " + grouped(entry.dial, national) : "";
+      }
+    }
+
+    // Rewrite the two controls so they show what will be saved: the country
+    // of a pasted full number, and the national part only.
+    function normalizeEntry() {
+      var entry = currentEntry();
+      if (entry) {
+        if (entry.dial !== dialByIso[country.value] && isoByDial[entry.dial]) {
+          country.value = isoByDial[entry.dial];
+        }
+        var national = storedNational(entry.dial, entry.national);
+        mobile.value = national || entry.national;
+      }
+      updatePreview();
     }
 
     function closeLists() {
@@ -382,6 +481,7 @@
       var wasSelected = current !== null;
       current = null;
       selected.hidden = true;
+      Array.prototype.forEach.call(editFields, function (field) { field.hidden = false; });
       addressNote.hidden = true;
       hideAddress();
       name.readOnly = false;
@@ -400,8 +500,15 @@
         country.value = customer.country;
       }
       mobile.value = customer.national_number;
-      status.textContent = "Existing customer: " + (customer.name || "no name on record")
-        + " · " + customer.mobile;
+      // Name and number now belong to this customer: the editable controls
+      // are hidden (still submitted) until "Change customer".
+      selectedName.textContent = customer.name || "No name on record";
+      selectedPhone.textContent = customer.country_code
+        ? customer.country_code + " " + grouped(customer.country_code, customer.national_number)
+        : customer.mobile;
+      status.textContent = "";
+      updatePreview();
+      Array.prototype.forEach.call(editFields, function (field) { field.hidden = true; });
       selected.hidden = false;
       addressNote.hidden = !customer.has_last_address;
       hideAddress();
@@ -500,8 +607,9 @@
     }
 
     function mobileLookup() {
-      var dial = dialByIso[country.value] || "";
-      var typed = digits(mobile.value);
+      var entry = currentEntry();
+      var dial = entry ? entry.dial : "";
+      var typed = entry ? entry.national : "";
       if (current || !dial || typed.length < 6) {
         closeLists();
         return;
@@ -584,11 +692,17 @@
       if (current) {
         unselect(false);  // the name came from the selected customer
       }
+      updatePreview();
       window.clearTimeout(mobileTimer);
       mobileTimer = window.setTimeout(mobileLookup, 250);
     }
     mobile.addEventListener("input", mobileChanged);
     country.addEventListener("change", mobileChanged);
+    mobile.addEventListener("paste", function () {
+      window.setTimeout(function () { normalizeEntry(); mobileChanged(); }, 0);
+    });
+    mobile.addEventListener("blur", normalizeEntry);
+    mobile.form.addEventListener("submit", normalizeEntry);
 
     document.addEventListener("click", function (event) {
       if (!box.contains(event.target)) {
@@ -599,6 +713,7 @@
     box.querySelector("[data-customer-change]").addEventListener("click", function () {
       unselect(false);
       mobile.value = "";
+      updatePreview();
       closeLists();
       name.focus();
     });
@@ -645,6 +760,7 @@
         .catch(function () { addressCard.textContent = "Address unavailable."; addressCard.hidden = false; });
     });
 
+    updatePreview();
     if (digits(mobile.value).length >= 6) {
       mobileLookup();  // a re-rendered form keeps its customer
     }

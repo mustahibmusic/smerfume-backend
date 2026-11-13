@@ -1388,10 +1388,49 @@ class CountryCodeTests(TestCase):
         self.assertIsNone(mobile_rules.mobile_search_prefix("+91", "98765x"))
         self.assertEqual(mobile_rules.combine_mobile("+91", "0123456789"), "+910123456789")
         self.assertEqual(mobile_rules.combine_mobile("+44", "7911 123456"), "+447911123456")
-        with self.assertRaises(mobile_rules.InvalidMobileNumber):
-            mobile_rules.combine_mobile("+44", "+447911123456")
+        # A pasted full number is split, never refused or doubled.
+        self.assertEqual(mobile_rules.combine_mobile("+44", "+447911123456"), "+447911123456")
         with self.assertRaises(mobile_rules.InvalidMobileNumber):
             mobile_rules.combine_mobile("+91", "98765")
+
+    def test_full_international_entry_picks_its_country(self):
+        for selected in ("+91", "+44", "+971"):
+            self.assertEqual(mobile_rules.split_mobile_entry(selected, "+971501234567"), ("+971", "501234567"))
+            self.assertEqual(mobile_rules.split_mobile_entry(selected, "00971501234567"), ("+971", "501234567"))
+            self.assertEqual(mobile_rules.split_mobile_entry(selected, "+971 50 123 4567"), ("+971", "501234567"))
+        self.assertEqual(mobile_rules.combine_mobile("+91", "+971501234567"), "+971501234567")
+        self.assertEqual(mobile_rules.combine_mobile("+91", "00971501234567"), "+971501234567")
+        self.assertEqual(mobile_rules.combine_mobile("+971", "+919876543210"), "+919876543210")
+        self.assertEqual(mobile_rules.mobile_search_prefix("+91", "+971501234567"), "+971501234567")
+        with self.assertRaises(mobile_rules.InvalidMobileNumber):
+            mobile_rules.combine_mobile("+91", "+999123456789")  # no such code
+        with self.assertRaises(mobile_rules.InvalidMobileNumber):
+            mobile_rules.combine_mobile("+91", "+97150abc")
+
+    def test_longest_dial_code_wins(self):
+        # +1 (US) and +1684 (American Samoa) overlap: the longer code wins.
+        self.assertEqual(mobile_rules.split_mobile_entry("+91", "+16845551234"), ("+1684", "5551234"))
+        self.assertEqual(mobile_rules.split_mobile_entry("+91", "+12025551234"), ("+1", "2025551234"))
+        self.assertEqual(mobile_rules.split_mobile_entry("+91", "+971501234567"), ("+971", "501234567"))
+        self.assertEqual(mobile_rules.split_mobile_entry("+91", "+447911123456"), ("+44", "7911123456"))
+
+    def test_selected_code_typed_again_is_not_duplicated(self):
+        self.assertEqual(mobile_rules.combine_mobile("+971", "501234567"), "+971501234567")
+        self.assertEqual(mobile_rules.combine_mobile("+971", "971501234567"), "+971501234567")
+        self.assertEqual(mobile_rules.combine_mobile("+44", "447911123456"), "+447911123456")
+        self.assertEqual(mobile_rules.combine_mobile("+1", "15551234567"), "+15551234567")
+        self.assertEqual(mobile_rules.mobile_search_prefix("+971", "971501234567"), "+971501234567")
+        # A national number that merely starts with the code's digits stays.
+        self.assertEqual(mobile_rules.combine_mobile("+7", "7771234567"), "+77771234567")
+        for value in ("+971501234567", "00971501234567", "971501234567", "501234567"):
+            self.assertNotIn("971971", mobile_rules.combine_mobile("+971", value))
+
+    def test_india_national_numbers(self):
+        self.assertEqual(mobile_rules.combine_mobile("+91", "9876543210"), "+919876543210")
+        self.assertEqual(mobile_rules.combine_mobile("+91", "0123456789"), "+910123456789")
+        self.assertEqual(mobile_rules.combine_mobile("+91", "1234567890"), "+911234567890")
+        self.assertEqual(mobile_rules.combine_mobile("+91", "919876543210"), "+919876543210")
+        self.assertEqual(mobile_rules.combine_mobile("+91", "+91 98765 43210"), "+919876543210")
 
 
 class CustomerSelectorTests(TestCase):

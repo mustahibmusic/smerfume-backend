@@ -302,6 +302,13 @@ def country_for_dial(dial):
     return None
 
 
+def preferred_iso_by_dial():
+    """{dial code: ISO country to select} for every known code, using the
+    preferred country when a code is shared. The sale page uses it to pick
+    the country of a pasted full number."""
+    return {dial: country_for_dial(dial) for dial in sorted(DIAL_CODES)}
+
+
 def split_number(full):
     """(dial code, national number) by longest known prefix, e.g.
     ``+919876543210`` -> (``+91``, ``9876543210``). A value that is not in

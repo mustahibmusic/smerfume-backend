@@ -73,6 +73,7 @@
 
   <section class="card card--flush">
     <h2 class="card__title">Items</h2>
+    <div class="card__body">{% include "ops/_scan.html" with scan_context="sale" %}</div>
     {{ formset.management_form }}
     <datalist id="sale-item-options"></datalist>
     <div class="sale-lines" data-sale-lines>

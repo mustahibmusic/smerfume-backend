@@ -772,3 +772,65 @@ class CustomerLookupTests(TestCase):
         self.london.refresh_from_db()
         self.assertNotEqual(self.london.get_full_name(), "")
         self.assertNotIn("customer_id", data)
+
+
+# ── Scan box on the New In-store Sale page ───────────────────────────────────
+
+from apps.catalog.models import ProductVariant  # noqa: E402
+
+SCAN_URL = reverse("ops:item_scan")
+
+
+class SaleScanTests(TestCase):
+    def setUp(self):
+        self.client.force_login(_user("scanseller", "orders.add_order", "orders.view_order"))
+        self.warehouse = Warehouse.objects.get(is_default=True)
+        self.variant = _stocked_variant(quantity=2, barcode="8901111111111")
+
+    def _scan(self, code, **extra):
+        params = {"context": "sale", "warehouse": str(self.warehouse.public_id), "code": code, **extra}
+        response = self.client.get(SCAN_URL, params)
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def test_found_by_barcode_and_sku_with_physical_stock_and_price(self):
+        for code in ("8901111111111", self.variant.sku):
+            data = self._scan(code)
+            self.assertEqual(data["status"], "found", code)
+            item = data["item"]
+            self.assertEqual((item["sku"], item["stock"], item["price"]),
+                             (self.variant.sku, 2, str(self.variant.selling_price)))
+            self.assertEqual(set(item), {"sku", "name", "barcode", "stock", "price"})  # no database ids
+
+    def test_unknown_and_inactive_refused(self):
+        self.assertEqual(self._scan("NOPE-404"), {"status": "not_found", "message":
+                         "No item with barcode or SKU “NOPE-404”.", "item": None})
+        ProductVariant.objects.filter(pk=self.variant.pk).update(is_active=False)
+        data = self._scan(self.variant.sku)
+        self.assertEqual((data["status"], data["item"]), ("ineligible", None))
+        self.assertIn("inactive", data["message"])
+
+    def test_out_of_stock_reports_zero_physical_stock(self):
+        InventoryStock.objects.filter(variant=self.variant).update(quantity=0)
+        self.assertEqual(self._scan(self.variant.sku)["item"]["stock"], 0)
+
+    def test_warehouse_required_and_permission(self):
+        self.assertEqual(self.client.get(SCAN_URL, {"context": "sale", "code": "x"}).status_code, 404)
+        self.client.force_login(_user("noscan", "orders.view_order"))
+        response = self.client.get(SCAN_URL, {"context": "sale", "warehouse": str(self.warehouse.public_id),
+                                              "code": self.variant.sku})
+        self.assertEqual(response.status_code, 403)
+
+    def test_page_scan_box_is_detached_from_the_sale_form(self):
+        html = self.client.get(SALE_URL).content.decode()
+        self.assertIn('data-scan-context="sale"', html)
+        scan_input = re.search(r'<input[^>]*data-scan-input[^>]*>', html).group(0)
+        self.assertIn('form="ops-scan-detached"', scan_input)
+        self.assertNotIn('id="ops-scan-detached"', html)  # no such form: Enter cannot submit the sale
+        self.assertNotIn('name=', scan_input)  # the code is never posted
+
+    def test_server_still_refuses_more_than_physical_stock(self):
+        before = Order.objects.count()
+        response = self.client.post(SALE_URL, _sale_post(self.variant.sku, quantity=3))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Order.objects.count(), before)

@@ -1,0 +1,13 @@
+{% comment %}
+Scan box shared by the sale, purchase order and goods receipt pages.
+Needs: scan_context ("sale", "purchase" or "receipt"); optional grn.
+The input belongs to no form (form="ops-scan-detached" names no form), so
+Enter can never submit the page's form and the code is never posted.
+{% endcomment %}
+<div class="scan-bar" data-scan data-scan-url="{% url 'ops:item_scan' %}" data-scan-context="{{ scan_context }}"{% if grn %} data-scan-grn="{{ grn }}"{% endif %}>
+  <label class="scan-bar__label" for="scan-code">Scan barcode or SKU</label>
+  <input type="text" id="scan-code" class="scan-bar__input" form="ops-scan-detached" autocomplete="off"
+         autocapitalize="off" spellcheck="false" maxlength="64" data-scan-input
+         placeholder="Scan, or type an exact barcode / SKU and press Enter">
+  <p class="scan-bar__status" role="status" aria-live="polite" data-scan-status></p>
+</div>

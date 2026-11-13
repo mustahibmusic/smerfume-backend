@@ -15,6 +15,7 @@
   </section>
   <section>
     <h2 class="section-title">Lines</h2>
+    {% if perms.purchases.add_purchaseorder %}{% include "ops/_scan.html" with scan_context="purchase" %}{% endif %}
     {% include "ops/purchases/_formset_table.html" with formset=lines %}
   </section>
   <datalist id="sku-options"></datalist>

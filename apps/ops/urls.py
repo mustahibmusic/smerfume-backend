@@ -2,6 +2,7 @@ from django.urls import path, re_path
 
 from apps.ops.views import (
     catalog, customers, inventory, list_pages, lookups, payments, purchase_drafts, purchases, refunds, returns, sales,
+    scan,
 )
 from apps.ops.views.auth import OpsLoginView, OpsLogoutView, OpsPasswordChangeView
 from apps.ops.views.home import OpsHomeView, OpsNotFoundView, OpsProfileView
@@ -52,6 +53,7 @@ urlpatterns = [
     ),
     path("sales/new/", sales.InStoreSaleView.as_view(), name="in_store_sale"),
     path("lookup/customers/", lookups.CustomerLookupView.as_view(), name="customer_lookup"),
+    path("lookup/items/", scan.ItemScanView.as_view(), name="item_scan"),
     path(
         "lookup/customers/<uuid:public_id>/last-address/", lookups.CustomerLastAddressView.as_view(),
         name="customer_last_address",

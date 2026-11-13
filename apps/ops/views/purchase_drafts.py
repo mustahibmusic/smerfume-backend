@@ -39,6 +39,7 @@ from apps.ops.purchase_forms import (
 from apps.purchases import rules
 from apps.purchases import services as po_services
 from apps.purchases.models import GoodsReceipt, PaymentAccount, PurchaseOrder
+from apps.purchases.selectors import outstanding_quantity, received_quantities
 
 VIEW_PO = "purchases.view_purchaseorder"
 VIEW_GRN = "purchases.view_goodsreceipt"
@@ -271,6 +272,16 @@ class GoodsReceiptEditView(OpsAccessMixin, TemplateView):
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         context["receipt"] = self.receipt
+        quantities = kwargs.get("quantities")
+        if quantities is not None:
+            # Posted receipts so far and what is still outstanding, per PO
+            # line (display; the service re-checks over-receipt on save).
+            received = received_quantities([line.pk for line in quantities.po_lines])
+            context["receive_rows"] = [
+                (line, retail, damaged, received.get(line.pk, 0),
+                 outstanding_quantity(line, received.get(line.pk, 0)))
+                for line, retail, damaged in quantities.rows()
+            ]
         return context
 
 

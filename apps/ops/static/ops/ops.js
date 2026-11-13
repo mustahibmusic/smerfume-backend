@@ -235,6 +235,87 @@
     });
   }
 
+  // ── Scan box (sale, purchase order, goods receipt) ─────────────────────
+  // One scan input per page. Enter looks the code up on the server
+  // (/ops/lookup/items/); a line is added or changed only after a "found"
+  // answer, through the page's adapter. The input belongs to no form, so
+  // Enter can never submit the page. The server re-validates on submit.
+  var scanAdapters = {};
+
+  function registerScanAdapter(context, adapter) {
+    scanAdapters[context] = adapter;
+  }
+
+  function initScan() {
+    document.querySelectorAll("[data-scan]").forEach(function (box) {
+      var input = box.querySelector("[data-scan-input]");
+      var status = box.querySelector("[data-scan-status]");
+      var url = box.getAttribute("data-scan-url");
+      var context = box.getAttribute("data-scan-context");
+      var busy = false;
+
+      function report(ok, message) {
+        status.textContent = message;
+        status.classList.toggle("is-ok", ok);
+        status.classList.toggle("is-error", !ok);
+        box.classList.toggle("scan-bar--error", !ok);
+        input.focus();
+        if (ok) {
+          input.value = "";
+        } else {
+          input.select();
+        }
+      }
+
+      input.addEventListener("keydown", function (event) {
+        if (event.key !== "Enter") {
+          return;
+        }
+        event.preventDefault();
+        var code = input.value.trim();
+        var adapter = scanAdapters[context];
+        if (!code || busy || !adapter) {
+          return;
+        }
+        var params = adapter.params ? adapter.params() : {};
+        if (params === null) {
+          return;  // the adapter reported why (for example no warehouse)
+        }
+        params.context = context;
+        params.code = code;
+        if (box.getAttribute("data-scan-grn")) {
+          params.grn = box.getAttribute("data-scan-grn");
+        }
+        busy = true;
+        status.textContent = "Looking up " + code + "…";
+        fetch(url + "?" + new URLSearchParams(params).toString(), { credentials: "same-origin" })
+          .then(function (response) { return response.ok ? response.json() : null; })
+          .then(function (data) {
+            if (!data) {
+              report(false, "Lookup failed. Nothing was added.");
+            } else if (data.status !== "found") {
+              report(false, data.message || "Not found. Nothing was added.");
+            } else {
+              var result = adapter.apply(data.item);
+              report(result.ok, result.message);
+            }
+          })
+          .catch(function () { report(false, "Lookup failed. Nothing was added."); })
+          .then(function () { busy = false; });
+      });
+      box.reportScan = report;
+    });
+  }
+
+  function intValue(input) {
+    var value = parseInt(input && input.value, 10);
+    return isNaN(value) ? 0 : value;
+  }
+
+  function sameSku(a, b) {
+    return (a || "").trim().toUpperCase() === (b || "").trim().toUpperCase() && (a || "").trim() !== "";
+  }
+
   function initSale() {
     var form = document.querySelector("[data-sale-form]");
     if (!form) {
@@ -254,6 +335,11 @@
       return row.stock > 0 ? text : text + " · Out of stock";
     }
 
+    function remember(row) {
+      known[row.sku.toUpperCase()] = row;
+      if (row.barcode) { known[row.barcode] = row; }
+    }
+
     function search(query) {
       if (!warehouse || !warehouse.value || query.length < 2) {
         return;
@@ -264,8 +350,7 @@
         .then(function (data) {
           options.innerHTML = "";
           (data.results || []).forEach(function (row) {
-            known[row.sku] = row;
-            if (row.barcode) { known[row.barcode] = row; }
+            remember(row);
             var option = document.createElement("option");
             option.value = row.sku;
             option.label = describe(row);
@@ -275,41 +360,87 @@
         .catch(function () { /* the server validates the SKU on submit */ });
     }
 
-    function showInfo(input) {
-      var info = input.closest("[data-sale-line]").querySelector("[data-sale-item-info]");
-      var row = known[input.value.trim()];
-      if (row && info) {
-        info.textContent = describe(row);
-        if (input.value.trim() === row.barcode) { input.value = row.sku; }
+    function liveLines() {
+      return Array.prototype.filter.call(lines.querySelectorAll("[data-sale-line]"), function (line) {
+        return !line.querySelector("[data-sale-delete]").checked;
+      });
+    }
+
+    function itemInput(line) { return line.querySelector("[data-sale-item]"); }
+    function qtyInput(line) { return line.querySelector("input[type='number']"); }
+
+    function lookupRow(value) {
+      value = (value || "").trim();
+      return known[value] || known[value.toUpperCase()];
+    }
+
+    function showInfo(line) {
+      var info = line.querySelector("[data-sale-item-info]");
+      var row = lookupRow(itemInput(line).value);
+      if (!row || !info) {
+        return;
       }
+      if (itemInput(line).value.trim() === row.barcode) { itemInput(line).value = row.sku; }
+      var qty = intValue(qtyInput(line));
+      var text = describe(row);
+      line.classList.toggle("sale-line--over", qty > row.stock);
+      if (qty > row.stock) {
+        text += " · Only " + row.stock + " in stock";
+      }
+      info.textContent = text;
+    }
+
+    function removeLine(line) {
+      line.querySelector("[data-sale-delete]").checked = true;
+      line.classList.add("is-removed");
+    }
+
+    // A manual pick of an item that is already on another line is merged
+    // into that line, the same way a repeated scan is.
+    function mergeDuplicate(line) {
+      var sku = itemInput(line).value;
+      var other = liveLines().filter(function (candidate) {
+        return candidate !== line && sameSku(itemInput(candidate).value, sku);
+      })[0];
+      if (!other) {
+        return;
+      }
+      var qty = qtyInput(other);
+      qty.value = String(intValue(qty) + Math.max(intValue(qtyInput(line)), 1));
+      itemInput(line).value = "";
+      qtyInput(line).value = "";
+      line.querySelector("[data-sale-item-info]").textContent = "";
+      if (liveLines().length > 1) {
+        removeLine(line);
+      }
+      showInfo(other);
     }
 
     function bind(line) {
-      var input = line.querySelector("[data-sale-item]");
-      var remove = line.querySelector("[data-sale-remove]");
+      var input = itemInput(line);
       input.addEventListener("input", function () {
         window.clearTimeout(timer);
         var query = input.value.trim();
         timer = window.setTimeout(function () { search(query); }, 250);
-        showInfo(input);
+        showInfo(line);
       });
-      input.addEventListener("change", function () { showInfo(input); });
+      input.addEventListener("change", function () {
+        showInfo(line);
+        mergeDuplicate(line);
+      });
       input.addEventListener("keydown", function (event) {
-        // A scanner ends with Enter: keep it from submitting the sale.
+        // Never submit the sale from an item box; scanning has its own box.
         if (event.key === "Enter") {
           event.preventDefault();
-          var qty = line.querySelector("input[type='number']");
-          if (qty && !qty.value) { qty.value = "1"; }
-          addLine();
+          showInfo(line);
+          mergeDuplicate(line);
         }
       });
-      remove.addEventListener("click", function () {
-        line.querySelector("[data-sale-delete]").checked = true;
-        line.classList.add("is-removed");
-      });
+      qtyInput(line).addEventListener("input", function () { showInfo(line); });
+      line.querySelector("[data-sale-remove]").addEventListener("click", function () { removeLine(line); });
     }
 
-    function addLine() {
+    function addLine(focus) {
       var index = parseInt(total.value, 10);
       var html = template.innerHTML.replace(/__prefix__/g, String(index));
       var wrapper = document.createElement("div");
@@ -318,11 +449,120 @@
       lines.appendChild(line);
       total.value = String(index + 1);
       bind(line);
-      line.querySelector("[data-sale-item]").focus();
+      if (focus !== false) {
+        itemInput(line).focus();
+      }
+      return line;
     }
 
     lines.querySelectorAll("[data-sale-line]").forEach(bind);
-    form.querySelector("[data-sale-add]").addEventListener("click", addLine);
+    form.querySelector("[data-sale-add]").addEventListener("click", function () { addLine(true); });
+
+    registerScanAdapter("sale", {
+      params: function () {
+        if (!warehouse || !warehouse.value) {
+          var box = document.querySelector("[data-scan]");
+          box.reportScan(false, "Choose the warehouse first.");
+          return null;
+        }
+        return { warehouse: warehouse.value };
+      },
+      apply: function (item) {
+        var row = { sku: item.sku, text: item.name, barcode: item.barcode, stock: item.stock, price: item.price };
+        remember(row);
+        var line = liveLines().filter(function (candidate) {
+          return sameSku(itemInput(candidate).value, item.sku);
+        })[0];
+        var next = line ? intValue(qtyInput(line)) + 1 : 1;
+        if (item.stock <= 0) {
+          return { ok: false, message: item.name + " is out of stock in this warehouse. Nothing was added." };
+        }
+        if (next > item.stock) {
+          return { ok: false, message: item.name + ": only " + item.stock + " in stock. Quantity stays " + (next - 1) + "." };
+        }
+        if (!line) {
+          line = liveLines().filter(function (candidate) { return !itemInput(candidate).value.trim(); })[0]
+            || addLine(false);
+        }
+        itemInput(line).value = item.sku;
+        qtyInput(line).value = String(next);
+        showInfo(line);
+        line.classList.add("is-flash");
+        window.setTimeout(function () { line.classList.remove("is-flash"); }, 900);
+        return { ok: true, message: item.name + (next === 1 ? " · 1 added" : " · now " + next) };
+      },
+    });
+  }
+
+  // Purchase order lines: a scanned item adds 1 to its line, or fills an
+  // empty line (adding one when needed). No stock condition for purchasing.
+  function initPurchaseScan() {
+    var box = document.querySelector("[data-scan][data-scan-context='purchase']");
+    var formset = document.querySelector("[data-formset][data-prefix='lines']");
+    if (!box || !formset) {
+      return;
+    }
+    function rows() {
+      return Array.prototype.filter.call(formset.querySelectorAll("[data-formset-body] tr"), function (row) {
+        var remove = row.querySelector("input[name$='-DELETE']");
+        return !(remove && remove.checked);
+      });
+    }
+    function sku(row) { return row.querySelector("input[name$='-sku']"); }
+    function qty(row) { return row.querySelector("input[name$='-quantity_ordered']"); }
+    registerScanAdapter("purchase", {
+      apply: function (item) {
+        var row = rows().filter(function (candidate) { return sameSku(sku(candidate).value, item.sku); })[0];
+        if (row) {
+          qty(row).value = String(intValue(qty(row)) + 1);
+        } else {
+          row = rows().filter(function (candidate) { return !sku(candidate).value.trim(); })[0];
+          if (!row) {
+            formset.querySelector("[data-formset-add]").click();
+            row = rows()[rows().length - 1];
+          }
+          sku(row).value = item.sku;
+          qty(row).value = "1";
+        }
+        var count = intValue(qty(row));
+        return { ok: true, message: item.name + (count === 1 ? " · 1 added" : " · now " + count) };
+      },
+    });
+  }
+
+  // Goods receipt from a purchase order: a scanned item adds 1 to
+  // "Retail received" on its PO line, never beyond what is outstanding.
+  // No free lines; stock changes only when the receipt is posted.
+  function initReceiptScan() {
+    var box = document.querySelector("[data-scan][data-scan-context='receipt']");
+    if (!box) {
+      return;
+    }
+    registerScanAdapter("receipt", {
+      apply: function (item) {
+        var row = document.querySelector("[data-po-line='" + item.line + "']");
+        if (!row) {
+          return { ok: false, message: item.name + " is not on this receipt. Nothing was added." };
+        }
+        var retail = row.querySelector("[data-receive-retail] input");
+        var damaged = row.querySelector("[data-receive-damaged] input");
+        var entered = intValue(retail) + intValue(damaged);
+        if (entered + 1 > item.outstanding) {
+          return {
+            ok: false,
+            message: item.name + ": " + item.outstanding + " outstanding and " + entered
+              + " already entered. Nothing was added.",
+          };
+        }
+        retail.value = String(intValue(retail) + 1);
+        row.classList.add("is-flash");
+        window.setTimeout(function () { row.classList.remove("is-flash"); }, 900);
+        return {
+          ok: true,
+          message: item.name + " · receiving " + intValue(retail) + " (" + item.outstanding + " outstanding)",
+        };
+      },
+    });
   }
 
   // In-store sale: two ways to find the same customer.
@@ -941,6 +1181,9 @@
     initFilterToggle();
     initForms();
     initSale();
+    initPurchaseScan();
+    initReceiptScan();
+    initScan();
     initCustomerLookup();
     initFormsets();
     initListSelection();

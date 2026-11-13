@@ -15,15 +15,18 @@
   </section>
   <section class="card card--flush">
     <h2 class="card__title">Received quantities</h2>
+    <div class="card__body">{% include "ops/_scan.html" with scan_context="receipt" grn=receipt.grn_number %}</div>
     <table class="table table--responsive">
-      <thead><tr><th scope="col">Item</th><th scope="col" class="num">Ordered</th><th scope="col">Retail received</th><th scope="col">Damaged received</th></tr></thead>
+      <thead><tr><th scope="col">Item</th><th scope="col" class="num">Ordered</th><th scope="col" class="num">Received so far</th><th scope="col" class="num">Outstanding</th><th scope="col">Retail receiving now</th><th scope="col">Damaged receiving now</th></tr></thead>
       <tbody>
-        {% for line, retail, damaged in quantities.rows %}
-        <tr>
+        {% for line, retail, damaged, received, outstanding in receive_rows %}
+        <tr data-po-line="{{ line.public_id }}">
           <td data-label="Item">{{ line.variant }}<br><code>{{ line.variant.sku }}</code></td>
           <td data-label="Ordered" class="num">{{ line.quantity_ordered }}</td>
-          <td data-label="Retail received"><div class="field">{{ retail }}{% for e in retail.errors %}<p class="field__error">{{ e }}</p>{% endfor %}</div></td>
-          <td data-label="Damaged received"><div class="field">{{ damaged }}{% for e in damaged.errors %}<p class="field__error">{{ e }}</p>{% endfor %}</div></td>
+          <td data-label="Received so far" class="num">{{ received }}</td>
+          <td data-label="Outstanding" class="num">{{ outstanding }}</td>
+          <td data-label="Retail receiving now" data-receive-retail><div class="field">{{ retail }}{% for e in retail.errors %}<p class="field__error">{{ e }}</p>{% endfor %}</div></td>
+          <td data-label="Damaged receiving now" data-receive-damaged><div class="field">{{ damaged }}{% for e in damaged.errors %}<p class="field__error">{{ e }}</p>{% endfor %}</div></td>
         </tr>
         {% endfor %}
       </tbody>

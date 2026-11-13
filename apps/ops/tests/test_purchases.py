@@ -764,3 +764,172 @@ class SkuFieldEligibilityTests(_Base):
             form, valid = build("COLLIDE-123")
             self.assertTrue(valid, form.errors)
             self.assertEqual(form.cleaned_data["sku"], variant_a)
+
+
+# ── Scan box: purchase orders and goods receipts ─────────────────────────────
+
+import re  # noqa: E402
+
+from apps.catalog.selectors import resolve_scan  # noqa: E402
+from apps.inventory.models import StockMovement  # noqa: E402
+
+SCAN_URL = reverse("ops:item_scan")
+
+
+def _detached_scan_input(html):
+    """The scan input exists and belongs to no form on the page."""
+    match = re.search(r'<input[^>]*data-scan-input[^>]*>', html)
+    form_attr = re.search(r'form="([^"]+)"', match.group(0)).group(1)
+    return match is not None and f'id="{form_attr}"' not in html
+
+
+class ResolveScanTests(_Base):
+    def test_order_barcode_then_exact_sku_then_upper_sku(self):
+        ProductVariant.objects.filter(pk=self.variant.pk).update(barcode="8900000000101")
+        self.assertEqual(resolve_scan("8900000000101"), self.variant)
+        self.assertEqual(resolve_scan(" OPS-PO-100 "), self.variant)
+        self.assertEqual(resolve_scan("ops-po-100"), self.variant)  # upper-case SKU
+        self.assertIsNone(resolve_scan("OPS-PO"))  # never partial
+        self.assertIsNone(resolve_scan(""))
+        lower = _variant("lower-sku")
+        self.assertEqual(resolve_scan("lower-sku"), lower)  # SKU as typed first
+        self.assertIsNone(resolve_scan("LOWER-SKU"))  # never case-insensitive
+
+    def test_barcode_wins_over_another_variants_sku(self):
+        sku_owner = _variant("COLLIDE-9")
+        barcode_owner = _variant("OPS-PO-B9")
+        ProductVariant.objects.filter(pk=barcode_owner.pk).update(barcode="COLLIDE-9")
+        self.assertEqual(resolve_scan("COLLIDE-9"), barcode_owner)
+        self.assertNotEqual(resolve_scan("COLLIDE-9"), sku_owner)
+
+    def test_returns_inactive_and_decant_variants(self):
+        ProductVariant.objects.filter(pk=self.variant.pk).update(is_active=False, is_decant=True)
+        self.assertEqual(resolve_scan("OPS-PO-100"), self.variant)
+
+
+class PurchaseScanTests(_Base):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.owner)
+
+    def _scan(self, code):
+        response = self.client.get(SCAN_URL, {"context": "purchase", "code": code})
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def test_found_unknown_inactive_decant(self):
+        data = self._scan("ops-po-100")
+        self.assertEqual((data["status"], data["item"]["sku"]), ("found", "OPS-PO-100"))
+        self.assertNotIn("stock", data["item"])  # no stock condition for purchasing
+        self.assertEqual(self._scan("NOPE-1")["status"], "not_found")
+        ProductVariant.objects.filter(pk=self.variant.pk).update(is_active=False)
+        self.assertIn("inactive", self._scan("OPS-PO-100")["message"])
+        ProductVariant.objects.filter(pk=self.variant.pk).update(is_active=True, is_decant=True)
+        data = self._scan("OPS-PO-100")
+        self.assertEqual(data["status"], "ineligible")
+        self.assertIn("decants cannot be purchased", data["message"])
+        self.assertIsNone(data["item"])
+
+    def test_permission_and_bad_context(self):
+        self.client.force_login(_user("poview", "purchases.view_purchaseorder"))
+        self.assertEqual(self.client.get(SCAN_URL, {"context": "purchase", "code": "OPS-PO-100"}).status_code, 403)
+        self.assertEqual(self.client.get(SCAN_URL, {"context": "nope", "code": "x"}).status_code, 400)
+
+    def test_po_page_scan_box_is_detached_and_line_rule_kept(self):
+        html = self.client.get(reverse("ops:po_new")).content.decode()
+        self.assertIn('data-scan-context="purchase"', html)
+        self.assertTrue(_detached_scan_input(html))
+        # The PR #30 line rule still decides on submit.
+        ProductVariant.objects.filter(pk=self.variant.pk).update(is_decant=True)
+        response = self.client.post(reverse("ops:po_new"), _po_post(self.supplier, self.warehouse, [
+            {"sku": "OPS-PO-100", "quantity_ordered": "2", "unit_price": "100"},
+        ]))
+        self.assertContains(response, "decants cannot be purchased")
+        self.assertFalse(PurchaseOrder.objects.exists())
+
+
+class ReceiptScanTests(_Base):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.owner)
+        self.second = _variant("OPS-PO-200")
+        po = self._po(issue=False, quantity=4)
+        PurchaseOrderLine.objects.create(
+            purchase_order=po, variant=self.second, quantity_ordered=5, unit_price=Decimal("100"),
+        )
+        services.issue_purchase_order(po, self.owner)
+        first = services.create_receipt_from_po(po, self.owner, vendor_document_reference="DC-1")
+        GoodsReceiptLine.objects.create(
+            receipt=first, po_line=po.lines.get(variant=self.variant), stock_type="retail", quantity=4,
+        )
+        services.post_goods_receipt(first, self.owner)
+        self.po = PurchaseOrder.objects.get(pk=po.pk)
+        self.receipt = services.create_receipt_from_po(self.po, self.owner, vendor_document_reference="DC-2")
+        self.edit_url = reverse("ops:grn_edit", args=[self.receipt.grn_number])
+
+    def _scan(self, code, grn=None):
+        response = self.client.get(SCAN_URL, {"context": "receipt", "grn": grn or self.receipt.grn_number,
+                                              "code": code})
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def test_matching_line_found_with_outstanding(self):
+        data = self._scan("OPS-PO-200")
+        line = self.po.lines.get(variant=self.second)
+        self.assertEqual(data["status"], "found")
+        self.assertEqual(
+            {k: data["item"][k] for k in ("line", "ordered", "received", "outstanding")},
+            {"line": str(line.public_id), "ordered": 5, "received": 0, "outstanding": 5},
+        )
+
+    def test_not_on_po_fully_received_and_unknown(self):
+        self.assertEqual(self._scan("OPS-PO-100")["message"],
+                         f"{self.variant} is fully received on {self.po.po_number}.")
+        _variant("OPS-PO-300")
+        data = self._scan("OPS-PO-300")
+        self.assertEqual((data["status"], data["message"]), ("ineligible", f"Not on {self.po.po_number}."))
+        self.assertEqual(self._scan("NOPE-2")["status"], "not_found")
+
+    def test_scanning_changes_no_stock(self):
+        stock_before = list(InventoryStock.objects.values_list("pk", "quantity"))
+        movements_before = StockMovement.objects.count()
+        lines_before = self.receipt.lines.count()
+        for _ in range(3):
+            self._scan("OPS-PO-200")
+        self.assertEqual(list(InventoryStock.objects.values_list("pk", "quantity")), stock_before)
+        self.assertEqual(StockMovement.objects.count(), movements_before)
+        self.assertEqual(self.receipt.lines.count(), lines_before)
+
+    def test_page_shows_outstanding_and_detached_scan_box(self):
+        response = self.client.get(self.edit_url)
+        html = response.content.decode()
+        self.assertTrue(_detached_scan_input(html))
+        self.assertIn(f'data-scan-grn="{self.receipt.grn_number}"', html)
+        line = self.po.lines.get(variant=self.second)
+        self.assertIn(f'data-po-line="{line.public_id}"', html)
+        rows = {row[0].variant_id: row[3:] for row in response.context["receive_rows"]}
+        self.assertEqual(rows[self.variant.pk], (4, 0))  # received so far, outstanding
+        self.assertEqual(rows[self.second.pk], (0, 5))
+
+    def test_over_receipt_refused_on_save(self):
+        line = self.po.lines.get(variant=self.second)
+        response = self.client.post(self.edit_url, {
+            "received_date": timezone.localdate().isoformat(), "vendor_document_reference": "DC-2", "notes": "",
+            f"retail_{line.public_id}": "6",
+            "disc-TOTAL_FORMS": "0", "disc-INITIAL_FORMS": "0", "disc-MIN_NUM_FORMS": "0", "disc-MAX_NUM_FORMS": "1000",
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(self.receipt.lines.exists())
+
+    def test_opening_receipt_has_no_po_scan(self):
+        opening = services.create_opening_receipt(self.warehouse, self.owner)
+        html = self.client.get(reverse("ops:grn_edit", args=[opening.grn_number])).content.decode()
+        self.assertNotIn('data-scan-context="receipt"', html)
+        response = self.client.get(SCAN_URL, {"context": "receipt", "grn": opening.grn_number, "code": "OPS-PO-200"})
+        self.assertEqual(response.status_code, 404)
+
+    def test_receipt_scan_needs_edit_permission(self):
+        self.client.force_login(_user("grnview", "purchases.view_goodsreceipt"))
+        response = self.client.get(SCAN_URL, {"context": "receipt", "grn": self.receipt.grn_number,
+                                              "code": "OPS-PO-200"})
+        self.assertEqual(response.status_code, 403)

@@ -800,3 +800,21 @@ form.stack:not(.card form) > .form-actions:last-child { margin: 0; border: 1px s
 .customer-lookup__address { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
 .customer-lookup__address-card { max-width: 520px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
 .customer-lookup__address-card .dl { margin: 0; }
+
+/* ── Scan box (sale, purchase order, goods receipt) ─────────────────────── */
+.scan-bar { display: grid; gap: 4px; max-width: 560px; }
+.scan-bar__label { font-weight: 600; font-size: var(--fs-md); }
+.scan-bar__input { width: 100%; font-family: var(--font-mono, ui-monospace, monospace); }
+.scan-bar--error .scan-bar__input { border-color: var(--danger); }
+.scan-bar__status { margin: 0; min-height: 1.3em; font-size: var(--fs-md); color: var(--muted); }
+.scan-bar__status.is-ok { color: var(--ok); }
+.scan-bar__status.is-error { color: var(--danger); }
+.is-flash { animation: scan-flash .9s ease; }
+@keyframes scan-flash { from { background: color-mix(in srgb, var(--accent) 18%, transparent); } to { background: transparent; } }
+@media (prefers-reduced-motion: reduce) { .is-flash { animation: none; } }
+.sale-line--over [data-sale-item-info] { color: var(--danger); }
+
+/* Purchase order lines: the item box needs room for SKU / name text, and
+   the table scrolls inside its card rather than clipping Remove. */
+.formset .card { overflow-x: auto; }
+.formset__table input[name$="-sku"] { min-width: 220px; }

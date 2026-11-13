@@ -111,3 +111,34 @@ def mask_mobile(value):
     """For logs and reports: only the last four digits."""
     value = value or ""
     return f"******{value[-4:]}" if len(value) >= 4 else "******"
+
+
+def mobile_search_prefix(dial_code, national):
+    """Prefix for a customer search scoped to one country: the dial code
+    plus the typed national digits (at least 6), or None.
+
+    For +91 the local rules apply (mobile_lookup_prefix): a leading zero is
+    part of a partial number, and the complete 0 + 10 / 91 + 10 forms are
+    recognised. For other codes the digits are used as typed, up to 15
+    digits in total.
+    """
+    cleaned = _strip_formatting(national)
+    if not cleaned.isdigit():
+        return None
+    if dial_code == INDIA_PREFIX:
+        return mobile_lookup_prefix(cleaned)
+    if len(cleaned) < LOOKUP_MIN_DIGITS or len(dial_code) - 1 + len(cleaned) > 15:
+        return None
+    return f"{dial_code}{cleaned}"
+
+
+def combine_mobile(dial_code, national):
+    """The canonical stored number for a country dial code and a national
+    number typed separately (the in-store sale form). Raises
+    InvalidMobileNumber."""
+    cleaned = _strip_formatting(national)
+    if not cleaned.isdigit():
+        raise InvalidMobileNumber("Enter the mobile number as digits, without the country code.")
+    if dial_code == INDIA_PREFIX:
+        return normalize_local_mobile(cleaned)
+    return normalize_indian_mobile(f"{dial_code}{cleaned}")

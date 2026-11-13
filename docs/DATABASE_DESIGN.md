@@ -446,7 +446,22 @@ Indexing review, contact numbers (2026-11-13): no new index. Exact lookups
 the in-store customer search (`mobile_number LIKE '+91<digits>%'`) uses the
 existing `mobile_number varchar_pattern_ops` btree (EXPLAIN: Index Cond with
 `~>=~` / `~<~`). Only prefix search is offered; a "contains" search would not
-be indexable. `CustomerProfile.mobile` is never searched.
+be indexable. `CustomerProfile.mobile` is never searched. The search is
+always scoped to the selected country (`LIKE '+<dial code><digits>%'`), so
+the same index serves every country.
+
+Customer name search and recent customers (2026-11-13):
+- Recent customers read only the newest 200 orders through
+  `order_created_id_idx`, then load at most 15 accounts by id: covered.
+- Name search (`first_name`/`last_name` `icontains`, 2+ characters, at most
+  15 rows) is a sequential scan of `accounts_user`; no existing index can
+  serve it. REVISIT LATER, not added now: Django's `icontains` compiles to
+  `UPPER(col) LIKE '%x%'`, so only an expression trigram index
+  (`GinIndex(OpClass(Upper("first_name"), name="gin_trgm_ops"))`, and the
+  same for `last_name`) would help, and every new customer account would
+  pay its write cost. At the current scale (tens of customers) the scan is
+  trivial; add it when customers exceed roughly 50,000 or the name lookup
+  p95 exceeds about 50 ms.
 
 Rule: every model/schema change includes an indexing review of new filter,
 search and order fields, high-frequency joins, dashboard queries and list

@@ -36,3 +36,18 @@ def orders_awaiting_cod_verification(queryset=None):
         status=Order.STATUS_PENDING,
         cod_verified_at__isnull=True,
     )
+
+
+def recent_customer_ids(limit=15, scan=200):
+    """Ids of the customers on the most recent orders, newest first, each
+    once. Only the newest ``scan`` orders are read (order_created_id_idx),
+    so this never scans the whole table; a customer with many recent
+    orders can leave fewer than ``limit`` ids. Cancelled orders count."""
+    ids = []
+    rows = Order.objects.filter(user__isnull=False).order_by("-created_at", "-id").values_list("user_id", flat=True)
+    for user_id in rows[:scan]:
+        if user_id not in ids:
+            ids.append(user_id)
+            if len(ids) == limit:
+                break
+    return ids

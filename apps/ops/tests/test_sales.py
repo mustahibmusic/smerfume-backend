@@ -568,58 +568,101 @@ class CustomerLookupTests(TestCase):
         self.staff = _user("lookupstaff", "orders.add_order")
         self.client.force_login(self.staff)
         self.asha = _lookup_customer("asha", "+919876543210", last_name="Rao")
-        self.other = _lookup_customer("other", "+919876543299", first_name="Ravi")
+        self.other = _lookup_customer("other", "+919876543299", first_name="Ravi", last_name="Kumar")
+        self.london = _lookup_customer("london", "+447911123456", first_name="Asha", last_name="Shah")
 
-    def _get(self, mobile):
-        response = self.client.get(LOOKUP_URL, {"mobile": mobile})
-        self.assertEqual(response.status_code, 200)
+    def _get(self, **params):
+        response = self.client.get(LOOKUP_URL, params)
+        self.assertEqual(response.status_code, 200, response.content)
         return response.json()
+
+    def _mobile(self, national, code="+91"):
+        return self._get(country_code=code, mobile=national)
 
     def test_needs_permission_and_runs_no_customer_query(self):
         self.client.force_login(_user("nolookup"))
         with CaptureQueriesContext(connection) as ctx:
-            response = self.client.get(LOOKUP_URL, {"mobile": "9876543210"})
+            response = self.client.get(LOOKUP_URL, {"name": "asha"})
         self.assertEqual(response.status_code, 403)
         self.assertFalse([q for q in ctx.captured_queries if "LIKE" in q["sql"]])
 
-    def test_minimum_six_digits_and_unsupported(self):
-        self.assertEqual(self._get("98765"), {"status": "too_short", "exact": False, "truncated": False,
-                                              "results": []})
-        self.assertEqual(self._get("+447911123456")["status"], "unsupported")
+    def test_exactly_one_mode(self):
+        for params in ({}, {"name": "asha", "recent": "1"}, {"mobile": "987654"},
+                       {"country_code": "+91", "name": "asha"},
+                       {"name": "asha", "country_code": "+91", "mobile": "9"}):
+            self.assertEqual(self.client.get(LOOKUP_URL, params).status_code, 400, params)
 
-    def test_prefix_returns_safe_fields_only(self):
-        data = self._get("987654")
-        self.assertEqual((data["status"], data["exact"]), ("ok", False))
+    def test_country_code_encoding_and_validation(self):
+        self.assertEqual(self.client.get(f"{LOOKUP_URL}?country_code=%2B91&mobile=987654").json()["status"], "ok")
+        # An unencoded "+" arrives as a space; it is still read as +91.
+        self.assertEqual(self.client.get(f"{LOOKUP_URL}?country_code=+91&mobile=987654").json()["status"], "ok")
+        self.assertEqual(self.client.get(LOOKUP_URL, {"country_code": "+999", "mobile": "987654"}).status_code, 400)
+
+    def test_mobile_prefix_scoped_to_country_with_safe_fields(self):
+        data = self._mobile("987654")
+        self.assertEqual((data["mode"], data["status"], data["exact"]), ("mobile", "ok", False))
         self.assertEqual([r["mobile"] for r in data["results"]], ["+919876543210", "+919876543299"])
         row = data["results"][0]
-        self.assertEqual(set(row), {"id", "name", "mobile", "email", "has_last_address"})
-        self.assertEqual(
-            (row["id"], row["name"], row["email"]), (str(self.asha.public_id), "Asha Rao", "a***@e***.com"),
-        )
+        self.assertEqual(set(row), {"id", "name", "country", "country_code", "national_number", "mobile", "email",
+                                    "has_last_address"})
+        self.assertEqual((row["id"], row["name"], row["email"]),
+                         (str(self.asha.public_id), "Asha Rao", "a***@e***.com"))
+        self.assertEqual((row["country"], row["country_code"], row["national_number"]), ("IN", "+91", "9876543210"))
+        # +44 numbers are found only with the +44 code.
+        self.assertEqual(self._mobile("791112")["results"], [])
+        uk = self._mobile("791112", code="+44")["results"]
+        self.assertEqual([(r["country"], r["national_number"]) for r in uk], [("GB", "7911123456")])
 
-    def test_exact_ten_digits_selects_one_customer_in_any_form(self):
-        for typed in ("9876543210", "+91 98765 43210", "09876543210"):
-            data = self._get(typed)
-            self.assertTrue(data["exact"], typed)
+    def test_minimum_six_digits(self):
+        self.assertEqual(self._mobile("98765")["status"], "too_short")
+        self.assertEqual(self._mobile("79111", code="+44")["status"], "too_short")
+
+    def test_exact_full_number_selects_one_customer(self):
+        for national in ("9876543210", "98765 43210", "09876543210"):
+            data = self._mobile(national)
+            self.assertTrue(data["exact"], national)
             self.assertEqual([r["mobile"] for r in data["results"]], ["+919876543210"])
+        self.assertTrue(self._mobile("7911123456", code="+44")["exact"])
+        self.assertEqual(self._mobile("9123456789")["results"], [])
 
-    def test_no_match_keeps_status_ok_with_no_results(self):
-        data = self._get("9123456789")
-        self.assertEqual((data["status"], data["exact"], data["results"]), ("ok", False, []))
+    def test_name_search(self):
+        self.assertEqual(self._get(name="a")["status"], "too_short")
+        self.assertEqual([r["name"] for r in self._get(name="asha")["results"]], ["Asha Rao", "Asha Shah"])
+        self.assertEqual([r["name"] for r in self._get(name="asha  rao")["results"]], ["Asha Rao"])
+        self.assertEqual([r["name"] for r in self._get(name="KUM")["results"]], ["Ravi Kumar"])
 
-    def test_excludes_staff_inactive_and_profile_mobile(self):
+    def test_name_search_at_most_fifteen(self):
+        for n in range(16):
+            _lookup_customer(f"many{n}", f"+9170000000{n:02d}", first_name="Meera")
+        data = self._get(name="meera")
+        self.assertEqual((len(data["results"]), data["truncated"]), (15, True))
+
+    def test_recent_customers_from_latest_orders_only(self):
+        self.assertEqual(self._get(recent="1")["results"], [])  # no orders: never the customer table
+        first = Order.objects.create(user=self.other, order_number="SMR-REC-000001", subtotal=1, total=1)
+        Order.objects.create(user=self.asha, order_number="SMR-REC-000002", subtotal=1, total=1,
+                             status=Order.STATUS_CANCELLED)
+        Order.objects.create(user=self.other, order_number="SMR-REC-000003", subtotal=1, total=1)
+        Order.objects.filter(pk=first.pk).update(created_at=timezone.now() - timezone.timedelta(days=1))
+        data = self._get(recent="1")
+        self.assertEqual(data["mode"], "recent")
+        self.assertEqual([r["name"] for r in data["results"]], ["Ravi Kumar", "Asha Rao"])
+
+    def test_recent_limit_fifteen(self):
+        for n in range(17):
+            customer = _lookup_customer(f"recent{n}", f"+9171000000{n:02d}")
+            Order.objects.create(user=customer, order_number=f"SMR-RCL-{n:06d}", subtotal=1, total=1)
+        self.assertEqual(len(self._get(recent="1")["results"]), 15)
+
+    def test_excludes_staff_inactive_no_mobile_and_profile_mobile(self):
         _lookup_customer("staffer", "+919876543211", is_staff=True)
         _lookup_customer("gone", "+919876543212", is_active=False)
+        _lookup_customer("nomobile", None, first_name="Asha", last_name="NoPhone")
         profile_only = _lookup_customer("profile", "+918000000000")
         CustomerProfile.objects.update_or_create(user=profile_only, defaults={"mobile": "9876543213"})
-        mobiles = [r["mobile"] for r in self._get("98765432")["results"]]
-        self.assertEqual(mobiles, ["+919876543210", "+919876543299"])
-
-    def test_at_most_five_with_truncated(self):
-        for n in range(6):
-            _lookup_customer(f"many{n}", f"+91700000000{n}")
-        data = self._get("700000")
-        self.assertEqual((len(data["results"]), data["truncated"]), (5, True))
+        self.assertEqual([r["mobile"] for r in self._mobile("98765432")["results"]],
+                         ["+919876543210", "+919876543299"])
+        self.assertNotIn("Asha NoPhone", [r["name"] for r in self._get(name="asha")["results"]])
 
     def test_has_last_address_and_read_only_address_endpoint(self):
         order = Order.objects.create(user=self.asha, order_number="SMR-LOOK-000001", subtotal=1, total=1)
@@ -627,7 +670,7 @@ class CustomerLookupTests(TestCase):
             order=order, full_name="Asha Rao", mobile="+919876543210", address_line1="1 MG Road",
             city="Pune", state="MH", pincode="411001",
         )
-        rows = {r["mobile"]: r for r in self._get("987654")["results"]}
+        rows = {r["mobile"]: r for r in self._mobile("987654")["results"]}
         self.assertTrue(rows["+919876543210"]["has_last_address"])
         self.assertFalse(rows["+919876543299"]["has_last_address"])
 
@@ -645,15 +688,17 @@ class CustomerLookupTests(TestCase):
 
     @override_settings(OPS_LOOKUP_RATE_PER_MINUTE=2)
     def test_rate_limited_per_staff_user(self):
-        self._get("987654")
-        self._get("987654")
-        self.assertEqual(self.client.get(LOOKUP_URL, {"mobile": "987654"}).status_code, 429)
+        self._get(name="asha")
+        self._get(name="asha")
+        self.assertEqual(self.client.get(LOOKUP_URL, {"name": "asha"}).status_code, 429)
 
-    def test_sale_page_has_lookup_box(self):
+    def test_sale_page_has_both_controls_with_india_default(self):
         self.client.force_login(_user("salepage", "orders.add_order", "orders.view_order"))
         response = self.client.get(SALE_URL)
-        self.assertContains(response, "data-customer-lookup")
-        self.assertContains(response, LOOKUP_URL)
+        self.assertContains(response, "data-customer-name")
+        self.assertContains(response, "data-customer-country")
+        self.assertContains(response, "data-customer-mobile")
+        self.assertContains(response, '<option value="IN" selected>India (+91)</option>', html=True)
 
     def test_sale_with_bare_mobile_reuses_canonical_customer_and_adds_no_address(self):
         self.client.force_login(_user("seller", "orders.add_order", "orders.view_order"))
@@ -664,3 +709,16 @@ class CustomerLookupTests(TestCase):
         self.assertEqual(order.user, self.asha)
         self.assertFalse(ShippingAddress.objects.filter(order=order).exists())
         self.assertEqual(User.objects.filter(mobile_number__endswith="9876543210").count(), 1)
+
+    def test_sale_combines_country_code_and_national_number(self):
+        self.client.force_login(_user("seller2", "orders.add_order", "orders.view_order"))
+        data = _sale_post(_stocked_variant().sku, mobile="7911123456")
+        data["customer_country"] = "GB"
+        self.assertEqual(self.client.post(SALE_URL, data).status_code, 302)
+        self.assertEqual(Order.objects.get(channel=Order.CHANNEL_IN_STORE).user, self.london)
+
+        data = _sale_post(_stocked_variant().sku, mobile="+447911123456")
+        data["customer_country"] = "GB"
+        response = self.client.post(SALE_URL, data)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "without the country code")

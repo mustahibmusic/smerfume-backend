@@ -1,6 +1,8 @@
 from django import forms
 from django.utils import timezone
 
+from apps.accounts import countries
+from apps.accounts.mobile import InvalidMobileNumber, combine_mobile
 from apps.accounts.models import User
 from apps.catalog.models import ProductVariant
 from apps.inventory.models import InventoryStock, StockMovement, StockReservation, Supplier, Warehouse
@@ -69,6 +71,13 @@ class OrderFilterForm(forms.Form):
 
 
 class OpsInStoreSaleForm(InStoreSaleForm):
+    """The mobile is entered as a country (dial code) and a national number;
+    clean() combines them into the one canonical stored number before the
+    shared sale path sees it."""
+
+    customer_country = forms.ChoiceField(
+        choices=(), initial=countries.DEFAULT_COUNTRY, required=False, label="Country code",
+    )
     warehouse = forms.ModelChoiceField(
         queryset=Warehouse.objects.order_by("name"), to_field_name="public_id",
         help_text="Stock location the items leave from.",
@@ -76,12 +85,32 @@ class OpsInStoreSaleForm(InStoreSaleForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.fields["customer_country"].choices = countries.country_choices()
+        self.fields["customer_mobile"].label = "Mobile number"
+        self.fields["customer_mobile"].help_text = "Without the country code. Finds the customer, or creates one."
         self.fields["customer_mobile"].widget = forms.TextInput(
             attrs={"inputmode": "tel", "autocomplete": "off", "maxlength": 15},
         )
+        self.fields["customer_name"].help_text = "Search existing customers, or type a new customer's name."
         self.fields["customer_name"].widget = forms.TextInput(attrs={"maxlength": 150})
         self.fields["discount_amount"].widget = forms.NumberInput(attrs={"step": "0.01", "min": "0"})
         self.fields["notes"].widget = forms.Textarea(attrs={"rows": 2})
+
+    def clean_customer_mobile(self):
+        # Combined with the country in clean(); the shared Indian default
+        # must not be applied to a national number of another country.
+        return self.cleaned_data["customer_mobile"].strip()
+
+    def clean(self):
+        cleaned = super().clean()
+        country = cleaned.get("customer_country") or countries.DEFAULT_COUNTRY
+        national = cleaned.get("customer_mobile")
+        if national:
+            try:
+                cleaned["customer_mobile"] = combine_mobile(countries.dial_code_for(country), national)
+            except InvalidMobileNumber as exc:
+                self.add_error("customer_mobile", str(exc))
+        return cleaned
 
 
 class OpsInStoreSaleLineForm(InStoreSaleLineForm):

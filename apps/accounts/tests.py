@@ -1348,3 +1348,63 @@ class MobileCollisionMergeOrdersTests(TestCase):
         self.assertEqual(self._children(), before)  # orders not moved
         self.retired.refresh_from_db()
         self.assertEqual((self.retired.mobile_number, self.retired.is_active), ("9000000007", True))
+
+
+from apps.accounts import countries  # noqa: E402
+from apps.accounts.selectors import search_customers  # noqa: E402
+from apps.orders.selectors import recent_customer_ids  # noqa: E402
+
+
+class CountryCodeTests(TestCase):
+    def test_dataset_is_complete_and_unique_by_iso(self):
+        isos = [iso for iso, _, _ in countries.COUNTRIES]
+        self.assertEqual(len(isos), len(set(isos)))
+        self.assertGreaterEqual(len(isos), 240)
+        for iso in ("IN", "US", "GB", "AE", "SA", "SG", "AU", "DE", "GQ", "SV"):
+            self.assertIn(iso, countries.BY_ISO)
+        self.assertEqual(countries.country_choices()[0], ("IN", "India (+91)"))
+
+    def test_split_by_longest_prefix(self):
+        self.assertEqual(countries.split_number("+919876543210"), ("+91", "9876543210"))
+        self.assertEqual(countries.split_number("+447911123456"), ("+44", "7911123456"))
+        self.assertEqual(countries.split_number("+12125551234"), ("+1", "2125551234"))
+        self.assertEqual(countries.split_number("+12684601234"), ("+1268", "4601234"))  # Antigua
+        self.assertEqual(countries.split_number("1234567890123"), ("", "1234567890123"))
+        self.assertEqual(countries.country_for_dial("+1"), "US")
+        self.assertEqual(countries.country_for_dial("+91"), "IN")
+
+    def test_clean_dial_code(self):
+        self.assertEqual(countries.clean_dial_code("+91"), "+91")
+        self.assertEqual(countries.clean_dial_code(" 91"), "+91")  # unencoded "+" arrives as a space
+        self.assertEqual(countries.clean_dial_code("44"), "+44")
+        self.assertIsNone(countries.clean_dial_code("+999"))
+        self.assertIsNone(countries.clean_dial_code(""))
+
+    def test_search_prefix_and_combine(self):
+        self.assertEqual(mobile_rules.mobile_search_prefix("+91", "012345"), "+91012345")
+        self.assertEqual(mobile_rules.mobile_search_prefix("+91", "09876543210"), "+919876543210")
+        self.assertEqual(mobile_rules.mobile_search_prefix("+44", "791112"), "+44791112")
+        self.assertIsNone(mobile_rules.mobile_search_prefix("+44", "79111"))
+        self.assertIsNone(mobile_rules.mobile_search_prefix("+91", "98765x"))
+        self.assertEqual(mobile_rules.combine_mobile("+91", "0123456789"), "+910123456789")
+        self.assertEqual(mobile_rules.combine_mobile("+44", "7911 123456"), "+447911123456")
+        with self.assertRaises(mobile_rules.InvalidMobileNumber):
+            mobile_rules.combine_mobile("+44", "+447911123456")
+        with self.assertRaises(mobile_rules.InvalidMobileNumber):
+            mobile_rules.combine_mobile("+91", "98765")
+
+
+class CustomerSelectorTests(TestCase):
+    def test_exactly_one_criterion(self):
+        with self.assertRaises(ValueError):
+            search_customers(limit=5)
+        with self.assertRaises(ValueError):
+            search_customers(name="a", mobile_prefix="+91", limit=5)
+
+    def test_recent_ids_read_only_newest_orders(self):
+        customers = [_mobile_user(f"rec{n}", f"+91900000010{n}") for n in range(3)]
+        for n, customer in enumerate([customers[0], customers[1], customers[0], customers[2]]):
+            Order.objects.create(user=customer, order_number=f"SMR-RID-{n:06d}", subtotal=1, total=1)
+        ids = recent_customer_ids(limit=15)
+        self.assertEqual(ids, [customers[2].pk, customers[0].pk, customers[1].pk])
+        self.assertEqual(recent_customer_ids(limit=15, scan=2), [customers[2].pk, customers[0].pk])

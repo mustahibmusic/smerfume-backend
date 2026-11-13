@@ -17,27 +17,51 @@
     <div class="alert alert--danger" role="alert">{% for error in formset.non_form_errors %}<p>{{ error }}</p>{% endfor %}</div>
   {% endif %}
 
-  <section class="card">
+  <section class="card customer-lookup" data-customer-lookup
+           data-url="{% url 'ops:customer_lookup' %}"
+           data-address-url="{% url 'ops:customer_last_address' '00000000-0000-0000-0000-000000000000' %}">
     <h2>Customer</h2>
     <div class="form-grid">
-      {% include "ops/_field.html" with field=form.customer_mobile %}
-      {% include "ops/_field.html" with field=form.customer_name %}
+      <div class="field customer-lookup__field{% if form.customer_name.errors %} field--error{% endif %}">
+        <label for="{{ form.customer_name.id_for_label }}">Customer name</label>
+        <input type="text" name="{{ form.customer_name.html_name }}" id="{{ form.customer_name.id_for_label }}"
+               value="{{ form.customer_name.value|default:'' }}" maxlength="150" autocomplete="off"
+               role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="customer-name-results"
+               placeholder="Search or type a new customer's name" data-customer-name>
+        <ul class="customer-lookup__list" id="customer-name-results" role="listbox" data-name-results hidden></ul>
+        <p class="field__help">{{ form.customer_name.help_text }}</p>
+        {% for error in form.customer_name.errors %}<p class="field__error">{{ error }}</p>{% endfor %}
+      </div>
+      <div class="field customer-lookup__field{% if form.customer_mobile.errors or form.customer_country.errors %} field--error{% endif %}">
+        <label for="{{ form.customer_mobile.id_for_label }}">Mobile number <span class="req" aria-hidden="true">*</span></label>
+        <div class="phone-input">
+          <select name="{{ form.customer_country.html_name }}" id="{{ form.customer_country.id_for_label }}"
+                  aria-label="Country code" data-customer-country>
+            {% for value, label in form.customer_country.field.choices %}
+              <option value="{{ value }}"{% if value == form.customer_country.value %} selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+          <input type="text" name="{{ form.customer_mobile.html_name }}" id="{{ form.customer_mobile.id_for_label }}"
+                 value="{{ form.customer_mobile.value|default:'' }}" maxlength="15" inputmode="tel" autocomplete="off"
+                 role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="customer-mobile-results"
+                 data-customer-mobile>
+        </div>
+        <ul class="customer-lookup__list" id="customer-mobile-results" role="listbox" data-mobile-results hidden></ul>
+        <p class="field__help">{{ form.customer_mobile.help_text }}</p>
+        {% for error in form.customer_mobile.errors %}<p class="field__error">{{ error }}</p>{% endfor %}
+        {% for error in form.customer_country.errors %}<p class="field__error">{{ error }}</p>{% endfor %}
+      </div>
       {% include "ops/_field.html" with field=form.warehouse %}
     </div>
-    <div class="customer-lookup" data-customer-lookup
-         data-url="{% url 'ops:customer_lookup' %}"
-         data-address-url="{% url 'ops:customer_last_address' '00000000-0000-0000-0000-000000000000' %}">
-      <p class="customer-lookup__status muted" data-customer-status role="status" aria-live="polite"></p>
-      <ul class="customer-lookup__list" data-customer-results hidden></ul>
-      <div class="customer-lookup__selected" data-customer-selected hidden>
-        <button type="button" class="button button--ghost" data-customer-change>Change customer</button>
-        <span class="customer-lookup__address" data-customer-address hidden>
-          Last delivery address available
-          <button type="button" class="button button--ghost" data-customer-address-view aria-expanded="false">View</button>
-        </span>
-      </div>
-      <div class="customer-lookup__address-card" data-customer-address-card hidden></div>
+    <p class="customer-lookup__status muted" data-customer-status role="status" aria-live="polite"></p>
+    <div class="customer-lookup__selected" data-customer-selected hidden>
+      <button type="button" class="button button--ghost" data-customer-change>Change customer</button>
+      <span class="customer-lookup__address" data-customer-address hidden>
+        Last delivery address available
+        <button type="button" class="button button--ghost" data-customer-address-view aria-expanded="false">View</button>
+      </span>
     </div>
+    <div class="customer-lookup__address-card" data-customer-address-card hidden></div>
   </section>
 
   <section class="card card--flush">

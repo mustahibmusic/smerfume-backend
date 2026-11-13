@@ -325,32 +325,51 @@
     form.querySelector("[data-sale-add]").addEventListener("click", addLine);
   }
 
-  // In-store sale: find the customer by mobile number. Suggestions from 6
-  // digits; a full 10-digit number matching one customer selects it. The
-  // server still resolves the customer from the mobile on submit.
+  // In-store sale: two ways to find the same customer.
+  // Customer name: recent customers on an empty focus, name search from 2
+  // characters. Mobile: country code + number, search from 6 digits within
+  // that country; a full stored number selects the customer. Choosing
+  // either way fills both fields. The server still resolves the customer
+  // from the combined mobile on submit.
   function initCustomerLookup() {
     var box = document.querySelector("[data-customer-lookup]");
-    var form = document.querySelector("[data-sale-form]");
-    if (!box || !form) {
+    if (!box) {
       return;
     }
-    var mobile = form.querySelector("input[name='customer_mobile']");
-    var name = form.querySelector("input[name='customer_name']");
+    var name = box.querySelector("[data-customer-name]");
+    var country = box.querySelector("[data-customer-country]");
+    var mobile = box.querySelector("[data-customer-mobile]");
+    var nameList = box.querySelector("[data-name-results]");
+    var mobileList = box.querySelector("[data-mobile-results]");
     var status = box.querySelector("[data-customer-status]");
-    var list = box.querySelector("[data-customer-results]");
     var selected = box.querySelector("[data-customer-selected]");
     var addressNote = box.querySelector("[data-customer-address]");
     var addressView = box.querySelector("[data-customer-address-view]");
     var addressCard = box.querySelector("[data-customer-address-card]");
     var url = box.getAttribute("data-url");
     var addressUrl = box.getAttribute("data-address-url");
-    var timer = null;
-    var request = 0;
     var current = null;
+    var request = 0;
+    var nameTimer = null;
+    var mobileTimer = null;
+    var dialByIso = {};
 
-    function clearList() {
-      list.innerHTML = "";
-      list.hidden = true;
+    Array.prototype.forEach.call(country.options, function (option) {
+      var match = option.textContent.match(/\((\+\d+)\)\s*$/);
+      dialByIso[option.value] = match ? match[1] : "";
+    });
+
+    function digits(value) {
+      return (value || "").replace(/[^0-9]/g, "");
+    }
+
+    function closeLists() {
+      [nameList, mobileList].forEach(function (list) {
+        list.hidden = true;
+        list.innerHTML = "";
+      });
+      name.setAttribute("aria-expanded", "false");
+      mobile.setAttribute("aria-expanded", "false");
     }
 
     function hideAddress() {
@@ -359,82 +378,38 @@
       addressView.setAttribute("aria-expanded", "false");
     }
 
-    function unselect() {
+    function unselect(keepName) {
+      var wasSelected = current !== null;
       current = null;
       selected.hidden = true;
       addressNote.hidden = true;
       hideAddress();
       name.readOnly = false;
+      if (wasSelected && !keepName) {
+        name.value = "";
+      }
+      status.textContent = "";
     }
 
     function select(customer) {
       current = customer;
-      clearList();
-      mobile.value = customer.mobile;
+      closeLists();
       name.value = customer.name;
       name.readOnly = true;
-      status.textContent = "Existing customer: " + (customer.name || "no name on record") + " · " + customer.mobile;
+      if (customer.country && dialByIso[customer.country] !== undefined) {
+        country.value = customer.country;
+      }
+      mobile.value = customer.national_number;
+      status.textContent = "Existing customer: " + (customer.name || "no name on record")
+        + " · " + customer.mobile;
       selected.hidden = false;
       addressNote.hidden = !customer.has_last_address;
       hideAddress();
     }
 
-    function show(data) {
-      clearList();
-      if (data.status === "too_short") {
-        status.textContent = "";
-        return;
-      }
-      if (data.status === "unsupported") {
-        status.textContent = "Customer search works with local 10-digit numbers.";
-        return;
-      }
-      if (data.exact) {
-        var match = data.results.filter(function (c) { return c.mobile.slice(-10) === digits().slice(-10); })[0];
-        if (match) {
-          select(match);
-          return;
-        }
-      }
-      if (!data.results.length) {
-        status.textContent = digits().length >= 10
-          ? "No customer with this number. A new customer will be created with the name you enter."
-          : "No matching customers yet.";
-        return;
-      }
-      status.textContent = data.results.length + (data.truncated ? "+" : "") + " matching customer"
-        + (data.results.length === 1 ? "" : "s") + ". Choose one or keep typing.";
-      data.results.forEach(function (customer) {
-        var item = document.createElement("li");
-        var button = document.createElement("button");
-        button.type = "button";
-        button.className = "customer-lookup__option";
-        var title = document.createElement("span");
-        title.textContent = (customer.name || "No name on record") + " · " + customer.mobile;
-        button.appendChild(title);
-        if (customer.email) {
-          var email = document.createElement("small");
-          email.textContent = customer.email;
-          button.appendChild(email);
-        }
-        button.addEventListener("click", function () {
-          select(customer);
-          name.focus();
-        });
-        item.appendChild(button);
-        list.appendChild(item);
-      });
-      list.hidden = false;
-    }
-
-    function digits() {
-      return mobile.value.replace(/[^0-9]/g, "");
-    }
-
-    function lookup() {
-      var value = mobile.value.trim();
+    function fetchCustomers(params, done) {
       var mine = ++request;
-      fetch(url + "?" + new URLSearchParams({ mobile: value }).toString(), { credentials: "same-origin" })
+      fetch(url + "?" + new URLSearchParams(params).toString(), { credentials: "same-origin" })
         .then(function (response) { return response.ok ? response.json() : null; })
         .then(function (data) {
           if (mine !== request) {
@@ -444,28 +419,188 @@
             status.textContent = "Customer search is unavailable. You can still record the sale.";
             return;
           }
-          show(data);
+          done(data);
         })
         .catch(function () {
           status.textContent = "Customer search is unavailable. You can still record the sale.";
         });
     }
 
-    mobile.addEventListener("input", function () {
-      if (current) {
-        unselect();
-        name.value = "";
+    function option(primary, secondary, onChoose, extraClass) {
+      var item = document.createElement("li");
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "customer-lookup__option" + (extraClass ? " " + extraClass : "");
+      button.setAttribute("role", "option");
+      button.tabIndex = -1;
+      var strong = document.createElement("strong");
+      strong.textContent = primary;
+      button.appendChild(strong);
+      if (secondary) {
+        var small = document.createElement("small");
+        small.textContent = secondary;
+        button.appendChild(small);
       }
-      window.clearTimeout(timer);
-      timer = window.setTimeout(lookup, 250);
+      button.addEventListener("click", onChoose);
+      item.appendChild(button);
+      return item;
+    }
+
+    function phone(customer) {
+      return customer.country_code ? customer.country_code + " " + customer.national_number : customer.mobile;
+    }
+
+    function showList(list, input, items) {
+      closeLists();
+      items.forEach(function (item) { list.appendChild(item); });
+      list.hidden = items.length === 0;
+      input.setAttribute("aria-expanded", items.length ? "true" : "false");
+    }
+
+    function newCustomerOption() {
+      return option("+ New customer", "Type the name, then the mobile number", function () {
+        closeLists();
+        status.textContent = "New customer: enter the name and mobile number.";
+        name.focus();
+      }, "customer-lookup__option--new");
+    }
+
+    function showNameResults(data, recent) {
+      var items = data.results.map(function (customer) {
+        return option(customer.name || "No name on record", phone(customer), function () {
+          select(customer);
+          mobile.focus();
+        });
+      });
+      if (recent) {
+        items.push(newCustomerOption());
+      }
+      showList(nameList, name, items);
+      if (!recent && !data.results.length) {
+        status.textContent = "No customer with this name. Continue typing to add a new customer.";
+      } else {
+        status.textContent = recent ? "Recent customers" : "";
+      }
+    }
+
+    function nameLookup() {
+      var text = name.value.trim();
+      if (current) {
+        return;
+      }
+      if (!text) {
+        fetchCustomers({ recent: "1" }, function (data) { showNameResults(data, true); });
+        return;
+      }
+      if (text.length < 2) {
+        closeLists();
+        return;
+      }
+      fetchCustomers({ name: text }, function (data) { showNameResults(data, false); });
+    }
+
+    function mobileLookup() {
+      var dial = dialByIso[country.value] || "";
+      var typed = digits(mobile.value);
+      if (current || !dial || typed.length < 6) {
+        closeLists();
+        return;
+      }
+      fetchCustomers({ country_code: dial, mobile: typed }, function (data) {
+        if (data.exact) {
+          var match = data.results.filter(function (c) { return c.mobile === dial + typed; })[0]
+            || data.results.filter(function (c) { return c.mobile.slice(-typed.length) === typed; })[0];
+          if (match) {
+            select(match);
+            return;
+          }
+        }
+        var items = data.results.map(function (customer) {
+          return option(phone(customer), customer.name || "No name on record", function () {
+            select(customer);
+            name.blur();
+          });
+        });
+        showList(mobileList, mobile, items);
+        if (!data.results.length && data.status === "ok") {
+          status.textContent = (dial === "+91" && typed.length >= 10)
+            ? "No customer with this number. A new customer will be created with the name you enter."
+            : "No matching customers yet.";
+        } else {
+          status.textContent = "";
+        }
+      });
+    }
+
+    function moveFocus(list, input, step) {
+      var buttons = Array.prototype.slice.call(list.querySelectorAll("button"));
+      if (!buttons.length || list.hidden) {
+        return false;
+      }
+      var index = buttons.indexOf(document.activeElement);
+      var next = index + step;
+      if (next < 0) {
+        input.focus();
+        return true;
+      }
+      buttons[Math.min(next, buttons.length - 1)].focus();
+      return true;
+    }
+
+    [[name, nameList], [mobile, mobileList]].forEach(function (pair) {
+      var input = pair[0];
+      var list = pair[1];
+      input.addEventListener("keydown", function (event) {
+        if (event.key === "ArrowDown" && moveFocus(list, input, 1)) {
+          event.preventDefault();
+        } else if (event.key === "Escape") {
+          closeLists();
+        } else if (event.key === "Enter" && !list.hidden) {
+          event.preventDefault();  // never submit the sale from a search box
+        }
+      });
+      list.addEventListener("keydown", function (event) {
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          event.preventDefault();
+          moveFocus(list, input, event.key === "ArrowDown" ? 1 : -1);
+        } else if (event.key === "Escape") {
+          closeLists();
+          input.focus();
+        }
+      });
+    });
+
+    name.addEventListener("focus", function () {
+      if (!current && !name.value.trim()) {
+        nameLookup();
+      }
+    });
+    name.addEventListener("input", function () {
+      window.clearTimeout(nameTimer);
+      nameTimer = window.setTimeout(nameLookup, 250);
+    });
+
+    function mobileChanged() {
+      if (current) {
+        unselect(false);  // the name came from the selected customer
+      }
+      window.clearTimeout(mobileTimer);
+      mobileTimer = window.setTimeout(mobileLookup, 250);
+    }
+    mobile.addEventListener("input", mobileChanged);
+    country.addEventListener("change", mobileChanged);
+
+    document.addEventListener("click", function (event) {
+      if (!box.contains(event.target)) {
+        closeLists();
+      }
     });
 
     box.querySelector("[data-customer-change]").addEventListener("click", function () {
-      unselect();
-      name.value = "";
+      unselect(false);
       mobile.value = "";
-      status.textContent = "";
-      mobile.focus();
+      closeLists();
+      name.focus();
     });
 
     addressView.addEventListener("click", function () {
@@ -510,8 +645,8 @@
         .catch(function () { addressCard.textContent = "Address unavailable."; addressCard.hidden = false; });
     });
 
-    if (mobile.value.trim()) {
-      lookup();  // re-rendered form after an error keeps the selection
+    if (digits(mobile.value).length >= 6) {
+      mobileLookup();  // a re-rendered form keeps its customer
     }
   }
 

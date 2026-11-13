@@ -14,6 +14,7 @@ from django.urls import reverse
 from django.views import View
 from django.views.generic import TemplateView
 
+from apps.accounts import countries
 from apps.catalog.models import ProductVariant
 from apps.inventory.models import Warehouse
 from apps.inventory.services.reservation import InsufficientStockError
@@ -71,6 +72,7 @@ class InStoreSaleView(OpsAccessMixin, TemplateView):
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
+        context["dial_countries"] = countries.preferred_iso_by_dial()
         formset = context["formset"]
         skus = {(f["sku"].value() or "").strip() for f in formset.forms} - {""}
         labels = {

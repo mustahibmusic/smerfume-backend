@@ -794,6 +794,9 @@ form.stack:not(.card form) > .form-actions:last-child { margin: 0; border: 1px s
 .customer-lookup__option:hover, .customer-lookup__option:focus-visible { background: var(--surface-2); outline: none; }
 .customer-lookup__option small { color: var(--muted); }
 .customer-lookup__selected { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.customer-lookup__preview { margin: 4px 0 0; font-size: 0.85em; color: var(--muted); }
+.customer-lookup__preview:empty { display: none; }
+.customer-lookup__chip { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
 .customer-lookup__address { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
 .customer-lookup__address-card { max-width: 520px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
 .customer-lookup__address-card .dl { margin: 0; }

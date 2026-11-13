@@ -592,6 +592,12 @@ class CustomerLookupTests(TestCase):
                        {"name": "asha", "country_code": "+91", "mobile": "9"}):
             self.assertEqual(self.client.get(LOOKUP_URL, params).status_code, 400, params)
 
+    def test_pasted_full_number_searches_its_own_country(self):
+        self.assertEqual([r["id"] for r in self._mobile("+447911123456")["results"]], [str(self.london.public_id)])
+        self.assertEqual([r["id"] for r in self._mobile("00447911123456")["results"]], [str(self.london.public_id)])
+        self.assertEqual([r["id"] for r in self._mobile("447911123456", code="+44")["results"]],
+                         [str(self.london.public_id)])
+
     def test_country_code_encoding_and_validation(self):
         self.assertEqual(self.client.get(f"{LOOKUP_URL}?country_code=%2B91&mobile=987654").json()["status"], "ok")
         # An unencoded "+" arrives as a space; it is still read as +91.
@@ -717,8 +723,52 @@ class CustomerLookupTests(TestCase):
         self.assertEqual(self.client.post(SALE_URL, data).status_code, 302)
         self.assertEqual(Order.objects.get(channel=Order.CHANNEL_IN_STORE).user, self.london)
 
-        data = _sale_post(_stocked_variant().sku, mobile="+447911123456")
+        data = _sale_post(_stocked_variant().sku, mobile="7911abc")
         data["customer_country"] = "GB"
         response = self.client.post(SALE_URL, data)
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "without the country code")
+        self.assertContains(response, "Enter the mobile number as digits")
+
+    def test_pasted_international_number_with_india_selected(self):
+        self.client.force_login(_user("seller3", "orders.add_order", "orders.view_order"))
+        for index, value in enumerate(("+971501234567", "00971501234567", "+971 50 123 4567")):
+            data = _sale_post(_stocked_variant().sku, mobile=value)
+            data["customer_country"] = "IN"
+            self.assertEqual(self.client.post(SALE_URL, data).status_code, 302, value)
+        self.assertEqual(User.objects.filter(mobile_number="+971501234567").count(), 1)
+        self.assertFalse(User.objects.filter(mobile_number__startswith="+91971").exists())
+        self.assertEqual(Order.objects.filter(user__mobile_number="+971501234567").count(), 3)
+        # Room in the box for a formatted full number ("+971 50 123 4567").
+        self.assertContains(self.client.get(SALE_URL), 'maxlength="20"')
+
+    def test_selected_code_typed_again_is_not_duplicated(self):
+        self.client.force_login(_user("seller4", "orders.add_order", "orders.view_order"))
+        for value in ("501234567", "971501234567"):
+            data = _sale_post(_stocked_variant().sku, mobile=value)
+            data["customer_country"] = "AE"
+            self.assertEqual(self.client.post(SALE_URL, data).status_code, 302, value)
+        self.assertEqual(User.objects.filter(mobile_number="+971501234567").count(), 1)
+        self.assertFalse(User.objects.filter(mobile_number__contains="971971").exists())
+
+    def test_rerendered_form_shows_the_country_actually_used(self):
+        self.client.force_login(_user("seller5", "orders.add_order", "orders.view_order"))
+        data = _sale_post("NO-SUCH-SKU", mobile="+971501234567")
+        data["customer_country"] = "IN"
+        response = self.client.post(SALE_URL, data)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["form"].cleaned_data["customer_country"], "AE")
+
+    def test_customer_is_whoever_the_number_belongs_to(self):
+        # The page never submits a selected-customer id: a name left over
+        # from one customer cannot attach the sale to them, and an existing
+        # customer's name is never changed by the sale.
+        self.client.force_login(_user("seller6", "orders.add_order", "orders.view_order"))
+        data = _sale_post(_stocked_variant().sku, mobile="7911123456")
+        data["customer_country"] = "GB"
+        data["customer_name"] = self.asha.get_full_name()
+        self.assertEqual(self.client.post(SALE_URL, data).status_code, 302)
+        order = Order.objects.get(channel=Order.CHANNEL_IN_STORE)
+        self.assertEqual(order.user, self.london)
+        self.london.refresh_from_db()
+        self.assertNotEqual(self.london.get_full_name(), "")
+        self.assertNotIn("customer_id", data)

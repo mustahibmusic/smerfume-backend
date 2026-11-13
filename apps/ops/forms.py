@@ -1,8 +1,9 @@
 from django import forms
+from django.core.validators import MaxLengthValidator
 from django.utils import timezone
 
 from apps.accounts import countries
-from apps.accounts.mobile import InvalidMobileNumber, combine_mobile
+from apps.accounts.mobile import InvalidMobileNumber, combine_mobile, split_mobile_entry
 from apps.accounts.models import User
 from apps.catalog.models import ProductVariant
 from apps.inventory.models import InventoryStock, StockMovement, StockReservation, Supplier, Warehouse
@@ -70,6 +71,9 @@ class OrderFilterForm(forms.Form):
 # database id reaches the page.
 
 
+MOBILE_ENTRY_MAX_LENGTH = 20
+
+
 class OpsInStoreSaleForm(InStoreSaleForm):
     """The mobile is entered as a country (dial code) and a national number;
     clean() combines them into the one canonical stored number before the
@@ -87,9 +91,19 @@ class OpsInStoreSaleForm(InStoreSaleForm):
         super().__init__(*args, **kwargs)
         self.fields["customer_country"].choices = countries.country_choices()
         self.fields["customer_mobile"].label = "Mobile number"
-        self.fields["customer_mobile"].help_text = "Without the country code. Finds the customer, or creates one."
+        self.fields["customer_mobile"].help_text = (
+            "The national number. A pasted full number (+971…, 00971…) picks its country. "
+            "Finds the customer, or creates one."
+        )
+        # Room for a pasted, formatted full number ("+971 50 123 4567");
+        # clean() reduces it to the canonical value.
+        mobile_field = self.fields["customer_mobile"]
+        mobile_field.max_length = MOBILE_ENTRY_MAX_LENGTH
+        mobile_field.validators = [
+            v for v in mobile_field.validators if not isinstance(v, MaxLengthValidator)
+        ] + [MaxLengthValidator(MOBILE_ENTRY_MAX_LENGTH)]
         self.fields["customer_mobile"].widget = forms.TextInput(
-            attrs={"inputmode": "tel", "autocomplete": "off", "maxlength": 15},
+            attrs={"inputmode": "tel", "autocomplete": "off", "maxlength": MOBILE_ENTRY_MAX_LENGTH},
         )
         self.fields["customer_name"].help_text = "Search existing customers, or type a new customer's name."
         self.fields["customer_name"].widget = forms.TextInput(attrs={"maxlength": 150})
@@ -106,10 +120,18 @@ class OpsInStoreSaleForm(InStoreSaleForm):
         country = cleaned.get("customer_country") or countries.DEFAULT_COUNTRY
         national = cleaned.get("customer_mobile")
         if national:
+            selected_dial = countries.dial_code_for(country)
             try:
-                cleaned["customer_mobile"] = combine_mobile(countries.dial_code_for(country), national)
+                # A pasted +<code> number picks its own country; a repeated
+                # code is dropped. The country is kept in step so a
+                # re-rendered form shows the country actually saved.
+                dial, _ = split_mobile_entry(selected_dial, national)
+                cleaned["customer_mobile"] = combine_mobile(selected_dial, national)
             except InvalidMobileNumber as exc:
                 self.add_error("customer_mobile", str(exc))
+            else:
+                if dial != selected_dial:
+                    cleaned["customer_country"] = countries.country_for_dial(dial)
         return cleaned
 
 

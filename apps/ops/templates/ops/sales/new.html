@@ -22,7 +22,7 @@
            data-address-url="{% url 'ops:customer_last_address' '00000000-0000-0000-0000-000000000000' %}">
     <h2>Customer</h2>
     <div class="form-grid">
-      <div class="field customer-lookup__field{% if form.customer_name.errors %} field--error{% endif %}">
+      <div class="field customer-lookup__field{% if form.customer_name.errors %} field--error{% endif %}" data-customer-edit>
         <label for="{{ form.customer_name.id_for_label }}">Customer name</label>
         <input type="text" name="{{ form.customer_name.html_name }}" id="{{ form.customer_name.id_for_label }}"
                value="{{ form.customer_name.value|default:'' }}" maxlength="150" autocomplete="off"
@@ -32,7 +32,7 @@
         <p class="field__help">{{ form.customer_name.help_text }}</p>
         {% for error in form.customer_name.errors %}<p class="field__error">{{ error }}</p>{% endfor %}
       </div>
-      <div class="field customer-lookup__field{% if form.customer_mobile.errors or form.customer_country.errors %} field--error{% endif %}">
+      <div class="field customer-lookup__field{% if form.customer_mobile.errors or form.customer_country.errors %} field--error{% endif %}" data-customer-edit>
         <label for="{{ form.customer_mobile.id_for_label }}">Mobile number <span class="req" aria-hidden="true">*</span></label>
         <div class="phone-input">
           <select name="{{ form.customer_country.html_name }}" id="{{ form.customer_country.id_for_label }}"
@@ -42,10 +42,11 @@
             {% endfor %}
           </select>
           <input type="text" name="{{ form.customer_mobile.html_name }}" id="{{ form.customer_mobile.id_for_label }}"
-                 value="{{ form.customer_mobile.value|default:'' }}" maxlength="15" inputmode="tel" autocomplete="off"
+                 value="{{ form.customer_mobile.value|default:'' }}" maxlength="{{ form.customer_mobile.field.max_length }}" inputmode="tel" autocomplete="off"
                  role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="customer-mobile-results"
                  data-customer-mobile>
         </div>
+        <p class="customer-lookup__preview" data-mobile-preview aria-live="polite"></p>
         <ul class="customer-lookup__list" id="customer-mobile-results" role="listbox" data-mobile-results hidden></ul>
         <p class="field__help">{{ form.customer_mobile.help_text }}</p>
         {% for error in form.customer_mobile.errors %}<p class="field__error">{{ error }}</p>{% endfor %}
@@ -55,6 +56,11 @@
     </div>
     <p class="customer-lookup__status muted" data-customer-status role="status" aria-live="polite"></p>
     <div class="customer-lookup__selected" data-customer-selected hidden>
+      <div class="customer-lookup__chip">
+        <span class="muted">Existing customer</span>
+        <strong data-selected-name></strong>
+        <span data-selected-phone></span>
+      </div>
       <button type="button" class="button button--ghost" data-customer-change>Change customer</button>
       <span class="customer-lookup__address" data-customer-address hidden>
         Last delivery address available
@@ -62,6 +68,7 @@
       </span>
     </div>
     <div class="customer-lookup__address-card" data-customer-address-card hidden></div>
+    {{ dial_countries|json_script:"dial-countries" }}
   </section>
 
   <section class="card card--flush">

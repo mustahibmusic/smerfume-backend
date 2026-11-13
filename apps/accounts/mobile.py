@@ -9,6 +9,8 @@ than 91) are kept as entered, because checkout has always accepted them.
 
 import re
 
+from apps.accounts import countries
+
 INDIA_PREFIX = "+91"
 LOCAL_DIGITS = 10
 LOOKUP_MIN_DIGITS = 6
@@ -113,17 +115,59 @@ def mask_mobile(value):
     return f"******{value[-4:]}" if len(value) >= 4 else "******"
 
 
+# A national number longer than this, typed next to a selected country and
+# starting with that country's digits, already carries the country code.
+NATIONAL_MAX_DIGITS = 10
+
+
+def split_mobile_entry(dial_code, value):
+    """(dial code, national digits) for what staff entered beside a selected
+    country code. Never duplicates a code:
+
+    - ``+<code>...`` or ``00<code>...``: the longest known dial code wins and
+      replaces the selected one (``+971501234567`` -> ``+971``, ``501234567``)
+    - digits that start with the selected code's digits and are longer than
+      ``NATIONAL_MAX_DIGITS`` lose that prefix (``+971`` with
+      ``971501234567`` -> ``501234567``); +91 keeps its own local rules
+    - anything else is the national number as typed
+
+    Raises InvalidMobileNumber for letters or an unknown code.
+    """
+    cleaned = _strip_formatting(value)
+    if cleaned.startswith("00"):
+        cleaned = "+" + cleaned[2:]
+    if cleaned.startswith("+"):
+        if not cleaned[1:].isdigit():
+            raise InvalidMobileNumber("Enter the mobile number as digits.")
+        found, national = countries.split_number(cleaned)
+        if not found:
+            raise InvalidMobileNumber("Unknown country code. Choose the country, then enter the number.")
+        return found, national
+    if not cleaned.isdigit():
+        raise InvalidMobileNumber("Enter the mobile number as digits.")
+    code_digits = (dial_code or "").lstrip("+")
+    if (
+        dial_code != INDIA_PREFIX and code_digits
+        and len(cleaned) > NATIONAL_MAX_DIGITS and cleaned.startswith(code_digits)
+    ):
+        cleaned = cleaned[len(code_digits):]
+    return dial_code, cleaned
+
+
 def mobile_search_prefix(dial_code, national):
     """Prefix for a customer search scoped to one country: the dial code
     plus the typed national digits (at least 6), or None.
 
-    For +91 the local rules apply (mobile_lookup_prefix): a leading zero is
-    part of a partial number, and the complete 0 + 10 / 91 + 10 forms are
-    recognised. For other codes the digits are used as typed, up to 15
-    digits in total.
+    The entry is first split with split_mobile_entry(), so a pasted
+    ``+<code>`` number searches its own country and a repeated code is not
+    searched twice. For +91 the local rules apply (mobile_lookup_prefix): a
+    leading zero is part of a partial number, and the complete 0 + 10 /
+    91 + 10 forms are recognised. For other codes the digits are used as
+    typed, up to 15 digits in total.
     """
-    cleaned = _strip_formatting(national)
-    if not cleaned.isdigit():
+    try:
+        dial_code, cleaned = split_mobile_entry(dial_code, national)
+    except InvalidMobileNumber:
         return None
     if dial_code == INDIA_PREFIX:
         return mobile_lookup_prefix(cleaned)
@@ -134,11 +178,11 @@ def mobile_search_prefix(dial_code, national):
 
 def combine_mobile(dial_code, national):
     """The canonical stored number for a country dial code and a national
-    number typed separately (the in-store sale form). Raises
+    number typed separately (the in-store sale form). The entry is split
+    with split_mobile_entry() first, so a pasted full number or a repeated
+    code still gives one ``+<code><national>`` value. Raises
     InvalidMobileNumber."""
-    cleaned = _strip_formatting(national)
-    if not cleaned.isdigit():
-        raise InvalidMobileNumber("Enter the mobile number as digits, without the country code.")
+    dial_code, cleaned = split_mobile_entry(dial_code, national)
     if dial_code == INDIA_PREFIX:
         return normalize_local_mobile(cleaned)
     return normalize_indian_mobile(f"{dial_code}{cleaned}")
